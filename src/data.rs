@@ -1,4 +1,4 @@
-use crate::models::{Candle, intern};
+use crate::models::{Candle, asset_id, tf_id};
 use chrono::NaiveDateTime;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::path::Path;
@@ -67,8 +67,8 @@ pub fn load_parquet(
             }
 
             candles.push(Candle {
-                asset: intern(asset),
-                timeframe: intern("1m"),
+                asset: asset_id(asset),
+                timeframe: tf_id("1m"),
                 open: opens[i],
                 high: highs[i],
                 low: lows[i],

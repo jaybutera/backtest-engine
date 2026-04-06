@@ -1,10 +1,14 @@
-use crate::models::{Candle, intern};
+use crate::models::{Candle, tf_id, tf_name};
 use chrono::{NaiveDateTime, TimeDelta};
 use std::collections::HashMap;
-use std::sync::Arc;
 
-/// Timeframe durations in minutes.
-pub fn tf_minutes(tf: &str) -> i64 {
+/// Timeframe durations in minutes (accepts u16 ID).
+pub fn tf_minutes_id(tf: u16) -> i64 {
+    tf_minutes_str(&tf_name(tf))
+}
+
+/// Timeframe durations in minutes (accepts string).
+pub fn tf_minutes_str(tf: &str) -> i64 {
     match tf {
         "1m" => 1,
         "5m" => 5,
@@ -25,17 +29,17 @@ fn tf_start(ts: NaiveDateTime, tf_min: i64) -> NaiveDateTime {
 }
 
 pub struct TimeframeBuilder {
-    timeframes: Vec<Arc<str>>,
-    buffers: HashMap<(Arc<str>, Arc<str>), Vec<Candle>>,
-    period_start: HashMap<(Arc<str>, Arc<str>), NaiveDateTime>,
+    timeframes: Vec<u16>,
+    buffers: HashMap<(u16, u16), Vec<Candle>>,
+    period_start: HashMap<(u16, u16), NaiveDateTime>,
 }
 
 impl TimeframeBuilder {
     pub fn new(timeframes: &[String]) -> Self {
-        let tfs: Vec<Arc<str>> = timeframes
+        let tfs: Vec<u16> = timeframes
             .iter()
             .filter(|tf| tf.as_str() != "1m")
-            .map(|tf| intern(tf))
+            .map(|tf| tf_id(tf))
             .collect();
         Self {
             timeframes: tfs,
@@ -46,14 +50,14 @@ impl TimeframeBuilder {
 
     /// Process a 1m candle. Returns completed higher-TF candles.
     pub fn process(&mut self, candle: &Candle) -> Vec<Candle> {
-        if &*candle.timeframe != "1m" {
+        if candle.timeframe != tf_id("1m") {
             return Vec::new();
         }
 
         let mut completed = Vec::new();
-        for tf in &self.timeframes {
-            let tf_min = tf_minutes(tf);
-            let key = (candle.asset.clone(), tf.clone());
+        for &tf in &self.timeframes {
+            let tf_min = tf_minutes_id(tf);
+            let key = (candle.asset, tf);
             let period = tf_start(candle.timestamp, tf_min);
 
             let current_period = self.period_start.get(&key).copied();
@@ -62,16 +66,16 @@ impl TimeframeBuilder {
                     // New period — flush buffer
                     if let Some(buf) = self.buffers.get(&key) {
                         if !buf.is_empty() {
-                            completed.push(aggregate(buf, &candle.asset, tf, cp));
+                            completed.push(aggregate(buf, candle.asset, tf, cp));
                         }
                     }
-                    self.buffers.insert(key.clone(), vec![candle.clone()]);
+                    self.buffers.insert(key, vec![candle.clone()]);
                     self.period_start.insert(key, period);
                 } else {
                     self.buffers.entry(key).or_default().push(candle.clone());
                 }
             } else {
-                self.buffers.entry(key.clone()).or_default().push(candle.clone());
+                self.buffers.entry(key).or_default().push(candle.clone());
                 self.period_start.insert(key, period);
             }
         }
@@ -81,9 +85,9 @@ impl TimeframeBuilder {
     /// Flush all incomplete buffers (end of backtest).
     pub fn flush(&mut self) -> Vec<Candle> {
         let mut completed = Vec::new();
-        for ((asset, tf), buf) in &self.buffers {
+        for (&(asset, tf), buf) in &self.buffers {
             if !buf.is_empty() {
-                let period = self.period_start[&(asset.clone(), tf.clone())];
+                let period = self.period_start[&(asset, tf)];
                 completed.push(aggregate(buf, asset, tf, period));
             }
         }
@@ -93,10 +97,10 @@ impl TimeframeBuilder {
     }
 }
 
-fn aggregate(candles: &[Candle], asset: &str, tf: &str, period_start: NaiveDateTime) -> Candle {
+fn aggregate(candles: &[Candle], asset: u16, tf: u16, period_start: NaiveDateTime) -> Candle {
     Candle {
-        asset: intern(asset),
-        timeframe: intern(tf),
+        asset,
+        timeframe: tf,
         open: candles[0].open,
         high: candles.iter().map(|c| c.high).fold(f64::NEG_INFINITY, f64::max),
         low: candles.iter().map(|c| c.low).fold(f64::INFINITY, f64::min),
