@@ -110,3 +110,128 @@ fn aggregate(candles: &[Candle], asset: u16, tf: u16, period_start: NaiveDateTim
         complete: true,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::asset_id;
+
+    fn make_1m_candle(asset: &str, minute: i64, open: f64, high: f64, low: f64, close: f64) -> Candle {
+        let base = chrono::NaiveDate::from_ymd_opt(2026, 3, 11).unwrap()
+            .and_hms_opt(2, 0, 0).unwrap();
+        Candle {
+            asset: asset_id(asset),
+            timeframe: tf_id("1m"),
+            open, high, low, close,
+            volume: 1.0,
+            timestamp: base + TimeDelta::minutes(minute),
+            complete: true,
+        }
+    }
+
+    fn make_series(n: usize) -> Vec<Candle> {
+        (0..n as i64).map(|i| {
+            let price = 50000.0 + (i as f64) * 10.0;
+            make_1m_candle("BTC", i, price, price + 20.0, price - 10.0, price + 5.0)
+        }).collect()
+    }
+
+    #[test]
+    fn test_5m_from_1m_count() {
+        // 100 1m candles should produce ~19-20 5m candles (matches Python test)
+        let candles = make_series(100);
+        let mut tfb = TimeframeBuilder::new(&["5m".to_string(), "15m".to_string()]);
+        let mut all_5m = Vec::new();
+        let tf_5m = tf_id("5m");
+        for c in &candles {
+            for htf in tfb.process(c) {
+                if htf.timeframe == tf_5m {
+                    all_5m.push(htf);
+                }
+            }
+        }
+        assert!(all_5m.len() >= 15 && all_5m.len() <= 20,
+            "Expected 15-20 5m candles, got {}", all_5m.len());
+    }
+
+    #[test]
+    fn test_15m_from_1m_count() {
+        // 100 1m candles should produce ~6 15m candles (matches Python test)
+        let candles = make_series(100);
+        let mut tfb = TimeframeBuilder::new(&["15m".to_string()]);
+        let mut all_15m = Vec::new();
+        let tf_15m = tf_id("15m");
+        for c in &candles {
+            for htf in tfb.process(c) {
+                if htf.timeframe == tf_15m {
+                    all_15m.push(htf);
+                }
+            }
+        }
+        assert!(all_15m.len() >= 4 && all_15m.len() <= 7,
+            "Expected 4-7 15m candles, got {}", all_15m.len());
+    }
+
+    #[test]
+    fn test_ohlcv_aggregation() {
+        // 5 candles should aggregate to: first open, max high, min low, last close, sum volume
+        let candles = vec![
+            make_1m_candle("BTC", 0, 100.0, 110.0, 90.0, 105.0),
+            make_1m_candle("BTC", 1, 105.0, 115.0, 95.0, 100.0),
+            make_1m_candle("BTC", 2, 100.0, 120.0, 85.0, 110.0),
+            make_1m_candle("BTC", 3, 110.0, 112.0, 88.0, 108.0),
+            make_1m_candle("BTC", 4, 108.0, 118.0, 92.0, 115.0),
+        ];
+        let mut tfb = TimeframeBuilder::new(&["5m".to_string()]);
+        let mut result = Vec::new();
+        for c in &candles {
+            result.extend(tfb.process(c));
+        }
+        // Flush to get the incomplete period
+        result.extend(tfb.flush());
+
+        assert!(!result.is_empty(), "Should produce at least one 5m candle");
+        let agg = &result[0];
+        assert_eq!(agg.open, 100.0);
+        assert_eq!(agg.high, 120.0);
+        assert_eq!(agg.low, 85.0);
+        assert!((agg.volume - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_htf_properties() {
+        // All HTF candles must have: high >= low, high >= open, high >= close
+        let candles = make_series(100);
+        let mut tfb = TimeframeBuilder::new(&["5m".to_string(), "15m".to_string(), "1h".to_string()]);
+        let mut all_htf = Vec::new();
+        for c in &candles {
+            all_htf.extend(tfb.process(c));
+        }
+        all_htf.extend(tfb.flush());
+
+        for c in &all_htf {
+            assert!(c.high >= c.low, "high must be >= low");
+            assert!(c.high >= c.open, "high must be >= open");
+            assert!(c.high >= c.close, "high must be >= close");
+            assert!(c.low <= c.open, "low must be <= open");
+            assert!(c.low <= c.close, "low must be <= close");
+            assert!(c.complete, "HTF candles must be marked complete");
+        }
+    }
+
+    #[test]
+    fn test_non_1m_ignored() {
+        let mut tfb = TimeframeBuilder::new(&["5m".to_string()]);
+        let candle = Candle {
+            asset: asset_id("BTC"),
+            timeframe: tf_id("5m"), // not 1m
+            open: 100.0, high: 110.0, low: 90.0, close: 105.0,
+            volume: 1.0,
+            timestamp: chrono::NaiveDate::from_ymd_opt(2026, 3, 11).unwrap()
+                .and_hms_opt(2, 0, 0).unwrap(),
+            complete: true,
+        };
+        let result = tfb.process(&candle);
+        assert!(result.is_empty(), "Non-1m candles should be ignored");
+    }
+}
