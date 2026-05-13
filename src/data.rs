@@ -203,6 +203,76 @@ fn extract_f64(col: &arrow::array::ArrayRef) -> Vec<f64> {
     panic!("Unsupported numeric column type: {:?}", col.data_type());
 }
 
+/// Discover all parquet files for `asset` across `data_dirs`, including the
+/// historical splice for SP500 (cash:USA500 history before HL listed xyz:SP500
+/// on 2026-04-26). This is the single source of truth for "what candles does
+/// asset X have on disk" — called by both the live warmup loader and the
+/// replay/backtest path so they always build engine state from the same input.
+pub fn discover_files_for_asset(asset: &str, data_dirs: &[&Path]) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+    for dir in data_dirs {
+        if !dir.exists() { continue; }
+        let main_file = dir.join(format!("{}_1m.parquet", asset));
+        if main_file.exists() && seen.insert(main_file.clone()) {
+            paths.push(main_file);
+        }
+        // Date-ranged archives: {asset}_1m_*.parquet
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let prefix = format!("{}_1m_", asset);
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                if stem.starts_with(&prefix)
+                    && path.extension().map(|e| e == "parquet").unwrap_or(false)
+                    && seen.insert(path.clone())
+                {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+
+    // SP500 splice: HL listed xyz:SP500 on 2026-04-26; before that we splice
+    // in the cash:USA500 perp (similar index). Order matters: SP500 paths come
+    // first so dedup-by-timestamp in load_asset_candles keeps real SP500 rows
+    // and only USA500 timestamps not already present get appended.
+    if asset == "xyz:SP500" {
+        for dir in data_dirs {
+            let usa = dir.join("cash:USA500_1m.parquet");
+            if usa.exists() && seen.insert(usa.clone()) {
+                paths.push(usa);
+            }
+        }
+    }
+
+    paths
+}
+
+/// Load all candles for `asset` from `data_dirs`, applying the SP500→USA500
+/// splice and an optional `[start, end]` time bound. Result is sorted by
+/// timestamp and deduplicated.
+pub fn load_asset_candles(
+    asset: &str,
+    data_dirs: &[&Path],
+    start: Option<NaiveDateTime>,
+    end: Option<NaiveDateTime>,
+) -> Vec<Candle> {
+    let paths = discover_files_for_asset(asset, data_dirs);
+    let mut all: Vec<Candle> = Vec::new();
+    let mut seen_ts: std::collections::HashSet<NaiveDateTime> = std::collections::HashSet::new();
+    for path in &paths {
+        for c in load_parquet(path, asset, start, end) {
+            if seen_ts.insert(c.timestamp) {
+                all.push(c);
+            }
+        }
+    }
+    all.sort_by_key(|c| c.timestamp);
+    all
+}
+
 /// Discover parquet files and return (path, asset_name) pairs.
 /// Deduplicates by asset, keeping the file with the most rows.
 pub fn discover_parquet_files(data_dirs: &[&Path]) -> Vec<(std::path::PathBuf, String)> {
