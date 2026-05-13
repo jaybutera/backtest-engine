@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Equity Curve</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --win: #3fb950;
+    --loss: #f85149;
+    --neutral: #d29922;
+    --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+  }
+  .app { display: flex; flex-direction: column; height: 100vh; }
+  header.top {
+    padding: 12px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  header.top h1 { margin: 0; font-size: 14px; font-weight: 600; }
+  header.top .spacer { flex: 1; }
+  .source-toggle { display: flex; gap: 0; }
+  .source-toggle .seg {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 5px 12px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .source-toggle .seg:first-child { border-radius: 4px 0 0 4px; border-right: 0; }
+  .source-toggle .seg:last-child  { border-radius: 0 4px 4px 0; }
+  .source-toggle .seg.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .source-toggle .seg:hover:not(.active) { background: #1a1f26; color: var(--text); }
+  button.btn, a.btn {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 4px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    text-decoration: none;
+  }
+  button.btn:hover, a.btn:hover { background: #1f2937; }
+  .controls {
+    padding: 8px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .controls select, .controls input[type=date] {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 3px 8px;
+    font-size: 12px;
+    border-radius: 4px;
+    color-scheme: dark;
+  }
+  .controls.bt.hidden { display: none; }
+  .summary {
+    padding: 8px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--muted);
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .summary b { color: var(--text); }
+  .summary .pos { color: var(--win); }
+  .summary .neg { color: var(--loss); }
+  #chart { flex: 1; position: relative; min-height: 0; }
+  .empty { padding: 40px; text-align: center; color: var(--muted); }
+  .legend {
+    padding: 8px 16px;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <h1 id="page-title">Equity Curve</h1>
+    <div class="source-toggle">
+      <div class="seg active" data-source="live">Live</div>
+      <div class="seg" data-source="backtest">Backtest</div>
+    </div>
+    <div class="spacer"></div>
+    <a href="/" class="btn">← Trades</a>
+    <button id="refresh-btn" class="btn">Refresh</button>
+  </header>
+  <div class="controls bt hidden" id="bt-controls">
+    <label>From <input type="date" id="bt-from"></label>
+    <label>To <input type="date" id="bt-to"></label>
+    <button id="bt-run-btn" class="btn">Run backtest</button>
+    <span id="bt-status"></span>
+  </div>
+  <div class="controls">
+    <label>Asset <select id="asset-filter"><option value="">All</option></select></label>
+    <label>Direction
+      <select id="direction-filter">
+        <option value="">Both</option>
+        <option value="long">Long</option>
+        <option value="short">Short</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="per-asset-toggle"> Per-asset lines</label>
+  </div>
+  <div class="summary" id="summary"></div>
+  <div id="chart"><div class="empty">Loading…</div></div>
+  <div class="legend" id="legend">
+    Cumulative net P&amp;L over time, plotted at each trade's exit. Live = USD net of fees · Backtest = R-multiples.
+  </div>
+</div>
+<script>
+let allTrades = [];
+let source = localStorage.getItem("viz.source") || "live";
+let chart = null;
+let series = [];   // {line, name, color}
+const ASSET_COLORS = [
+  "#58a6ff", "#d29922", "#a371f7", "#f0883e",
+  "#3fb950", "#f85149", "#79c0ff", "#ffa657",
+];
+
+function fmtAgo(epoch) {
+  if (!epoch) return "";
+  const sec = Math.floor(Date.now() / 1000) - epoch;
+  if (sec < 60) return `${sec}s ago`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
+  return `${Math.floor(sec / 86400)}d ago`;
+}
+function fmtDollar(n) {
+  if (n == null) return "—";
+  const sign = n >= 0 ? "+" : "−";
+  return `${sign}$${Math.abs(n).toFixed(2)}`;
+}
+function fmtR(r) {
+  if (r == null) return "—";
+  const sign = r >= 0 ? "+" : "−";
+  return `${sign}${Math.abs(r).toFixed(2)}R`;
+}
+function pnlOf(t) {
+  // Live: net of fees. Backtest: R-multiples.
+  if (source === "backtest") return t.r_pnl ?? 0;
+  return (t.closed_pnl ?? 0) - (t.fee ?? 0);
+}
+function fmtTotal(v) { return source === "backtest" ? fmtR(v) : fmtDollar(v); }
+
+function buildCurve(trades) {
+  // Sort by realization time (exit). Trades without exit_epoch are skipped.
+  const pts = trades
+    .filter(t => t.exit_epoch != null && pnlOf(t) != null)
+    .map(t => ({ time: t.exit_epoch, pnl: pnlOf(t) }))
+    .sort((a, b) => a.time - b.time);
+  // Dedupe identical timestamps by aggregating — lightweight-charts rejects dupes.
+  const byTime = new Map();
+  for (const p of pts) byTime.set(p.time, (byTime.get(p.time) || 0) + p.pnl);
+  const ordered = [...byTime.entries()].sort((a, b) => a[0] - b[0]);
+  let cum = 0;
+  return ordered.map(([t, v]) => ({ time: t, value: (cum += v) }));
+}
+
+function maxDrawdown(curve) {
+  // Peak-to-trough of cumulative net pnl. Returns drawdown as a positive number.
+  let peak = -Infinity, dd = 0;
+  for (const p of curve) {
+    if (p.value > peak) peak = p.value;
+    const cur = peak - p.value;
+    if (cur > dd) dd = cur;
+  }
+  return dd;
+}
+
+function renderSummary(trades, curve) {
+  const total = curve.length ? curve[curve.length - 1].value : 0;
+  const wins = trades.filter(t => t.outcome === "win").length;
+  const losses = trades.filter(t => t.outcome === "loss").length;
+  const resolved = wins + losses;
+  const wr = resolved > 0 ? ((wins / resolved) * 100).toFixed(0) : "—";
+  const dd = maxDrawdown(curve);
+  const totalCls = total >= 0 ? "pos" : "neg";
+  document.getElementById("summary").innerHTML = `
+    <span><b>${trades.length}</b> trades</span>
+    <span><b>${wins}</b> W · <b>${losses}</b> L</span>
+    <span>WR: <b>${wr}%</b></span>
+    <span>Σ Net: <b class="${totalCls}">${fmtTotal(total)}</b></span>
+    <span>Max DD: <b>${fmtTotal(-dd)}</b></span>
+  `;
+}
+
+function ensureChart() {
+  if (chart) return;
+  const container = document.getElementById("chart");
+  container.innerHTML = "";
+  chart = LightweightCharts.createChart(container, {
+    layout: { background: { color: "#0d1117" }, textColor: "#c9d1d9" },
+    grid: {
+      vertLines: { color: "#1f2937" },
+      horzLines: { color: "#1f2937" },
+    },
+    timeScale: { timeVisible: true, secondsVisible: false },
+    rightPriceScale: { borderColor: "#30363d" },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
+  window.addEventListener("resize", () => {
+    chart.resize(container.clientWidth, container.clientHeight);
+  });
+}
+
+function clearSeries() {
+  for (const s of series) chart.removeSeries(s.line);
+  series = [];
+}
+
+function addLine(name, data, color) {
+  const line = chart.addLineSeries({
+    color,
+    lineWidth: 2,
+    priceLineVisible: false,
+    lastValueVisible: true,
+    title: name,
+  });
+  line.setData(data);
+  series.push({ line, name, color });
+}
+
+function render() {
+  const asset = document.getElementById("asset-filter").value;
+  const direction = document.getElementById("direction-filter").value;
+  const perAsset = document.getElementById("per-asset-toggle").checked;
+
+  let filtered = allTrades;
+  if (asset) filtered = filtered.filter(t => t.asset === asset);
+  if (direction) filtered = filtered.filter(t => t.direction === direction);
+
+  const overall = buildCurve(filtered);
+  renderSummary(filtered, overall);
+
+  const container = document.getElementById("chart");
+  if (!overall.length) {
+    if (chart) { clearSeries(); }
+    container.innerHTML = `<div class="empty">No trades to chart.</div>`;
+    chart = null;
+    return;
+  }
+  ensureChart();
+  clearSeries();
+
+  if (perAsset && !asset) {
+    const byAsset = new Map();
+    for (const t of filtered) {
+      if (!byAsset.has(t.asset)) byAsset.set(t.asset, []);
+      byAsset.get(t.asset).push(t);
+    }
+    const assets = [...byAsset.keys()].sort();
+    assets.forEach((a, i) => {
+      const curve = buildCurve(byAsset.get(a));
+      if (curve.length) addLine(a, curve, ASSET_COLORS[i % ASSET_COLORS.length]);
+    });
+    addLine("Total", overall, "#ffffff");
+  } else {
+    addLine("Net P&L", overall, "#58a6ff");
+  }
+  chart.timeScale().fitContent();
+}
+
+async function loadTrades({refresh = false} = {}) {
+  const btn = document.getElementById("refresh-btn");
+  const prevLabel = btn.textContent;
+  if (refresh) {
+    btn.disabled = true;
+    btn.textContent = "Refreshing…";
+  }
+  try {
+    const qs = new URLSearchParams({source});
+    if (refresh && source === "live") qs.set("refresh", "1");
+    const resp = await fetch(`/api/trades?${qs}`);
+    const data = await resp.json();
+    allTrades = data.trades;
+    document.title = source === "backtest" ? "Backtest Equity" : "Live Equity";
+    document.getElementById("page-title").textContent =
+      source === "backtest" ? "Backtest Equity Curve" : "Live Equity Curve";
+    const assets = [...new Set(allTrades.map(t => t.asset))].sort();
+    const cur = document.getElementById("asset-filter").value;
+    document.getElementById("asset-filter").innerHTML =
+      `<option value="">All</option>` +
+      assets.map(a => `<option value="${a}"${a === cur ? " selected" : ""}>${a}</option>`).join("");
+    updateBacktestStatus(data.exists, data.generated_at);
+    render();
+  } finally {
+    if (refresh) {
+      btn.disabled = false;
+      btn.textContent = prevLabel;
+    }
+  }
+}
+
+function updateBacktestStatus(exists, generatedAt) {
+  if (source !== "backtest") return;
+  const el = document.getElementById("bt-status");
+  if (!exists) {
+    el.textContent = "No backtest yet — click Run.";
+  } else {
+    el.textContent = `Last run: ${fmtAgo(generatedAt)}`;
+  }
+}
+
+function setSource(next) {
+  if (source === next) return;
+  source = next;
+  localStorage.setItem("viz.source", source);
+  document.querySelectorAll(".source-toggle .seg").forEach(el => {
+    el.classList.toggle("active", el.dataset.source === source);
+  });
+  document.getElementById("bt-controls").classList.toggle("hidden", source !== "backtest");
+  loadTrades();
+}
+
+async function runBacktest() {
+  const btn = document.getElementById("bt-run-btn");
+  const status = document.getElementById("bt-status");
+  const from = document.getElementById("bt-from").value;
+  const to = document.getElementById("bt-to").value;
+  btn.disabled = true;
+  status.textContent = "Running...";
+  try {
+    const resp = await fetch("/api/backtest/run", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({from, to}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      status.textContent = `Failed: ${data.error || resp.status}`;
+      console.error(data);
+      return;
+    }
+    await loadTrades();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function initBacktestDates() {
+  const iso = d => d.toISOString().slice(0, 10);
+  let from = iso(new Date(Date.now() - 14 * 86400000));
+  let to = iso(new Date());
+  try {
+    const resp = await fetch("/api/backtest/range");
+    const r = await resp.json();
+    if (r.earliest) from = r.earliest;
+    if (r.latest) to = r.latest;
+  } catch (e) {
+    console.warn("range fetch failed, falling back to 14d window", e);
+  }
+  document.getElementById("bt-from").value = from;
+  document.getElementById("bt-to").value = to;
+}
+
+function initSourceToggle() {
+  document.querySelectorAll(".source-toggle .seg").forEach(el => {
+    el.classList.toggle("active", el.dataset.source === source);
+    el.addEventListener("click", () => setSource(el.dataset.source));
+  });
+  document.getElementById("bt-controls").classList.toggle("hidden", source !== "backtest");
+}
+
+document.getElementById("asset-filter").addEventListener("change", render);
+document.getElementById("direction-filter").addEventListener("change", render);
+document.getElementById("per-asset-toggle").addEventListener("change", render);
+document.getElementById("refresh-btn").addEventListener("click", () => loadTrades({refresh: true}));
+document.getElementById("bt-run-btn").addEventListener("click", runBacktest);
+
+initSourceToggle();
+initBacktestDates();
+loadTrades();
+</script>
+</body>
+</html>
