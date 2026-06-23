@@ -36,10 +36,17 @@ pub struct TimeframeBuilder {
 
 impl TimeframeBuilder {
     pub fn new(timeframes: &[String]) -> Self {
+        // Aggregate every requested timeframe that is strictly higher than the
+        // base interval. The base itself (default "1m", or "1h" for a 1h-only
+        // backtest) is fed to the engine directly, not aggregated. Any
+        // requested timeframe <= the base (e.g. "1m"/"5m"/"15m" when base="1h")
+        // is dropped, since no sub-base data exists to build it from.
+        let base_id = crate::models::base_tf_id();
+        let base_min = tf_minutes_id(base_id);
         let tfs: Vec<u16> = timeframes
             .iter()
-            .filter(|tf| tf.as_str() != "1m")
             .map(|tf| tf_id(tf))
+            .filter(|&id| tf_minutes_id(id) > base_min)
             .collect();
         Self {
             timeframes: tfs,
@@ -48,9 +55,9 @@ impl TimeframeBuilder {
         }
     }
 
-    /// Process a 1m candle. Returns completed higher-TF candles.
+    /// Process a base-interval candle. Returns completed higher-TF candles.
     pub fn process(&mut self, candle: &Candle) -> Vec<Candle> {
-        if candle.timeframe != tf_id("1m") {
+        if candle.timeframe != crate::models::base_tf_id() {
             return Vec::new();
         }
 

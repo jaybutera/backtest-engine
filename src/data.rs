@@ -1,4 +1,4 @@
-use crate::models::{Candle, asset_id, tf_id};
+use crate::models::{Candle, asset_id};
 use arrow::array::{Float64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use chrono::NaiveDateTime;
@@ -91,7 +91,7 @@ pub fn load_parquet(
 
             candles.push(Candle {
                 asset: asset_id(asset),
-                timeframe: tf_id("1m"),
+                timeframe: crate::models::base_tf_id(),
                 open: opens[i],
                 high: highs[i],
                 low: lows[i],
@@ -203,28 +203,98 @@ fn extract_f64(col: &arrow::array::ArrayRef) -> Vec<f64> {
     panic!("Unsupported numeric column type: {:?}", col.data_type());
 }
 
-/// Discover all parquet files for `asset` across `data_dirs`, including the
-/// historical splice for SP500 (cash:USA500 history before HL listed xyz:SP500
-/// on 2026-04-26). This is the single source of truth for "what candles does
-/// asset X have on disk" — called by both the live warmup loader and the
-/// replay/backtest path so they always build engine state from the same input.
-pub fn discover_files_for_asset(asset: &str, data_dirs: &[&Path]) -> Vec<PathBuf> {
+/// A backing data source for an asset: a parquet file stem (the part before
+/// `_{iv}.parquet`, e.g. "PAXGUSDT" or "cash:USA500") plus a linear price
+/// transform applied to OHLC at load time so the engine sees the asset in HL
+/// price terms: `hl_price = src_price * scale + offset`.
+#[derive(Clone, Debug)]
+pub struct DataSource {
+    /// File stem before the `_{iv}` suffix (the SOURCE symbol, not the asset).
+    pub stem: String,
+    /// Multiplicative price scale (1.0 = identity).
+    pub scale: f64,
+    /// Additive price offset in HL price units, applied after scale.
+    pub offset: f64,
+}
+
+impl DataSource {
+    /// Identity source whose stem equals the asset name (the default: an asset
+    /// is backed by its own `{asset}_{iv}.parquet`).
+    fn identity(stem: &str) -> Self {
+        DataSource { stem: stem.to_string(), scale: 1.0, offset: 0.0 }
+    }
+}
+
+/// Maps an asset name to the ordered list of backing sources it should load
+/// from. An asset absent from the map uses the default: a single identity
+/// source backed by its own `{asset}_{iv}.parquet` (plus the built-in
+/// SP500→USA500 splice). This is the config-driven generalization of the
+/// former hardcoded splice — see `default_map`.
+#[derive(Clone, Debug, Default)]
+pub struct SourceMap {
+    overrides: std::collections::HashMap<String, Vec<DataSource>>,
+}
+
+impl SourceMap {
+    pub fn new() -> Self {
+        SourceMap { overrides: std::collections::HashMap::new() }
+    }
+
+    /// Register an asset's backing sources, replacing any prior entry.
+    pub fn insert(&mut self, asset: &str, sources: Vec<DataSource>) {
+        self.overrides.insert(asset.to_string(), sources);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.overrides.is_empty()
+    }
+
+    /// The ordered sources for `asset`. Falls back to the built-in default
+    /// (identity self-source plus the SP500→USA500 splice at 1m) when the asset
+    /// has no override. Order matters: earlier sources win on timestamp dedup.
+    fn sources_for(&self, asset: &str) -> Vec<DataSource> {
+        if let Some(s) = self.overrides.get(asset) {
+            return s.clone();
+        }
+        default_sources(asset)
+    }
+}
+
+/// The built-in (un-overridden) source list for an asset: the asset's own
+/// `{asset}_{iv}` file, plus — for xyz:SP500 at the 1m base only — the
+/// historical cash:USA500 splice (HL listed xyz:SP500 on 2026-04-26; before
+/// that we backfill with the similar cash:USA500 index). This reproduces the
+/// former hardcoded behavior exactly so callers passing no override are
+/// unaffected.
+fn default_sources(asset: &str) -> Vec<DataSource> {
+    let mut v = vec![DataSource::identity(asset)];
+    // Only valid at the 1m base: the donor file is 1m-only, so splicing it into
+    // a non-1m run would mix grains. Skip when base != "1m".
+    if asset == "xyz:SP500" && crate::models::base_interval() == "1m" {
+        v.push(DataSource::identity("cash:USA500"));
+    }
+    v
+}
+
+/// Glob the on-disk parquet files for a single source `stem` across `data_dirs`:
+/// `{stem}_{iv}.parquet` plus dated shards `{stem}_{iv}_*.parquet`. Returns
+/// paths in discovery order, deduplicated.
+fn files_for_stem(stem: &str, iv: &str, data_dirs: &[&Path]) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-
     for dir in data_dirs {
         if !dir.exists() { continue; }
-        let main_file = dir.join(format!("{}_1m.parquet", asset));
+        let main_file = dir.join(format!("{}_{}.parquet", stem, iv));
         if main_file.exists() && seen.insert(main_file.clone()) {
             paths.push(main_file);
         }
-        // Date-ranged archives: {asset}_1m_*.parquet
+        // Date-ranged archives: {stem}_{iv}_*.parquet
         if let Ok(entries) = std::fs::read_dir(dir) {
-            let prefix = format!("{}_1m_", asset);
+            let prefix = format!("{}_{}_", stem, iv);
             for entry in entries.flatten() {
                 let path = entry.path();
-                let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                if stem.starts_with(&prefix)
+                let fstem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                if fstem.starts_with(&prefix)
                     && path.extension().map(|e| e == "parquet").unwrap_or(false)
                     && seen.insert(path.clone())
                 {
@@ -233,39 +303,78 @@ pub fn discover_files_for_asset(asset: &str, data_dirs: &[&Path]) -> Vec<PathBuf
             }
         }
     }
-
-    // SP500 splice: HL listed xyz:SP500 on 2026-04-26; before that we splice
-    // in the cash:USA500 perp (similar index). Order matters: SP500 paths come
-    // first so dedup-by-timestamp in load_asset_candles keeps real SP500 rows
-    // and only USA500 timestamps not already present get appended.
-    if asset == "xyz:SP500" {
-        for dir in data_dirs {
-            let usa = dir.join("cash:USA500_1m.parquet");
-            if usa.exists() && seen.insert(usa.clone()) {
-                paths.push(usa);
-            }
-        }
-    }
-
     paths
 }
 
-/// Load all candles for `asset` from `data_dirs`, applying the SP500→USA500
-/// splice and an optional `[start, end]` time bound. Result is sorted by
-/// timestamp and deduplicated.
+/// Discover all parquet files for `asset` across `data_dirs`, including the
+/// historical splice for SP500 (cash:USA500 history before HL listed xyz:SP500
+/// on 2026-04-26). This is the single source of truth for "what candles does
+/// asset X have on disk" — called by both the live warmup loader and the
+/// replay/backtest path so they always build engine state from the same input.
+///
+/// Backwards-compatible wrapper: uses the built-in default source map (no
+/// config-driven overrides). Callers with a `SourceMap` should use
+/// `load_asset_candles_with_sources` instead.
+pub fn discover_files_for_asset(asset: &str, data_dirs: &[&Path]) -> Vec<PathBuf> {
+    let iv = crate::models::base_interval();
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for src in default_sources(asset) {
+        for p in files_for_stem(&src.stem, &iv, data_dirs) {
+            if seen.insert(p.clone()) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Load all candles for `asset` from `data_dirs`, applying the built-in
+/// (un-overridden) source map and an optional `[start, end]` time bound.
+/// Result is sorted by timestamp and deduplicated.
 pub fn load_asset_candles(
     asset: &str,
     data_dirs: &[&Path],
     start: Option<NaiveDateTime>,
     end: Option<NaiveDateTime>,
 ) -> Vec<Candle> {
-    let paths = discover_files_for_asset(asset, data_dirs);
+    load_asset_candles_with_sources(asset, data_dirs, start, end, &SourceMap::new())
+}
+
+/// Load all candles for `asset` from `data_dirs`, resolving its backing
+/// sources through `sources` (config-driven override, or the built-in default
+/// when the asset is absent). Each source's `scale`/`offset` is applied to OHLC
+/// at load time so the engine sees the asset in HL price terms. Sources are
+/// loaded in order; the first to provide a given timestamp wins (so a primary
+/// real feed takes precedence over a spliced donor). Result is sorted by
+/// timestamp and deduplicated.
+pub fn load_asset_candles_with_sources(
+    asset: &str,
+    data_dirs: &[&Path],
+    start: Option<NaiveDateTime>,
+    end: Option<NaiveDateTime>,
+    sources: &SourceMap,
+) -> Vec<Candle> {
+    let iv = crate::models::base_interval();
     let mut all: Vec<Candle> = Vec::new();
     let mut seen_ts: std::collections::HashSet<NaiveDateTime> = std::collections::HashSet::new();
-    for path in &paths {
-        for c in load_parquet(path, asset, start, end) {
-            if seen_ts.insert(c.timestamp) {
-                all.push(c);
+    let mut seen_path: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for src in sources.sources_for(asset) {
+        let identity = src.scale == 1.0 && src.offset == 0.0;
+        for path in files_for_stem(&src.stem, &iv, data_dirs) {
+            if !seen_path.insert(path.clone()) {
+                continue;
+            }
+            for mut c in load_parquet(&path, asset, start, end) {
+                if !identity {
+                    c.open = c.open * src.scale + src.offset;
+                    c.high = c.high * src.scale + src.offset;
+                    c.low = c.low * src.scale + src.offset;
+                    c.close = c.close * src.scale + src.offset;
+                }
+                if seen_ts.insert(c.timestamp) {
+                    all.push(c);
+                }
             }
         }
     }
@@ -289,8 +398,10 @@ pub fn discover_parquet_files(data_dirs: &[&Path]) -> Vec<(std::path::PathBuf, S
             let path = entry.path();
             if path.extension().map(|e| e == "parquet").unwrap_or(false) {
                 let stem = path.file_stem().unwrap().to_string_lossy();
-                // Must contain _1m
-                if !stem.contains("_1m") {
+                // Must contain the base interval suffix (e.g. "_1m", or "_1h"
+                // for a 1h-only backtest).
+                let iv_suffix = format!("_{}", crate::models::base_interval());
+                if !stem.contains(&iv_suffix) {
                     continue;
                 }
                 let asset = stem.split('_').next().unwrap_or("").to_string();
