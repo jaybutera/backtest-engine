@@ -71,7 +71,7 @@
     font-size: 12px;
     color: var(--muted);
   }
-  .controls select, .controls input[type=date] {
+  .controls select, .controls input[type=date], .controls input[type=number] {
     background: var(--bg);
     border: 1px solid var(--border);
     color: var(--text);
@@ -138,10 +138,12 @@
   <div id="chart"><div class="empty">Loading…</div></div>
   <div class="legend" id="legend">
     Cumulative net P&amp;L over time, plotted at each trade's exit. Live = USD net of fees · Backtest = R-multiples.
+    A strategy with <code>risk_frac</code> set instead plots a <b>$ compounding equity curve</b> (each trade risks risk_frac × balance-at-open).
   </div>
 </div>
 <script>
 let allTrades = [];
+let compoundMeta = null;   // engine-computed {risk_frac, account_size, final_balance, max_dd_frac, multiple}
 let source = localStorage.getItem("viz.source") || "live";
 let chart = null;
 let series = [];   // {line, name, color}
@@ -200,20 +202,61 @@ function maxDrawdown(curve) {
   return dd;
 }
 
-function renderSummary(trades, curve) {
-  const total = curve.length ? curve[curve.length - 1].value : 0;
+// Compounding is a STRATEGY/engine concern: a backtest whose strategy set
+// `risk_frac > 0` embeds a dollar equity curve in the
+// sidecar — per-trade `equity` plus the `compound` summary (compoundMeta). The
+// page just plots it; there is no client-side knob. Active only on the backtest
+// source when that data is present and the view is unfiltered (the embedded
+// curve is whole-portfolio; a filtered subset has no meaningful $ curve).
+function compoundActive(trades) {
+  return source === "backtest" && compoundMeta != null &&
+    trades.length === allTrades.length && trades.every(t => t.equity != null);
+}
+
+// Plot the engine-embedded per-trade equity as the $ balance curve.
+function buildCompoundCurve(trades) {
+  const pts = trades
+    .filter(t => t.exit_epoch != null && t.equity != null)
+    .map(t => ({ time: t.exit_epoch, value: t.equity }))
+    .sort((a, b) => a.time - b.time);
+  const byTime = new Map();
+  for (const p of pts) byTime.set(p.time, p.value);   // last balance at instant wins
+  const curve = [...byTime.entries()].sort((a, b) => a[0] - b[0])
+    .map(([t, v]) => ({ time: t, value: v }));
+  return {
+    curve,
+    maxDDFrac: compoundMeta.max_dd_frac,
+    start: compoundMeta.account_size,
+    f: compoundMeta.risk_frac,
+  };
+}
+
+function renderSummary(trades, curve, compound) {
   const wins = trades.filter(t => t.outcome === "win").length;
   const losses = trades.filter(t => t.outcome === "loss").length;
   const resolved = wins + losses;
   const wr = resolved > 0 ? ((wins / resolved) * 100).toFixed(0) : "—";
-  const dd = maxDrawdown(curve);
-  const totalCls = total >= 0 ? "pos" : "neg";
+  let pnlCells;
+  if (compound) {
+    const final = curve.length ? curve[curve.length - 1].value : compound.start;
+    const mult = compound.start > 0 ? final / compound.start : 0;
+    const finalCls = final >= compound.start ? "pos" : "neg";
+    pnlCells = `
+    <span>Risk: <b>${(compound.f * 100).toFixed(1)}%</b> compounding</span>
+    <span>Final: <b class="${finalCls}">$${Math.round(final).toLocaleString()}</b> (<b>${mult.toFixed(2)}×</b>)</span>
+    <span>Max DD: <b class="neg">${(compound.maxDDFrac * 100).toFixed(1)}%</b></span>`;
+  } else {
+    const total = curve.length ? curve[curve.length - 1].value : 0;
+    const dd = maxDrawdown(curve);
+    const totalCls = total >= 0 ? "pos" : "neg";
+    pnlCells = `
+    <span>Σ Net: <b class="${totalCls}">${fmtTotal(total)}</b></span>
+    <span>Max DD: <b>${fmtTotal(-dd)}</b></span>`;
+  }
   document.getElementById("summary").innerHTML = `
     <span><b>${trades.length}</b> trades</span>
     <span><b>${wins}</b> W · <b>${losses}</b> L</span>
-    <span>WR: <b>${wr}%</b></span>
-    <span>Σ Net: <b class="${totalCls}">${fmtTotal(total)}</b></span>
-    <span>Max DD: <b>${fmtTotal(-dd)}</b></span>
+    <span>WR: <b>${wr}%</b></span>${pnlCells}
   `;
 }
 
@@ -262,8 +305,18 @@ function render() {
   if (asset) filtered = filtered.filter(t => t.asset === asset);
   if (direction) filtered = filtered.filter(t => t.direction === direction);
 
-  const overall = buildCurve(filtered);
-  renderSummary(filtered, overall);
+  const compound = compoundActive(filtered);
+  // Per-asset lines are meaningless under one shared compounding account.
+  const showPerAsset = perAsset && !asset && !compound;
+
+  let overall, compoundResult = null;
+  if (compound) {
+    compoundResult = buildCompoundCurve(filtered);
+    overall = compoundResult.curve;
+  } else {
+    overall = buildCurve(filtered);
+  }
+  renderSummary(filtered, overall, compoundResult);
 
   const container = document.getElementById("chart");
   if (!overall.length) {
@@ -275,7 +328,13 @@ function render() {
   ensureChart();
   clearSeries();
 
-  if (perAsset && !asset) {
+  if (compound) {
+    addLine(`Equity ($, ${(compoundResult.f * 100).toFixed(1)}% comp)`, overall, "#d29922");
+    chart.timeScale().fitContent();
+    return;
+  }
+
+  if (showPerAsset) {
     const byAsset = new Map();
     for (const t of filtered) {
       if (!byAsset.has(t.asset)) byAsset.set(t.asset, []);
@@ -306,6 +365,9 @@ async function loadTrades({refresh = false} = {}) {
     const resp = await fetch(`/api/trades?${qs}`);
     const data = await resp.json();
     allTrades = data.trades;
+    // Engine-embedded compounding summary (present when the strategy set
+    // risk_frac>0); null otherwise. When set, the page plots the $ equity curve.
+    compoundMeta = (source === "backtest" && data.compound) || null;
     document.title = source === "backtest" ? "Backtest Equity" : "Live Equity";
     document.getElementById("page-title").textContent =
       source === "backtest" ? "Backtest Equity Curve" : "Live Equity Curve";
