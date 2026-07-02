@@ -122,6 +122,7 @@
     <label>To <input type="date" id="bt-to"></label>
     <button id="bt-run-btn" class="btn">Run backtest</button>
     <span id="bt-status"></span>
+    <span id="bt-freshness" style="display:none; color:#c60; font-weight:600;"></span>
   </div>
   <div class="controls">
     <label>Asset <select id="asset-filter"><option value="">All</option></select></label>
@@ -376,7 +377,7 @@ async function loadTrades({refresh = false} = {}) {
     document.getElementById("asset-filter").innerHTML =
       `<option value="">All</option>` +
       assets.map(a => `<option value="${a}"${a === cur ? " selected" : ""}>${a}</option>`).join("");
-    updateBacktestStatus(data.exists, data.generated_at);
+    updateBacktestStatus(data.exists, data.generated_at, data.freshness);
     render();
   } finally {
     if (refresh) {
@@ -386,13 +387,25 @@ async function loadTrades({refresh = false} = {}) {
   }
 }
 
-function updateBacktestStatus(exists, generatedAt) {
+function updateBacktestStatus(exists, generatedAt, freshness) {
   if (source !== "backtest") return;
   const el = document.getElementById("bt-status");
   if (!exists) {
     el.textContent = "No backtest yet — click Run.";
   } else {
     el.textContent = `Last run: ${fmtAgo(generatedAt)}`;
+  }
+  // Flag when the last run was built on incomplete local data — a lagging
+  // asset or interior gap silently drops just-formed trades from the backtest
+  // (a stale-sidecar divergence). Without this a stale sidecar looks fine.
+  const warn = document.getElementById("bt-freshness");
+  if (warn) {
+    if (freshness && freshness.stale) {
+      warn.textContent = `⚠ built on incomplete data: ${freshness.reason} — re-run once the collector backfills`;
+      warn.style.display = "";
+    } else {
+      warn.style.display = "none";
+    }
   }
 }
 
