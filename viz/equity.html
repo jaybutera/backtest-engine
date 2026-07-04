@@ -4,127 +4,76 @@
 <meta charset="utf-8">
 <title>Equity Curve</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<link rel="stylesheet" href="/theme.css">
 <style>
-  :root {
-    --bg: #0d1117;
-    --panel: #161b22;
-    --border: #30363d;
-    --text: #c9d1d9;
-    --muted: #8b949e;
-    --win: #3fb950;
-    --loss: #f85149;
-    --neutral: #d29922;
-    --accent: #58a6ff;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    font-size: 13px;
-  }
+  /* Page-specific layout on top of the shared 端末 TERMINAL theme (theme.css). */
   .app { display: flex; flex-direction: column; height: 100vh; }
-  header.top {
-    padding: 12px 16px;
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    gap: 16px;
+  /* Live/Backtest toggle sits inside the header nav on this page: give the
+     segments room and a left separator so they read as flush header tabs. */
+  .hdr nav .seg2 { border-left: 1px solid var(--line); }
+  .hdr nav .seg2 .seg { padding: 0 14px; display: flex; align-items: center; }
+  /* Controls row on this page uses inline labels (top-bar layout, not a grid). */
+  .ctlrow {
+    display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line);
+    font-size: 9px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim);
   }
-  header.top h1 { margin: 0; font-size: 14px; font-weight: 600; }
-  header.top .spacer { flex: 1; }
-  .source-toggle { display: flex; gap: 0; }
-  .source-toggle .seg {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    color: var(--muted);
-    padding: 5px 12px;
-    cursor: pointer;
-    font-size: 12px;
-    font-weight: 500;
+  .ctlrow.hidden { display: none; }
+  .ctlrow label { display: inline-flex; align-items: center; gap: 6px; }
+  .ctlrow input[type=date], .ctlrow select { width: auto; text-transform: none; letter-spacing: normal; }
+  .ctlrow input[type=checkbox] { accent-color: var(--shu); }
+  .ctlrow #bt-status { color: var(--dim); }
+  .ctlrow #bt-freshness { color: var(--loss); font-weight: 600; }
+  .run-inline {
+    height: 26px; background: none; border: 1px solid var(--line-hard);
+    color: var(--shu); font: inherit; font-size: 10px; font-weight: 700;
+    letter-spacing: .14em; text-transform: uppercase; padding: 0 12px; cursor: pointer;
   }
-  .source-toggle .seg:first-child { border-radius: 4px 0 0 4px; border-right: 0; }
-  .source-toggle .seg:last-child  { border-radius: 0 4px 4px 0; }
-  .source-toggle .seg.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .source-toggle .seg:hover:not(.active) { background: #1a1f26; color: var(--text); }
-  button.btn, a.btn {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    color: var(--text);
-    padding: 4px 10px;
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 11px;
-    text-decoration: none;
-  }
-  button.btn:hover, a.btn:hover { background: #1f2937; }
-  .controls {
-    padding: 8px 16px;
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    gap: 12px;
-    align-items: center;
-    flex-wrap: wrap;
-    font-size: 12px;
-    color: var(--muted);
-  }
-  .controls select, .controls input[type=date], .controls input[type=number] {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    color: var(--text);
-    padding: 3px 8px;
-    font-size: 12px;
-    border-radius: 4px;
-    color-scheme: dark;
-  }
-  .controls.bt.hidden { display: none; }
+  .run-inline:hover { background: var(--shu); color: #fff; border-color: var(--shu); }
+  .run-inline:disabled { opacity: .55; cursor: default; }
   .summary {
-    padding: 8px 16px;
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-    font-size: 12px;
-    color: var(--muted);
-    display: flex;
-    gap: 16px;
-    flex-wrap: wrap;
+    display: flex; gap: 16px; flex-wrap: wrap; align-items: center;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--line);
+    font-size: 9px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim);
   }
-  .summary b { color: var(--text); }
+  .summary b { color: var(--ink); font-weight: 600; }
   .summary .pos { color: var(--win); }
   .summary .neg { color: var(--loss); }
   #chart { flex: 1; position: relative; min-height: 0; }
-  .empty { padding: 40px; text-align: center; color: var(--muted); }
   .legend {
-    padding: 8px 16px;
-    background: var(--panel);
-    border-top: 1px solid var(--border);
-    font-size: 11px;
-    color: var(--muted);
+    padding: 6px 12px;
+    border-top: 1px solid var(--line);
+    font-size: 10px; color: var(--dim); line-height: 1.5;
   }
+  .legend code { color: var(--ink); }
+  .legend b { color: var(--ink); font-weight: 600; }
 </style>
 </head>
 <body>
 <div class="app">
-  <header class="top">
-    <h1 id="page-title">Equity Curve</h1>
-    <div class="source-toggle">
-      <div class="seg active" data-source="live">Live</div>
-      <div class="seg" data-source="backtest">Backtest</div>
+  <div class="hdr">
+    <div class="title">
+      <h1><span id="page-title">Equity Curve</span><span class="cjk">資産曲線</span></h1>
     </div>
-    <div class="spacer"></div>
-    <a href="/" class="btn">← Trades</a>
-    <button id="refresh-btn" class="btn">Refresh</button>
-  </header>
-  <div class="controls bt hidden" id="bt-controls">
+    <nav>
+      <div class="seg2 source-toggle" style="border-bottom:0;">
+        <div class="seg active" data-source="live">Live</div>
+        <div class="seg" data-source="backtest">Backtest</div>
+      </div>
+      <a href="/">Trades</a>
+      <button id="refresh-btn">Refresh</button>
+    </nav>
+  </div>
+  <div class="ctlrow hidden" id="bt-controls">
     <label>From <input type="date" id="bt-from"></label>
     <label>To <input type="date" id="bt-to"></label>
-    <button id="bt-run-btn" class="btn">Run backtest</button>
+    <button id="bt-run-btn" class="run-inline">▶ Run backtest</button>
     <span id="bt-status"></span>
-    <span id="bt-freshness" style="display:none; color:#c60; font-weight:600;"></span>
+    <span id="bt-freshness" style="display:none;"></span>
   </div>
-  <div class="controls">
+  <div class="ctlrow">
     <label>Asset <select id="asset-filter"><option value="">All</option></select></label>
     <label>Direction
       <select id="direction-filter">
@@ -149,8 +98,8 @@ let source = localStorage.getItem("viz.source") || "live";
 let chart = null;
 let series = [];   // {line, name, color}
 const ASSET_COLORS = [
-  "#58a6ff", "#d29922", "#a371f7", "#f0883e",
-  "#3fb950", "#f85149", "#79c0ff", "#ffa657",
+  "#58a6ff", "#e8c14a", "#a371f7", "#f0883e",
+  "#37d67a", "#ff5d52", "#79c0ff", "#ffa657",
 ];
 
 function fmtAgo(epoch) {
@@ -266,13 +215,13 @@ function ensureChart() {
   const container = document.getElementById("chart");
   container.innerHTML = "";
   chart = LightweightCharts.createChart(container, {
-    layout: { background: { color: "#0d1117" }, textColor: "#c9d1d9" },
+    layout: { background: { color: "#0b0b0d" }, textColor: "#ebe9e2" },
     grid: {
-      vertLines: { color: "#1f2937" },
-      horzLines: { color: "#1f2937" },
+      vertLines: { color: "#1b1b1d" },
+      horzLines: { color: "#1b1b1d" },
     },
     timeScale: { timeVisible: true, secondsVisible: false },
-    rightPriceScale: { borderColor: "#30363d" },
+    rightPriceScale: { borderColor: "#3a3a38" },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
   });
   window.addEventListener("resize", () => {
@@ -330,7 +279,7 @@ function render() {
   clearSeries();
 
   if (compound) {
-    addLine(`Equity ($, ${(compoundResult.f * 100).toFixed(1)}% comp)`, overall, "#d29922");
+    addLine(`Equity ($, ${(compoundResult.f * 100).toFixed(1)}% comp)`, overall, "#e8c14a");
     chart.timeScale().fitContent();
     return;
   }
@@ -346,7 +295,7 @@ function render() {
       const curve = buildCurve(byAsset.get(a));
       if (curve.length) addLine(a, curve, ASSET_COLORS[i % ASSET_COLORS.length]);
     });
-    addLine("Total", overall, "#ffffff");
+    addLine("Total", overall, "#ebe9e2");
   } else {
     addLine("Net P&L", overall, "#58a6ff");
   }
