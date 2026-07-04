@@ -1,0 +1,14 @@
+# Fill lens: worst-case bound (allow_signal_bar_fill=true, entry_slippage_r=0.1).
+# BACKTEST-ONLY.
+#
+# The signal bar is eligible to fill (optimistic on WHEN) but every fill takes a
+# 0.1R worse price (pessimistic on PRICE). Combined they bound the strategy: the
+# signal-bar eligibility recovers fills the limit_only lens excludes, while the
+# slippage taxes each one. Use as a sensitivity anchor, not a trustworthy R.
+#
+# See the fill-model design notes.
+
+[fill]
+allow_signal_bar_fill = true
+entry_slippage_r = 0.1
+intrabar_stop_first = true

@@ -1,0 +1,32 @@
+# Fill lens: HYBRID entry-fill — LIVE-FAITHFUL-INTENDED. BACKTEST-ONLY.
+#
+# Describes how the backtest SIMULATES entry fills. Live ignores this file (live
+# fills are real). Cross with any strategy via
+# `replay --strategy <s> --fill config/fill/market_hybrid.toml`.
+#
+# Models the live resting-GTC-limit + seed/chase watchdog path (ground truth in
+# the live trader), with the INTENDED single-`chase_r`-as-gate-and-cap
+# semantics — NOT the live IOC bug (a live max_chase_r gates WHEN the
+# chase fires, but chase_limit_price hardcodes the IOC price cap at +0.1R, so a
+# chase triggered 0.1–0.3R away fails its IOC and abandons the trade). This lens
+# implements what live WOULD do if the IOC cap honored the gate.
+#
+# The decision bar D = first candle after the signal bar T (T is never eligible;
+# the order didn't exist yet). Case A (D opens at/past the entry) → taker fill at
+# the open (a marketable GTC limit aggresses). Case B (D opens in front) → a
+# seeded watchdog may immediate-chase at the open (taker), else the limit rests
+# and fills maker at the entry or taker at the E±chase_r·R boundary; abandons on
+# a stop-gap, a TP-open/TP-range while unfilled, or 30-min age. See
+# paper.rs::hybrid_fill_action and
+# the hybrid-fill notes.
+#
+# In hybrid mode `allow_signal_bar_fill` and `entry_slippage_r` are IGNORED (the
+# binary warns if either is set).
+
+[fill]
+entry_fill_mode = "hybrid"
+chase_r = 0.1
+chase_requires_seed = true
+immediate_chase_at_open = true
+past_entry_fee = "taker"
+intrabar_stop_first = true

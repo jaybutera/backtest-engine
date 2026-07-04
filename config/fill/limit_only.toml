@@ -1,0 +1,19 @@
+# Fill lens: pure resting-limit (allow_signal_bar_fill=false, entry_slippage_r=0.0).
+# BACKTEST-ONLY.
+#
+# The PESSIMISTIC fill corner: the backtest only books a trade when a candle
+# AFTER the signal bar actually reaches the resting entry limit; if price never
+# gets there before the 2h cancel horizon, NO TRADE is recorded (mirrors live's
+# "opportunity invalidated"). Fills at exactly the entry (no slippage).
+#
+# This is the strictest, latest-possible-fill model — it excludes the many live
+# trades that fill immediately on the signal bar, so it UNDERSTATES the realized
+# book (see worst_case_bound / legacy_phantom for the more realistic corners, and
+# the fill-model notes). It deletes the phantom-fill edge the
+# pre-honest model booked from fills live could never get; expect R to drop
+# sharply vs the legacy model.
+
+[fill]
+allow_signal_bar_fill = false
+entry_slippage_r = 0.0
+intrabar_stop_first = true
