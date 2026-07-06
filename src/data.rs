@@ -1,4 +1,4 @@
-use crate::models::{Candle, asset_id};
+use crate::models::{Candle, Tick, asset_id};
 use arrow::array::{Float64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use chrono::NaiveDateTime;
@@ -107,9 +107,154 @@ pub fn load_parquet(
     candles
 }
 
+// ─── Tick (raw trade print) loading ─────────────────────────────────────────
+
+/// Load raw trade ticks from a per-asset tick parquet, sorted ascending by
+/// timestamp. Schema (written by `the tick puller`):
+/// `timestamp`(ms, no tz), `price`(f64), `size`(f64), `side`(u8). Also tolerates
+/// the local tick-collector's trades shape (`time` i64 ms, `px`, `sz`, `side`)
+/// so either source can back the tick fill mode. Column lookup is
+/// case-insensitive and name-aliased. An optional `[start, end]` bound trims the
+/// stream. Millisecond timestamps are preserved (the whole point of tick mode).
+pub fn load_ticks(
+    path: &Path,
+    start: Option<NaiveDateTime>,
+    end: Option<NaiveDateTime>,
+) -> Vec<Tick> {
+    use arrow::array::UInt8Array;
+
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|e| panic!("Failed to open tick file {}: {}", path.display(), e));
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap_or_else(|e| panic!("Failed to read tick parquet {}: {}", path.display(), e));
+    if start.is_some() || end.is_some() {
+        let keep = select_row_groups(&builder, start, end);
+        builder = builder.with_row_groups(keep);
+    }
+    let reader = builder.build().expect("Failed to build tick parquet reader");
+
+    let mut ticks = Vec::new();
+    for batch in reader {
+        let batch = batch.expect("Failed to read tick record batch");
+        let n = batch.num_rows();
+        let schema = batch.schema();
+        let find_col = |names: &[&str]| -> Option<usize> {
+            for name in names {
+                for (i, field) in schema.fields().iter().enumerate() {
+                    if field.name().eq_ignore_ascii_case(name) {
+                        return Some(i);
+                    }
+                }
+            }
+            None
+        };
+        let ts_col = find_col(&["timestamp", "time", "ts"]).expect("tick file: no timestamp column");
+        let px_col = find_col(&["price", "px"]).expect("tick file: no price column");
+        let sz_col = find_col(&["size", "sz", "qty"]);
+        let side_col = find_col(&["side"]);
+
+        let timestamps = extract_timestamps(batch.column(ts_col));
+        let prices = extract_f64(batch.column(px_col));
+        let sizes = sz_col.map(|c| extract_f64(batch.column(c)));
+        // side may be u8 (reservoir) or i64 (local collector); tolerate both.
+        let sides: Option<Vec<u8>> = side_col.map(|c| {
+            let col = batch.column(c);
+            if let Some(a) = col.as_any().downcast_ref::<UInt8Array>() {
+                a.iter().map(|v| v.unwrap_or(0)).collect()
+            } else {
+                extract_f64(col).iter().map(|v| *v as u8).collect()
+            }
+        });
+
+        for i in 0..n {
+            let ts = timestamps[i];
+            if let Some(s) = start {
+                if ts < s {
+                    continue;
+                }
+            }
+            if let Some(e) = end {
+                if ts > e {
+                    continue;
+                }
+            }
+            ticks.push(Tick {
+                timestamp: ts,
+                price: prices[i],
+                size: sizes.as_ref().map(|v| v[i]).unwrap_or(0.0),
+                side: sides.as_ref().map(|v| v[i]).unwrap_or(0),
+            });
+        }
+    }
+    ticks.sort_by_key(|t| t.timestamp);
+    ticks
+}
+
+/// Directory holding the per-asset tick parquets written by
+/// `the tick puller`.
+pub const TICKS_DIR: &str = "data/ticks_reservoir";
+
+/// Discover the tick parquet for a source `stem` across `data_dirs`, checking
+/// `{dir}/ticks_reservoir/{stem}_ticks.parquet` and `{dir}/{stem}_ticks.parquet`.
+/// Returns the first existing path, or None.
+pub fn tick_file_for_stem(stem: &str, data_dirs: &[&Path]) -> Option<PathBuf> {
+    for dir in data_dirs {
+        let a = dir.join("ticks_reservoir").join(format!("{}_ticks.parquet", stem));
+        if a.exists() {
+            return Some(a);
+        }
+        let b = dir.join(format!("{}_ticks.parquet", stem));
+        if b.exists() {
+            return Some(b);
+        }
+    }
+    // Absolute fallback under the repo's canonical ticks dir.
+    let c = PathBuf::from(TICKS_DIR).join(format!("{}_ticks.parquet", stem));
+    if c.exists() {
+        return Some(c);
+    }
+    None
+}
+
+/// Load ticks for `asset` by resolving its backing source stems through the
+/// `SourceMap` (so a `[[source]]` override like reservoir maps xyz:GOLD →
+/// `reservoir_xyz_GOLD_ticks.parquet`) and falling back to the asset's own name
+/// as the stem. Returns the merged, time-sorted tick stream, or an empty Vec if
+/// no tick file exists for any of the asset's stems. The `[start, end]` bound is
+/// widened by one day on each side by the caller if warmup crossing is needed;
+/// here it is applied verbatim.
+pub fn load_asset_ticks(
+    asset: &str,
+    data_dirs: &[&Path],
+    start: Option<NaiveDateTime>,
+    end: Option<NaiveDateTime>,
+    sources: &SourceMap,
+) -> Vec<Tick> {
+    let mut stems: Vec<String> = sources
+        .sources_for(asset)
+        .into_iter()
+        .map(|s| s.stem)
+        .collect();
+    // Always also try the asset's own name as a stem (default/no-override case).
+    if !stems.iter().any(|s| s == asset) {
+        stems.push(asset.to_string());
+    }
+    let mut all: Vec<Tick> = Vec::new();
+    let mut seen_path: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for stem in &stems {
+        if let Some(path) = tick_file_for_stem(stem, data_dirs) {
+            if !seen_path.insert(path.clone()) {
+                continue;
+            }
+            all.extend(load_ticks(&path, start, end));
+        }
+    }
+    all.sort_by_key(|t| t.timestamp);
+    all
+}
+
 fn extract_timestamps(col: &arrow::array::ArrayRef) -> Vec<NaiveDateTime> {
     use arrow::array::*;
-    use arrow::datatypes::*;
 
     if let Some(arr) = col.as_any().downcast_ref::<TimestampMicrosecondArray>() {
         return arr.iter()
@@ -252,7 +397,7 @@ impl SourceMap {
     /// The ordered sources for `asset`. Falls back to the built-in default
     /// (identity self-source plus the SP500→USA500 splice at 1m) when the asset
     /// has no override. Order matters: earlier sources win on timestamp dedup.
-    fn sources_for(&self, asset: &str) -> Vec<DataSource> {
+    pub fn sources_for(&self, asset: &str) -> Vec<DataSource> {
         if let Some(s) = self.overrides.get(asset) {
             return s.clone();
         }

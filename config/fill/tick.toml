@@ -1,0 +1,37 @@
+# Fill lens: TICK-RESOLUTION entry/stop/TP fills. BACKTEST-ONLY.
+#
+# Instead of resolving fills on 1-minute OHLC candles (where intrabar order is
+# unknowable and guessed via `intrabar_stop_first`), this lens walks the actual
+# millisecond TRADE ticks within each bar and acts on the FIRST tick that
+# crosses each level. So a stop, TP, or entry fills at the EXACT tick timestamp
+# and price the trade printed through the level — sub-minute, no waiting a whole
+# minute to learn price hit a level.
+#
+#   - Entry (resting limit): fills MAKER at the entry price on the first tick
+#     that reaches it, stamped with that tick's time.
+#   - Stop vs TP: whichever the price touches FIRST in tick time wins — real
+#     ordering, replacing the OHLC stop-first/TP-first heuristic entirely.
+#   - A trade filled mid-bar is raced against the LATER ticks of the same bar
+#     (true intrabar precision), though its hold clock still starts next bar.
+#   - Fallback: a bar with NO ticks (quiet minute, or a gap in the tick archive)
+#     falls back to the OHLC candle logic for that bar so a run never crashes on
+#     missing ticks. The run reports how often this fallback fired.
+#
+# DATA: raw trade prints from the Hydromancer Reservoir `fills/perp/all` archive,
+# pulled into data/ticks_reservoir/{stem}_ticks.parquet. The engine derives the tick file
+# from the asset's candle source stem (so the `reservoir` dataset's xyz:GOLD →
+# reservoir_xyz_GOLD_ticks.parquet). History is SHORT (the xyz instruments are
+# young) — use this over a window where ticks exist (GOLD/SILVER/CL from ~2026-05).
+#
+# HONEST LIMITS: these are real trade-price crossings (good), but (a) a tick-less
+# minute falls back to OHLC; (b) this models trade PRICE crossing a level, NOT L2
+# queue position — a passive limit is assumed to fill when a trade prints through
+# its price (BBO/queue realism is out of scope). `allow_signal_bar_fill=false`
+# keeps the signal bar ineligible (the order didn't exist when it printed).
+
+[fill]
+entry_fill_mode = "tick"
+allow_signal_bar_fill = false
+# intrabar_stop_first is IGNORED in tick mode (real tick order decides); kept at
+# the pessimistic default for the OHLC fallback bars.
+intrabar_stop_first = true
