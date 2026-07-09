@@ -1,4 +1,4 @@
-# Fill lens: TICK-RESOLUTION entry/stop/TP fills. BACKTEST-ONLY.
+# Fill lens: TICK-RESOLUTION entry/stop/TP fills + live-faithful entry-chase. BACKTEST-ONLY.
 #
 # Instead of resolving fills on 1-minute OHLC candles (where intrabar order is
 # unknowable and guessed via `intrabar_stop_first`), this lens walks the actual
@@ -9,6 +9,12 @@
 #
 #   - Entry (resting limit): fills MAKER at the entry price on the first tick
 #     that reaches it, stamped with that tick's time.
+#   - Entry chase (tick_chase, ON): when the limit is armed and a tick reaches
+#     the chase boundary B = E ± chase_r·R BEFORE any tick touches E, the entry
+#     fills TAKER at B — the same chase the live trader performs. Whichever
+#     level a tick reaches first in true tick time wins. Without this branch
+#     every chase becomes a phantom no-fill and the lens systematically drops
+#     the winners live would have chased into (a per-trade tax; see the chase A/B). `tick_nochase.toml` = this lens with it off.
 #   - Stop vs TP: whichever the price touches FIRST in tick time wins — real
 #     ordering, replacing the OHLC stop-first/TP-first heuristic entirely.
 #   - A trade filled mid-bar is raced against the LATER ticks of the same bar
@@ -31,6 +37,10 @@
 
 [fill]
 entry_fill_mode = "tick"
+# Live-faithful entry-chase on real tick order (this is also the built-in
+# default; stated explicitly so the lens is self-documenting). Env
+# TICK_CHASE=1|0 force-overrides for quick A/B.
+tick_chase = true
 allow_signal_bar_fill = false
 # intrabar_stop_first is IGNORED in tick mode (real tick order decides); kept at
 # the pessimistic default for the OHLC fallback bars.
