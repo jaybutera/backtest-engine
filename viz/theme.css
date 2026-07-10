@@ -199,6 +199,18 @@ input[type=date]:disabled {
   padding: 7px 12px 7px 0; cursor: pointer;
   border-bottom: 1px solid #1b1b1d;
 }
+/* Mirrored-trader rows carry a tag between dir and when,
+   so they need one extra column; without it the tag pushes pnl off-grid. */
+.trade.has-trader {
+  grid-template-columns: 3px 92px 46px auto 1fr 74px;
+}
+.trade .trader-tag {
+  font-size: 9px; letter-spacing: .06em; text-align: center;
+  color: var(--dim); background: var(--line);
+  border: 1px solid var(--line-hard); padding: 2px 6px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 96px;
+}
+.trade:hover .trader-tag { color: inherit; border-color: currentColor; }
 .trade .asset { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .trade:hover { background: var(--ink); color: var(--bg); }
 .trade:hover .when, .trade:hover .dir, .trade:hover .detail { color: inherit; border-color: currentColor; }
