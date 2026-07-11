@@ -62,6 +62,11 @@ body {
   white-space: nowrap;
 }
 .trader-row select { flex: 1; width: auto; }
+/* Account equity of the selected bot (filled by /api/balance; empty when N/A). */
+.trader-row #trader-balance {
+  font-variant-numeric: tabular-nums; color: var(--ink);
+  font-size: 12px; white-space: nowrap;
+}
 
 /* Axes label under the page title (strategy × fill × dataset). */
 .bt-axes-label {
