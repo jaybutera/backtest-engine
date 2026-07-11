@@ -49,25 +49,19 @@ body {
 .hdr nav a:hover, .hdr nav button:hover { background: var(--ink); color: var(--bg); }
 .hdr nav button:disabled { opacity: .5; cursor: default; }
 
-/* ── Trader pill strip (built from the registry) ─────────────────────── */
-/* One pill per deployed strat, current highlighted, unconfigured dimmed.
-   Sits in the header nav; shares its terminal-ish boxy language. */
-.trader-pills { display: flex; align-items: stretch; }
-.trader-pills .pill {
-  display: flex; align-items: center;
-  border: 0; border-left: 1px solid var(--line);
-  background: none; color: var(--dim);
-  font: inherit; font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
-  padding: 0 12px; cursor: pointer; text-decoration: none; white-space: nowrap;
+/* ── Live-strat picker (options come from the registry) ─────────────── */
+/* One sidebar row: small label + dropdown of the deployed strats. Hidden in
+   backtest mode (backtests aren't per-account). Unconfigured = disabled option. */
+.trader-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
 }
-.trader-pills .pill:hover { background: var(--ink); color: var(--bg); }
-.trader-pills .pill.active {
-  background: var(--shu); color: #fff; font-weight: 700; cursor: default;
+.trader-row label {
+  font-size: 9px; letter-spacing: .16em; text-transform: uppercase; color: var(--dim);
+  white-space: nowrap;
 }
-.trader-pills .pill.active:hover { background: var(--shu); color: #fff; }
-.trader-pills .pill.disabled {
-  opacity: .4; cursor: not-allowed; pointer-events: none;
-}
+.trader-row select { flex: 1; width: auto; }
 
 /* Axes label under the page title (strategy × fill × dataset). */
 .bt-axes-label {
