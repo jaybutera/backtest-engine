@@ -49,6 +49,26 @@ body {
 .hdr nav a:hover, .hdr nav button:hover { background: var(--ink); color: var(--bg); }
 .hdr nav button:disabled { opacity: .5; cursor: default; }
 
+/* ── Trader pill strip (built from the registry) ─────────────────────── */
+/* One pill per deployed strat, current highlighted, unconfigured dimmed.
+   Sits in the header nav; shares its terminal-ish boxy language. */
+.trader-pills { display: flex; align-items: stretch; }
+.trader-pills .pill {
+  display: flex; align-items: center;
+  border: 0; border-left: 1px solid var(--line);
+  background: none; color: var(--dim);
+  font: inherit; font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
+  padding: 0 12px; cursor: pointer; text-decoration: none; white-space: nowrap;
+}
+.trader-pills .pill:hover { background: var(--ink); color: var(--bg); }
+.trader-pills .pill.active {
+  background: var(--shu); color: #fff; font-weight: 700; cursor: default;
+}
+.trader-pills .pill.active:hover { background: var(--shu); color: #fff; }
+.trader-pills .pill.disabled {
+  opacity: .4; cursor: not-allowed; pointer-events: none;
+}
+
 /* Axes label under the page title (strategy × fill × dataset). */
 .bt-axes-label {
   font-size: 10px; color: var(--dim); margin-top: 3px; letter-spacing: .03em;
