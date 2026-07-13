@@ -68,14 +68,25 @@ body {
   font-size: 12px; white-space: nowrap;
 }
 
-/* Axes label under the page title (strategy × fill × dataset). */
+/* Axes label under the page title: the run's canonical UID
+   (strategy×fill×dataset@from..to) as a click-to-copy chip. */
 .bt-axes-label {
   font-size: 10px; color: var(--dim); margin-top: 3px; letter-spacing: .03em;
   font-variant-numeric: tabular-nums;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .bt-axes-label:empty { display: none; }
 .bt-axes-label b { color: var(--ink); font-weight: 600; }
+.bt-uid {
+  color: var(--ink); cursor: pointer; user-select: all;
+  border-bottom: 1px dotted var(--line-hard);
+  /* The uid is a single space-less token; break-all lets the full thing show
+     in the narrow sidebar instead of ellipsizing the dataset/date tail. */
+  word-break: break-all;
+}
+.bt-uid:hover { color: var(--shu); border-bottom-color: var(--shu); }
+/* Brief post-copy confirmation, toggled by the click handler. */
+.bt-uid.copied { color: var(--win); border-bottom-color: var(--win); }
+.bt-uid.copied::after { content: " copied"; font-size: 9px; letter-spacing: .1em; }
 
 /* ── Source toggle (Live / Backtest) — boxy segments ────────────────── */
 .seg2 { display: flex; border-bottom: 1px solid var(--line); }
