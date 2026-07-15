@@ -241,6 +241,9 @@ input[type=date]:disabled {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 96px;
 }
 .trade:hover .trader-tag { color: inherit; border-color: currentColor; }
+/* Trade took less than the configured risk (margin clamp / partial fill). */
+.trade .risk-cut { color: var(--shu); font-size: 10px; letter-spacing: .04em; }
+.trade:hover .risk-cut { color: inherit; }
 .trade .asset { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .trade:hover { background: var(--ink); color: var(--bg); }
 .trade:hover .when, .trade:hover .dir, .trade:hover .detail { color: inherit; border-color: currentColor; }
