@@ -270,6 +270,9 @@ input[type=date]:disabled {
 .trade .pnl.win { color: var(--win); }
 .trade .pnl.loss { color: var(--loss); }
 .trade .pnl.scratch { color: var(--dim); font-weight: 400; }
+/* Round-trip fee shown on its own line under the PnL (live HL trades only). */
+.trade .pnl .fee { display: block; color: var(--dim); font-size: 9px; font-weight: 400; }
+.trade:hover .pnl .fee { color: inherit; }
 /* The price-detail line spans the full row width below the main cells. */
 .trade .detail {
   grid-column: 2 / -1; color: var(--dim); font-size: 10px; margin-top: 2px;
