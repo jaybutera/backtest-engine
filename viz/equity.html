@@ -62,7 +62,7 @@
         <div class="seg active" data-source="live">Live</div>
         <div class="seg" data-source="backtest">Backtest</div>
       </div>
-      <a href="/">Trades</a>
+      <a href="/" id="trades-link">Trades</a>
       <a href="/engine">Engine</a>
       <button id="refresh-btn">Refresh</button>
     </nav>
@@ -96,6 +96,13 @@
 let allTrades = [];
 let compoundMeta = null;   // engine-computed {risk_frac, account_size, final_balance, max_dd_frac, multiple}
 let source = localStorage.getItem("viz.source") || "live";
+// Which live account this page charts, carried in from the trades page via
+// ?trader= (the dashboard's Equity link sets it). Without it /api/trades falls
+// back to the registry default, which silently showed one trader's curve from
+// another's page. Empty = server default, kept for direct /equity visits.
+const TRADER = new URLSearchParams(location.search).get("trader") || "";
+document.getElementById("trades-link").href =
+  TRADER ? `/${encodeURIComponent(TRADER)}` : "/";
 let chart = null;
 let series = [];   // {line, name, color}
 const ASSET_COLORS = [
@@ -312,6 +319,7 @@ async function loadTrades({refresh = false} = {}) {
   }
   try {
     const qs = new URLSearchParams({source});
+    if (TRADER) qs.set("trader", TRADER);
     if (refresh && source === "live") qs.set("refresh", "1");
     const resp = await fetch(`/api/trades?${qs}`);
     const data = await resp.json();
@@ -319,9 +327,12 @@ async function loadTrades({refresh = false} = {}) {
     // Engine-embedded compounding summary (present when the strategy set
     // risk_frac>0); null otherwise. When set, the page plots the $ equity curve.
     compoundMeta = (source === "backtest" && data.compound) || null;
-    document.title = source === "backtest" ? "Backtest Equity" : "Live Equity";
+    // Name the account being charted (server label, e.g. "Live Trader
+    // (main)") so live curves are never ambiguous about whose money it is.
+    const who = source !== "backtest" && data.trader_label ? ` — ${data.trader_label}` : "";
+    document.title = (source === "backtest" ? "Backtest Equity" : "Live Equity") + who;
     document.getElementById("page-title").textContent =
-      source === "backtest" ? "Backtest Equity Curve" : "Live Equity Curve";
+      (source === "backtest" ? "Backtest Equity Curve" : "Live Equity Curve") + who;
     const assets = [...new Set(allTrades.map(t => t.asset))].sort();
     const cur = document.getElementById("asset-filter").value;
     document.getElementById("asset-filter").innerHTML =
