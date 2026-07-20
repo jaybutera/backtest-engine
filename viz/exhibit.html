@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Exhibit</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<link rel="stylesheet" href="/theme.css">
+<style>
+  html, body { height: 100%; }
+  body { display: flex; flex-direction: column; }
+  .x-meta {
+    padding: 8px 12px; border-bottom: 1px solid var(--line);
+    display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center;
+    font-size: 11px; color: var(--dim);
+  }
+  .x-chip {
+    border: 1px solid var(--line-hard); padding: 1px 6px; color: var(--ink);
+    white-space: nowrap;
+  }
+  .x-chip.uid { cursor: pointer; user-select: all; }
+  .x-chip.uid.copied { background: var(--ink); color: var(--bg); }
+  .x-leg { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+  .x-leg .swatch { width: 8px; height: 8px; display: inline-block; }
+  #chart { flex: 1; min-height: 0; }
+  .x-foot {
+    padding: 6px 12px; border-top: 1px solid var(--line);
+    font-size: 10px; color: var(--dim); letter-spacing: .03em;
+  }
+  .x-help { padding: 24px; max-width: 860px; color: var(--ink); font-size: 12px; line-height: 1.7; }
+  .x-help code { color: var(--shu); }
+  .x-help h2 { font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
+  .empty { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--dim); }
+</style>
+</head>
+<body>
+  <div class="hdr">
+    <div class="title">
+      <h1 id="page-title">EXHIBIT<span class="cjk">展示</span></h1>
+    </div>
+    <nav>
+      <a href="/">Dashboard</a>
+    </nav>
+  </div>
+  <div class="x-meta" id="meta"></div>
+  <div id="chart"></div>
+  <div class="x-foot" id="foot"></div>
+
+<script>
+// ── Exhibit: a self-contained chart permalink ───────────────────────────────
+// Everything needed to draw the exhibit lives in the URL: asset, marker
+// groups (entry/exit/sl/tp), level lines, provenance chips. Candles come from
+// /api/chart (local collector parquets, optionally donor files/scale/offset
+// passed through) — markers are drawn AS QUOTED, never recomputed, so links
+// stay valid regardless of how the engine evolves.
+//
+// Grammar (query params):
+//   asset=EXAMPLE                       required
+//   t=dir:bull,in:TS@PX,out:TS@PX,sl:PX,tp:PX,limit:PX,label:live fill
+//                                       repeated — one marker group per trade
+//   (flat single-trade form also works: dir=&in=&out=&sl=&tp=&limit=&label=)
+//   lvl=96.965@swept swing_low          repeated — horizontal level line
+//   from=TS&to=TS                       optional explicit window
+//   pad=60                              window padding, minutes
+//   src=backtest | live | …      provenance chip (display only)
+//   uid=strategy×fill×dataset@a..b      backtest uid chip (click-to-copy)
+//   title=…  note=…                     heading / footer context
+//   files=stem1,stem2&scale=&offset=    donor-source override for candles
+// TS = epoch seconds, or ISO datetime (assumed UTC unless an offset is given).
+
+const CENTRAL_TZ = "America/Chicago";
+const GROUP_COLORS = ["#58a6ff", "#e8b339", "#c792ea", "#ff9d52", "#4dd0e1"];
+
+function centralHM(epoch) {
+  return new Date(epoch * 1000).toLocaleTimeString("en-GB", {
+    timeZone: CENTRAL_TZ, hour: "2-digit", minute: "2-digit", hour12: false });
+}
+function centralMD(epoch) {
+  return new Date(epoch * 1000).toLocaleDateString("en-US", {
+    timeZone: CENTRAL_TZ, day: "numeric", month: "short" });
+}
+function centralTickMark(epoch, tickType) {
+  return tickType <= 2 ? centralMD(epoch) : centralHM(epoch);
+}
+
+function parseTs(s) {
+  if (!s) return null;
+  s = s.trim();
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  // ISO without explicit zone is UTC (matches the engine's naive-UTC times).
+  const hasZone = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(s);
+  const ms = Date.parse(hasZone ? s : s + "Z");
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+}
+
+// "TS@PX" → {ts, px}; either half may be omitted ("TS", "@PX").
+function parseAnchor(s) {
+  if (!s) return null;
+  const i = s.lastIndexOf("@");
+  const tsPart = i >= 0 ? s.slice(0, i) : s;
+  const pxPart = i >= 0 ? s.slice(i + 1) : "";
+  const ts = tsPart ? parseTs(tsPart) : null;
+  const px = pxPart ? parseFloat(pxPart) : null;
+  if (ts == null && (px == null || Number.isNaN(px))) return null;
+  return { ts, px: Number.isNaN(px) ? null : px };
+}
+
+// "dir:bull,in:TS@PX,sl:96.5,label:live fill" → {dir, in, sl, label, …}.
+// Split on commas, then each field on its FIRST colon (ISO timestamps keep
+// their own colons intact on the value side).
+function parseGroup(s) {
+  const g = {};
+  for (const field of s.split(",")) {
+    const i = field.indexOf(":");
+    if (i <= 0) continue;
+    g[field.slice(0, i).trim()] = field.slice(i + 1).trim();
+  }
+  return g;
+}
+
+function fmtPrice(p) {
+  if (p == null) return "—";
+  const abs = Math.abs(p);
+  const dp = abs >= 1000 ? 1 : abs >= 100 ? 2 : abs >= 1 ? 3 : 5;
+  return p.toFixed(dp);
+}
+
+function barTimeFor(epoch, candles) {
+  let t = candles[0].time;
+  for (const c of candles) {
+    if (c.time > epoch) break;
+    t = c.time;
+  }
+  return t;
+}
+
+const qs = new URLSearchParams(location.search);
+const asset = qs.get("asset");
+
+function collectGroups() {
+  const groups = [];
+  // Flat single-trade form.
+  if (qs.get("in") || qs.get("out") || qs.get("dir")) {
+    const g = {};
+    for (const k of ["dir", "in", "out", "sl", "tp", "limit", "label", "color"]) {
+      const v = qs.get(k);
+      if (v) g[k] = v;
+    }
+    groups.push(g);
+  }
+  for (const raw of qs.getAll("t")) groups.push(parseGroup(raw));
+  return groups.map((g, i) => {
+    const dirRaw = (g.dir || "").toLowerCase();
+    return {
+      label: g.label || (groups.length > 1 ? `#${i + 1}` : ""),
+      dir: dirRaw === "bull" || dirRaw === "long" ? "long"
+         : dirRaw === "bear" || dirRaw === "short" ? "short" : null,
+      entry: parseAnchor(g.in),
+      exit: parseAnchor(g.out),
+      sl: g.sl ? parseFloat(g.sl) : null,
+      tp: g.tp ? parseFloat(g.tp) : null,
+      limit: g.limit ? parseFloat(g.limit) : null,
+      color: g.color || GROUP_COLORS[i % GROUP_COLORS.length],
+    };
+  });
+}
+
+function collectLevels() {
+  return qs.getAll("lvl").map(raw => {
+    const i = raw.indexOf("@");
+    const px = parseFloat(i >= 0 ? raw.slice(0, i) : raw);
+    const label = i >= 0 ? raw.slice(i + 1) : "level";
+    return Number.isNaN(px) ? null : { px, label };
+  }).filter(Boolean);
+}
+
+function showHelp() {
+  document.getElementById("chart").innerHTML = `
+    <div class="x-help">
+      <h2>exhibit — chart permalink</h2>
+      <p>Draws trade markers on real candles from parameters carried entirely in
+      the URL. Nothing is recomputed: the exhibit shows exactly what the link
+      quotes, so links written in reports stay valid as the engine evolves.</p>
+      <p><b>Minimal:</b><br>
+      <code>/exhibit?asset=EXAMPLE&amp;dir=bull&amp;in=TS@96.887&amp;out=TS@97.966&amp;sl=96.505&amp;tp=97.966</code></p>
+      <p><b>Comparison (repeated <code>t</code> groups):</b><br>
+      <code>/exhibit?asset=EXAMPLE&amp;t=label:phantom,dir:bull,in:TS@PX,out:TS@PX&amp;t=label:live fill,dir:bull,in:TS@PX,out:TS@PX</code></p>
+      <p><b>Level lines:</b> <code>lvl=96.965@swept swing_low</code> (repeatable) ·
+      <b>Provenance:</b> <code>src=backtest&amp;uid=strategy×fill×dataset@a..b</code> ·
+      <b>Window:</b> <code>from=TS&amp;to=TS&amp;pad=60</code> ·
+      <b>Donor candles:</b> <code>files=stem&amp;scale=&amp;offset=</code></p>
+      <p>TS = epoch seconds or ISO datetime (UTC unless offset given). Times display in Central,
+      like the rest of the viz. Generate links from a backtest sidecar with
+      <code>uv run scripts/trade_permalink.py</code>.</p>
+    </div>`;
+}
+
+async function main() {
+  const groups = collectGroups();
+  const levels = collectLevels();
+  if (!asset || (!groups.length && !levels.length)) { showHelp(); return; }
+
+  // Window: explicit from/to beats marker-derived extent.
+  const times = groups.flatMap(g => [g.entry?.ts, g.exit?.ts]).filter(t => t != null);
+  const from = parseTs(qs.get("from")) ?? (times.length ? Math.min(...times) : null);
+  const to = parseTs(qs.get("to")) ?? (times.length ? Math.max(...times) : null);
+  if (from == null) { showHelp(); return; }
+  const pad = parseInt(qs.get("pad") || "60", 10);
+
+  // Heading + provenance strip.
+  const dirs = [...new Set(groups.map(g => g.dir).filter(Boolean))];
+  document.title = `${asset} exhibit`;
+  document.getElementById("page-title").innerHTML =
+    `${asset} ${dirs.map(d => d.toUpperCase()).join("/")}` +
+    (qs.get("title") ? ` — ${escText(qs.get("title"))}` : "") +
+    `<span class="cjk">展示</span>`;
+  const meta = document.getElementById("meta");
+  if (qs.get("src")) meta.appendChild(chip(qs.get("src")));
+  if (qs.get("uid")) {
+    const c = chip(qs.get("uid"));
+    c.classList.add("uid");
+    c.title = "click to copy";
+    c.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(qs.get("uid")); } catch (e) { return; }
+      c.classList.add("copied");
+      setTimeout(() => c.classList.remove("copied"), 900);
+    });
+    meta.appendChild(c);
+  }
+  for (const g of groups) {
+    if (!g.label && groups.length === 1) continue;
+    const leg = document.createElement("span");
+    leg.className = "x-leg";
+    leg.innerHTML = `<span class="swatch" style="background:${g.color}"></span>` +
+      escText(`${g.label}${g.entry?.px != null ? " in " + fmtPrice(g.entry.px) : ""}` +
+              `${g.exit?.px != null ? " out " + fmtPrice(g.exit.px) : ""}`);
+    meta.appendChild(leg);
+  }
+  document.getElementById("foot").textContent =
+    (qs.get("note") ? qs.get("note") + " · " : "") +
+    "markers drawn as quoted in the URL on collector candles — not recomputed · times Central";
+
+  // Candles.
+  const p = new URLSearchParams({ asset, entry: from, pad_minutes: pad });
+  if (to != null) p.set("exit", to);
+  for (const k of ["files", "scale", "offset"]) if (qs.get(k)) p.set(k, qs.get(k));
+  const resp = await fetch("/api/chart?" + p.toString());
+  const data = await resp.json();
+  if (!data.candles || !data.candles.length) {
+    document.getElementById("chart").innerHTML =
+      `<div class="empty">No candle data for ${escText(asset)} in this range.</div>`;
+    return;
+  }
+
+  const container = document.getElementById("chart");
+  const chart = LightweightCharts.createChart(container, {
+    layout: { background: { color: "#0b0b0d" }, textColor: "#ebe9e2" },
+    grid: { vertLines: { color: "#1b1b1d" }, horzLines: { color: "#1b1b1d" } },
+    localization: { timeFormatter: (e) => `${centralMD(e)} ${centralHM(e)}` },
+    timeScale: {
+      timeVisible: true, secondsVisible: false,
+      tickMarkFormatter: (e, tt) => centralTickMark(e, tt),
+    },
+    rightPriceScale: { borderColor: "#3a3a38" },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
+  const candleSeries = chart.addCandlestickSeries({
+    upColor: "#37d67a", downColor: "#ff5d52",
+    borderUpColor: "#37d67a", borderDownColor: "#ff5d52",
+    wickUpColor: "#37d67a", wickDownColor: "#ff5d52",
+  });
+  window.addEventListener("resize", () => chart.resize(container.clientWidth, container.clientHeight));
+  candleSeries.setData(data.candles);
+
+  const many = groups.length > 1;
+  const tag = (g, name) => (many && g.label ? `${g.label} ${name}` : name);
+  const line = (price, color, style, title) => candleSeries.createPriceLine({
+    price, color, lineWidth: 1, lineStyle: style, axisLabelVisible: true, title,
+  });
+  const dot = (time, price, color) => {
+    chart.addLineSeries({
+      color, lineVisible: false, pointMarkersVisible: true, pointMarkersRadius: 4,
+      lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
+    }).setData([{ time, value: price }]);
+  };
+
+  const Dashed = LightweightCharts.LineStyle.Dashed;
+  const Dotted = LightweightCharts.LineStyle.Dotted;
+  const markers = [];
+  for (const g of groups) {
+    if (g.limit != null) line(g.limit, g.color, Dashed, tag(g, "limit"));
+    if (g.sl != null) line(g.sl, "#ff5d52", Dotted, tag(g, "stop"));
+    if (g.tp != null) line(g.tp, "#37d67a", Dotted, tag(g, "tp"));
+    if (g.entry?.ts != null) {
+      const bt = barTimeFor(g.entry.ts, data.candles);
+      markers.push({
+        time: bt,
+        position: g.dir === "short" ? "aboveBar" : "belowBar",
+        color: g.color,
+        shape: g.dir === "short" ? "arrowDown" : "arrowUp",
+        text: `${tag(g, "in")}${g.entry.px != null ? " " + fmtPrice(g.entry.px) : ""}`,
+      });
+      if (g.entry.px != null) dot(bt, g.entry.px, g.color);
+    }
+    if (g.exit?.ts != null) {
+      const bt = barTimeFor(g.exit.ts, data.candles);
+      markers.push({
+        time: bt,
+        position: g.dir === "short" ? "belowBar" : "aboveBar",
+        color: g.color,
+        shape: "circle",
+        text: `${tag(g, "out")}${g.exit.px != null ? " " + fmtPrice(g.exit.px) : ""}`,
+      });
+      if (g.exit.px != null) dot(bt, g.exit.px, g.color);
+    }
+    if (g.entry?.ts == null && g.entry?.px != null) line(g.entry.px, g.color, Dashed, tag(g, "in"));
+    if (g.exit?.ts == null && g.exit?.px != null) line(g.exit.px, "#ebe9e2", Dashed, tag(g, "out"));
+  }
+  for (const lv of levels) line(lv.px, "#e8b339", Dashed, lv.label);
+  markers.sort((a, b) => a.time - b.time);
+  candleSeries.setMarkers(markers);
+  chart.timeScale().fitContent();
+}
+
+function chip(text) {
+  const el = document.createElement("span");
+  el.className = "x-chip";
+  el.textContent = text;
+  return el;
+}
+function escText(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+main();
+</script>
+</body>
+</html>
