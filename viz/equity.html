@@ -8,10 +8,9 @@
 <style>
   /* Page-specific layout on top of the shared 端末 TERMINAL theme (theme.css). */
   .app { display: flex; flex-direction: column; height: 100vh; }
-  /* Live/Backtest toggle sits inside the header nav on this page: give the
-     segments room and a left separator so they read as flush header tabs. */
-  .hdr nav .seg2 { border-left: 1px solid var(--line); }
-  .hdr nav .seg2 .seg { padding: 0 14px; display: flex; align-items: center; }
+  /* Live/Backtest toggle sits on the left as its own row under the header
+     (matching the dashboard), not stretched full-width: segments hug content. */
+  .source-toggle .seg { flex: 0 0 auto; padding: 7px 20px; }
   /* Controls row on this page uses inline labels (top-bar layout, not a grid). */
   .ctlrow {
     display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
@@ -58,14 +57,14 @@
       <h1><span id="page-title">Equity Curve</span><span class="cjk">資産曲線</span></h1>
     </div>
     <nav>
-      <div class="seg2 source-toggle" style="border-bottom:0;">
-        <div class="seg active" data-source="live">Live</div>
-        <div class="seg" data-source="backtest">Backtest</div>
-      </div>
       <a href="/" id="trades-link">Trades</a>
       <a href="/engine">Engine</a>
       <button id="refresh-btn">Refresh</button>
     </nav>
+  </div>
+  <div class="seg2 source-toggle">
+    <div class="seg active" data-source="live">Live</div>
+    <div class="seg" data-source="backtest">Backtest</div>
   </div>
   <div class="ctlrow hidden" id="bt-controls">
     <label>From <input type="date" id="bt-from"></label>
