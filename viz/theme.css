@@ -155,6 +155,9 @@ input[type=date]:disabled {
 .switch input:checked + .box::before { content: "\25A0 "; }  /* ■ */
 .switch input:focus-visible + .box { outline: 2px solid var(--shu); outline-offset: 1px; }
 .switch .why { font-size: 9px; color: var(--dim); letter-spacing: .05em; }
+/* Shown only while the selected strategy constrains the dataset axis. Needs the
+   `.switch` qualifier to beat that rule's `display: inline-flex`. */
+.switch.hidden { display: none; }
 
 /* Assets row value in the grid. */
 .grid .assets-val { font-size: 10px; color: var(--dim); }
