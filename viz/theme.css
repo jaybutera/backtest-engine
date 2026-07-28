@@ -244,6 +244,10 @@ input[type=date]:disabled {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 96px;
 }
 .trade:hover .trader-tag { color: inherit; border-color: currentColor; }
+/* Attribution the manage-log join couldn't prove — inferred from nearby ticks
+   and prefixed "≈" in the markup. Dashed border so it reads as a guess. */
+.trade .trader-tag.inferred { border-style: dashed; opacity: .8; }
+.tv-detail .inferred .kd-note { color: var(--dim); font-size: 10px; }
 /* Trade took less than the configured risk (margin clamp / partial fill). */
 .trade .risk-cut { color: var(--shu); font-size: 10px; letter-spacing: .04em; }
 .trade:hover .risk-cut { color: inherit; }
