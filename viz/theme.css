@@ -272,11 +272,19 @@ input[type=date]:disabled {
 }
 .trade .dir.short { color: var(--loss); }
 .trade .dir.long { color: var(--win); }
+/* Options (swing) rows: the dir cell carries the strategy badge, colored by
+   credit (sold premium) vs debit (paid premium). */
+.trade .dir.credit { color: var(--win); }
+.trade .dir.debit { color: #58a6ff; }
 .trade .when { color: var(--dim); font-size: 10px; }
 .trade .pnl { text-align: right; font-weight: 700; }
 .trade .pnl.win { color: var(--win); }
 .trade .pnl.loss { color: var(--loss); }
 .trade .pnl.scratch { color: var(--dim); font-weight: 400; }
+/* Options position states that aren't win/loss: an open swing shows its mark
+   in plain ink; pending/cancelled are quiet non-results. */
+.trade .pnl.open { color: var(--ink); }
+.trade .pnl.pending, .trade .pnl.cancelled { color: var(--dim); font-weight: 400; }
 /* Round-trip fee shown on its own line under the PnL (live HL trades only). */
 .trade .pnl .fee { display: block; color: var(--dim); font-size: 9px; font-weight: 400; }
 .trade:hover .pnl .fee { color: inherit; }
