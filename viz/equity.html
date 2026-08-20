@@ -94,6 +94,19 @@
 <script>
 let allTrades = [];
 let compoundMeta = null;   // engine-computed {risk_frac, account_size, final_balance, max_dd_frac, multiple}
+// Per-asset source overrides stamped in the backtest sidecar ({asset: {files,
+// scale, offset}}), when the run redirected assets to other feeds (e.g. the
+// CME presets map xyz:XYZ100 -> NQ full-size bars). Used to label series and
+// filter options with the real feed, so an "xyz:" name never reads as
+// one venue's data when the bars underneath are another's. Display only.
+let runSources = null;
+
+// "xyz:XYZ100 (NQ)" when the run sourced this asset from other files, else the
+// plain asset id. Labels/option text only — filter VALUES stay the asset id.
+function assetLabel(a) {
+  const s = runSources && runSources[a];
+  return s && s.files && s.files.length ? `${a} (${s.files.join("+")})` : a;
+}
 let source = localStorage.getItem("viz.source") || "live";
 // Which live account this page charts, carried in from the trades page via
 // ?trader= (the dashboard's Equity link sets it). Without it /api/trades falls
@@ -300,7 +313,7 @@ function render() {
     const assets = [...byAsset.keys()].sort();
     assets.forEach((a, i) => {
       const curve = buildCurve(byAsset.get(a));
-      if (curve.length) addLine(a, curve, ASSET_COLORS[i % ASSET_COLORS.length]);
+      if (curve.length) addLine(assetLabel(a), curve, ASSET_COLORS[i % ASSET_COLORS.length]);
     });
     addLine("Total", overall, "#ebe9e2");
   } else {
@@ -326,6 +339,7 @@ async function loadTrades({refresh = false} = {}) {
     // Engine-embedded compounding summary (present when the strategy set
     // risk_frac>0); null otherwise. When set, the page plots the $ equity curve.
     compoundMeta = (source === "backtest" && data.compound) || null;
+    runSources = (source === "backtest" && data.sources) || null;
     // Name the account being charted (server label, e.g. "Live Trader
     // (main)") so live curves are never ambiguous about whose money it is.
     const who = source !== "backtest" && data.trader_label ? ` — ${data.trader_label}` : "";
@@ -336,7 +350,7 @@ async function loadTrades({refresh = false} = {}) {
     const cur = document.getElementById("asset-filter").value;
     document.getElementById("asset-filter").innerHTML =
       `<option value="">All</option>` +
-      assets.map(a => `<option value="${a}"${a === cur ? " selected" : ""}>${a}</option>`).join("");
+      assets.map(a => `<option value="${a}"${a === cur ? " selected" : ""}>${assetLabel(a)}</option>`).join("");
     updateBacktestStatus(data.exists, data.generated_at, data.freshness);
     render();
   } finally {
