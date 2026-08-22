@@ -537,6 +537,80 @@ pub fn load_asset_candles_with_sources(
     all
 }
 
+/// Remove contract-roll discontinuities from a continuous futures series.
+///
+/// A continuous 1m file stitched from successive contracts carries a price
+/// jump wherever the lead contract switched. Left in, that jump reads as a
+/// market move: it distorts every indicator that spans it and can fire or
+/// suppress signals on a gap that no position ever experienced. This applies
+/// a back-adjustment: each roll gap is added to every bar before it, so the
+/// series is continuous and anchored at the most recent contract's true
+/// prices.
+///
+/// A roll is detected as a jump between two contiguous bars (at most
+/// `max_gap_secs` apart) that straddle a UTC-day boundary and exceed
+/// `4 × p99.9` of ordinary bar-to-bar jumps that do NOT straddle midnight.
+/// The midnight condition matches how such files are usually built (the lead
+/// contract switches at a day boundary); the multiple is wide enough that a
+/// genuine move at that hour — thin evening session — essentially never
+/// qualifies, while roll gaps sit an order of magnitude above it.
+///
+/// `candles` must be sorted by timestamp. Returns the number of splices
+/// removed. Series shorter than a few hundred bars are left untouched: there
+/// is no stable jump distribution to threshold against.
+pub fn roll_adjust(candles: &mut [Candle], max_gap_secs: i64) -> usize {
+    if candles.len() < 500 {
+        return 0;
+    }
+    let day = |c: &Candle| c.timestamp.and_utc().timestamp().div_euclid(86_400);
+    let secs = |c: &Candle| c.timestamp.and_utc().timestamp();
+
+    let mut diffs: Vec<f64> = Vec::with_capacity(candles.len());
+    for w in candles.windows(2) {
+        let contiguous = secs(&w[1]) - secs(&w[0]) <= max_gap_secs;
+        let midnight = day(&w[1]) != day(&w[0]);
+        if contiguous && !midnight {
+            diffs.push((w[1].open - w[0].close).abs());
+        }
+    }
+    if diffs.len() < 100 {
+        return 0;
+    }
+    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p999 = diffs[((diffs.len() as f64) * 0.999) as usize];
+    let threshold = 4.0 * p999;
+    if !threshold.is_finite() || threshold <= 0.0 {
+        return 0;
+    }
+
+    // (index of the first bar AFTER the splice, signed gap)
+    let mut splices: Vec<(usize, f64)> = Vec::new();
+    for i in 1..candles.len() {
+        let contiguous = secs(&candles[i]) - secs(&candles[i - 1]) <= max_gap_secs;
+        let midnight = day(&candles[i]) != day(&candles[i - 1]);
+        let d = candles[i].open - candles[i - 1].close;
+        if contiguous && midnight && d.abs() > threshold {
+            splices.push((i, d));
+        }
+    }
+    // Walk backwards, accumulating the offset applied to everything earlier.
+    let mut offset = 0.0;
+    let mut si = splices.len();
+    for i in (0..candles.len()).rev() {
+        while si > 0 && splices[si - 1].0 == i + 1 {
+            si -= 1;
+            offset += splices[si].1;
+        }
+        if offset != 0.0 {
+            candles[i].open += offset;
+            candles[i].high += offset;
+            candles[i].low += offset;
+            candles[i].close += offset;
+        }
+    }
+    splices.len()
+}
+
 /// Discover parquet files and return (path, asset_name) pairs.
 /// Deduplicates by asset, keeping the file with the most rows.
 pub fn discover_parquet_files(data_dirs: &[&Path]) -> Vec<(std::path::PathBuf, String)> {
@@ -933,6 +1007,89 @@ pub fn last_timestamp_us(path: &Path) -> std::io::Result<Option<i64>> {
         }
     }
     Ok(max_ts)
+}
+
+#[cfg(test)]
+mod roll_adjust_tests {
+    use super::*;
+    use crate::models::{asset_id, tf_id};
+    use chrono::{Duration, NaiveDate};
+
+    /// A flat 1m series over `days` UTC days with a small regular wobble,
+    /// plus a jump of `gap` applied from `roll_at` onward.
+    fn series(days: i64, roll_at: NaiveDateTime, gap: f64) -> Vec<Candle> {
+        let t0 = NaiveDate::from_ymd_opt(2025, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        (0..days * 1440)
+            .map(|i| {
+                let ts = t0 + Duration::minutes(i);
+                let wobble = if i % 2 == 0 { 0.1 } else { -0.1 };
+                let base = 100.0 + wobble + if ts >= roll_at { gap } else { 0.0 };
+                Candle {
+                    asset: asset_id("T"),
+                    timeframe: tf_id("1m"),
+                    open: base,
+                    high: base + 0.2,
+                    low: base - 0.2,
+                    close: base + 0.05,
+                    volume: 1.0,
+                    timestamp: ts,
+                    complete: true,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_midnight_jump_is_removed_and_earlier_bars_shifted() {
+        let roll = NaiveDate::from_ymd_opt(2025, 1, 3)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let mut c = series(5, roll, 40.0);
+        let before_last = c.last().unwrap().close;
+        let n = roll_adjust(&mut c, 600);
+        assert_eq!(n, 1);
+        // Anchored at the latest prices: the tail is untouched.
+        assert_eq!(c.last().unwrap().close, before_last);
+        // Earlier bars were lifted by the gap, so the series is continuous.
+        // The measured gap is open-after minus close-before: 140.1 - 99.95.
+        assert!(
+            (c[0].open - (100.1 + 40.15)).abs() < 1e-9,
+            "got {}",
+            c[0].open
+        );
+        let max_jump = c
+            .windows(2)
+            .map(|w| (w[1].open - w[0].close).abs())
+            .fold(0.0, f64::max);
+        assert!(max_jump < 1.0, "residual jump {max_jump}");
+    }
+
+    #[test]
+    fn a_midday_jump_is_a_market_move_and_stays() {
+        let mid = NaiveDate::from_ymd_opt(2025, 1, 3)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let mut c = series(5, mid, 40.0);
+        let first = c[0].open;
+        assert_eq!(roll_adjust(&mut c, 600), 0);
+        assert_eq!(c[0].open, first);
+    }
+
+    #[test]
+    fn short_series_are_left_alone() {
+        let roll = NaiveDate::from_ymd_opt(2025, 1, 1)
+            .unwrap()
+            .and_hms_opt(1, 0, 0)
+            .unwrap();
+        let mut c = series(5, roll, 40.0);
+        c.truncate(100);
+        assert_eq!(roll_adjust(&mut c, 600), 0);
+    }
 }
 
 #[cfg(test)]
