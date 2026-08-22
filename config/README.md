@@ -12,13 +12,24 @@ data, should be one flag and not a fork.
 
 ## Strategy — which trades to take
 
-`config/strategy/*.toml`. An asset list, a pointer to an engine config, and a
-`[strategy]` table of parameters.
+`config/strategy/*.toml`. An asset list, a pointer to an engine config, a
+`[strategy]` table of parameters, and a few top-level keys:
 
-Every key in `[strategy]` is validated against a registry at load time. A key
-that is not in the registry is a **hard load error**, not a warning — a typo'd
-parameter name should fail loudly rather than silently grade a different
-strategy than you meant to run.
+| Key | Meaning |
+|---|---|
+| `factory = "name"` | Which registered strategy factory builds this preset. Optional when the binary registers only one. |
+| `base = "other.toml"` | Inherit from another preset (one level). |
+| `engine = "path"` | Passed through to the factory untouched. |
+| `assets = [...]` | The watchlist. |
+| `[[source]]` | Map an asset onto other parquet stems (see Dataset). |
+| `[[contract]]` | Flat per-contract fee spec: `asset`, `point_value`, `round_turn`, `schedule`. |
+| `roll_adjust = true` | Back-adjust contract-roll gaps out of every loaded series. |
+
+Every key in `[strategy]` is validated against a registry at load time: the
+engine's own knobs plus the ones the selected factory declares. A key that is
+in neither is a **hard load error**, not a warning — a typo'd parameter name
+should fail loudly rather than silently grade a different strategy than you
+meant to run.
 
 Parameters absent from a preset take their registry default, and the defaults
 are chosen so that an unmentioning preset behaves as though the feature does

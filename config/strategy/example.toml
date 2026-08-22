@@ -8,7 +8,28 @@
 # against the knob registry at load time; an unrecognized key fails the load
 # rather than being ignored.
 
+# Which registered strategy factory builds this preset. The shipped binary
+# registers only "macross", so this line is optional here; a binary that
+# registers several factories needs it (or --factory on the command line).
+factory = "macross"
+
 assets = ["EXAMPLE"]
+
+# Flat per-contract fee specs, if the data is futures. Declaring any
+# [[contract]] switches the fee schedule to "futures" (or "futures_full" when
+# every contract says so) unless fee_schedule is set explicitly below.
+#
+#     [[contract]]
+#     asset = "EXAMPLE"
+#     point_value = 5.0     # dollars per point, per contract
+#     round_turn = 1.90     # all-in fee per contract, in and out
+#     schedule = "futures"  # or "futures_full"
+#
+# Back-adjust contract-roll gaps out of every loaded series. Off by default
+# because it rewrites prices; turn it on for continuous futures files that
+# were stitched unadjusted at the roll.
+#
+#     roll_adjust = true
 
 [strategy]
 # Minimum score an opportunity needs before the default admission rule takes
@@ -27,3 +48,10 @@ max_hold = 300
 # Charge fees. Leaving this off flatters short-hold strategies badly: at a
 # small stop distance the round-trip cost can exceed the entire edge.
 fees = true
+
+# Knobs declared by the "macross" factory itself (see
+# src/example_strategy.rs). They validate like the built-in ones above; a
+# preset for another factory would not know them.
+ma_fast = 20
+ma_slow = 60
+ma_stop_atr_mult = 2.0

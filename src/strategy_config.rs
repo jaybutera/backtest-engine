@@ -46,8 +46,23 @@ struct StrategyFile {
     base: Option<String>,
     /// Path to the engine config (the `[v2]` TOML).
     engine: Option<String>,
+    /// Which registered [`crate::strategy::StrategyFactory`] builds this
+    /// preset's strategy, by name. Optional when the driver has exactly one
+    /// factory registered.
+    #[serde(rename = "factory")]
+    strategy_impl: Option<String>,
     /// Asset watchlist for this preset.
     assets: Option<Vec<String>>,
+    /// Per-contract fee specs (`[[contract]]` tables) for flat-fee futures
+    /// schedules. Registered with [`crate::fees`] by the driver at load time,
+    /// so a run's fee model is readable from its config rather than hidden in
+    /// a `register_contract` call somewhere in a binary.
+    #[serde(default)]
+    contract: Vec<ContractEntry>,
+    /// Remove contract-roll discontinuities from every loaded series before
+    /// the strategy sees it (see [`crate::data::roll_adjust`]). Off by
+    /// default: it rewrites prices, so a run must opt in knowingly.
+    roll_adjust: Option<bool>,
     /// Optional config-driven data-source overrides (`[[source]]` tables).
     /// Each maps an asset to one or more backing parquet file stems with an
     /// optional price scale/offset, so a backtest can run an asset against a
@@ -103,6 +118,40 @@ struct SourceEntry {
 
 fn default_scale() -> f64 {
     1.0
+}
+
+/// One `[[contract]]` table: a flat per-contract fee spec for one asset.
+///
+/// ```toml
+/// [[contract]]
+/// asset = "EXAMPLE"
+/// point_value = 5.0      # dollars per one point of price, per contract
+/// round_turn = 1.90      # all-in fee per contract, in and out
+/// schedule = "futures"   # or "futures_full"; default "futures"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContractEntry {
+    asset: String,
+    point_value: f64,
+    round_turn: f64,
+    #[serde(default = "default_contract_schedule")]
+    schedule: String,
+}
+
+fn default_contract_schedule() -> String {
+    "futures".to_string()
+}
+
+/// A resolved `[[contract]]` entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContractSpecEntry {
+    pub asset: String,
+    pub point_value: f64,
+    pub round_turn: f64,
+    /// `"futures"` or `"futures_full"` — which flat schedule this spec
+    /// belongs to.
+    pub schedule: String,
 }
 
 /// A resolved data-source override for one asset, ready to feed the loader.
@@ -293,6 +342,30 @@ pub fn legacy_fill_keys_in_strategy(path: &Path) -> Vec<String> {
     found
 }
 
+/// Read the top-level `factory = "<name>"` key from a strategy file without
+/// validating the rest of it, following one level of `base`.
+///
+/// The driver needs the factory name BEFORE the full load, because the
+/// factory's own knobs have to be registered for the `[strategy]` table to
+/// validate. A cheap generic re-parse breaks that cycle.
+pub fn peek_strategy_factory(path: &Path) -> Option<String> {
+    fn read(path: &Path) -> Option<toml::Value> {
+        std::fs::read_to_string(path)
+            .ok()?
+            .parse::<toml::Value>()
+            .ok()
+    }
+    let child = read(path)?;
+    if let Some(name) = child.get("factory").and_then(|v| v.as_str()) {
+        return Some(name.to_string());
+    }
+    let base_rel = child.get("base").and_then(|v| v.as_str())?;
+    read(&resolve_relative(path, base_rel))?
+        .get("factory")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Which run context we're resolving defaults for. The `fees` default differs:
 /// backtests default fees ON, live defaults fees OFF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,7 +386,13 @@ pub enum Context {
 #[derive(Debug, Clone)]
 pub struct ResolvedStrategy {
     pub engine: Option<String>,
+    /// The factory name from the file's top-level `factory = "..."`, if set.
+    pub strategy_impl: Option<String>,
     pub assets: Option<Vec<String>>,
+    /// Per-contract fee specs from `[[contract]]` tables. Empty when none.
+    pub contracts: Vec<ContractSpecEntry>,
+    /// Whether the loader should roll-adjust every series (`roll_adjust`).
+    pub roll_adjust: bool,
     /// Config-driven data-source overrides, one per asset that declares a
     /// `[[source]]`. Empty when none are declared (loader uses defaults).
     pub sources: Vec<AssetSource>,
@@ -449,8 +528,18 @@ fn merge(into: &mut StrategyFile, child: StrategyFile) {
     if child.engine.is_some() {
         into.engine = child.engine;
     }
+    if child.strategy_impl.is_some() {
+        into.strategy_impl = child.strategy_impl;
+    }
+    if child.roll_adjust.is_some() {
+        into.roll_adjust = child.roll_adjust;
+    }
     if child.assets.is_some() {
         into.assets = child.assets;
+    }
+    // Contracts: same all-or-nothing replacement as sources.
+    if !child.contract.is_empty() {
+        into.contract = child.contract;
     }
     // Source overrides: a child that declares any `[[source]]` replaces the
     // base's set wholesale (matches the all-or-nothing nature of `assets`).
@@ -586,6 +675,35 @@ pub fn load_strategy(path: &Path, context: Context) -> Result<ResolvedStrategy, 
         })
         .collect();
 
+    let contracts: Vec<ContractSpecEntry> = acc
+        .contract
+        .into_iter()
+        .map(|c| ContractSpecEntry {
+            asset: c.asset,
+            point_value: c.point_value,
+            round_turn: c.round_turn,
+            schedule: c.schedule,
+        })
+        .collect();
+    for c in &contracts {
+        if c.schedule != "futures" && c.schedule != "futures_full" {
+            return Err(format!(
+                "strategy config {}: [[contract]] for {} names schedule \"{}\" \
+                 (expected \"futures\" or \"futures_full\")",
+                path.display(),
+                c.asset,
+                c.schedule
+            ));
+        }
+        if !c.point_value.is_finite() || c.point_value <= 0.0 || c.round_turn < 0.0 {
+            return Err(format!(
+                "strategy config {}: [[contract]] for {} needs point_value > 0 and round_turn >= 0",
+                path.display(),
+                c.asset
+            ));
+        }
+    }
+
     // Validate the merged `[strategy]` table against the knob registry. This
     // replaces serde's `deny_unknown_fields` and is strictly stronger: it
     // rejects unknown keys AND wrong-typed values, with a did-you-mean hint.
@@ -602,8 +720,18 @@ pub fn load_strategy(path: &Path, context: Context) -> Result<ResolvedStrategy, 
     // An explicit `fee_schedule` in the config still wins — the registered
     // default is the empty string precisely so "unset" is distinguishable
     // from a deliberate choice.
+    // Declared `[[contract]]` specs imply the flat schedule they belong to:
+    // a config that prices its assets per contract does not also have to say
+    // so twice. A mixed declaration (some full-size, some micro) picks the
+    // full-size schedule only if every contract is full-size.
     if !params.is_set("fee_schedule") {
-        let inferred = if sources_use_futures(&sources) {
+        let inferred = if !contracts.is_empty() {
+            if contracts.iter().all(|c| c.schedule == "futures_full") {
+                "futures_full"
+            } else {
+                "futures"
+            }
+        } else if sources_use_futures(&sources) {
             "futures"
         } else if sources_use_futures_full(&sources) {
             "futures_full"
@@ -615,7 +743,10 @@ pub fn load_strategy(path: &Path, context: Context) -> Result<ResolvedStrategy, 
 
     Ok(ResolvedStrategy {
         engine,
+        strategy_impl: acc.strategy_impl,
         assets: acc.assets,
+        contracts,
+        roll_adjust: acc.roll_adjust.unwrap_or(false),
         sources,
         params,
     })
@@ -662,6 +793,120 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, content).unwrap();
         p
+    }
+
+    #[test]
+    fn contracts_factory_and_roll_adjust_resolve() {
+        let _g = STEM_GUARD.lock().unwrap();
+        clear_futures_stems();
+        let d = tmpdir("contracts");
+        let p = write_tmp(
+            &d,
+            "s.toml",
+            r#"
+factory = "macross"
+roll_adjust = true
+assets = ["X"]
+
+[[contract]]
+asset = "X"
+point_value = 5.0
+round_turn = 1.9
+
+[[contract]]
+asset = "Y"
+point_value = 50.0
+round_turn = 4.3
+schedule = "futures_full"
+
+[strategy]
+rr = 2.0
+"#,
+        );
+        assert_eq!(peek_strategy_factory(&p).as_deref(), Some("macross"));
+        let r = load_strategy(&p, Context::Replay).unwrap();
+        assert_eq!(r.strategy_impl.as_deref(), Some("macross"));
+        assert!(r.roll_adjust);
+        assert_eq!(r.contracts.len(), 2);
+        assert_eq!(r.contracts[0].schedule, "futures");
+        assert_eq!(r.contracts[1].schedule, "futures_full");
+        // Mixed micro/full declarations imply the micro schedule.
+        assert_eq!(r.params.get_str("fee_schedule"), "futures");
+    }
+
+    #[test]
+    fn all_full_size_contracts_imply_the_full_schedule_unless_overridden() {
+        let _g = STEM_GUARD.lock().unwrap();
+        clear_futures_stems();
+        let d = tmpdir("contracts_full");
+        let p = write_tmp(
+            &d,
+            "s.toml",
+            "[[contract]]\nasset = \"Y\"\npoint_value = 50.0\nround_turn = 4.3\nschedule = \"futures_full\"\n",
+        );
+        let r = load_strategy(&p, Context::Replay).unwrap();
+        assert_eq!(r.params.get_str("fee_schedule"), "futures_full");
+        let p2 = write_tmp(
+            &d,
+            "s2.toml",
+            "[[contract]]\nasset = \"Y\"\npoint_value = 50.0\nround_turn = 4.3\nschedule = \"futures_full\"\n[strategy]\nfee_schedule = \"perp\"\n",
+        );
+        assert_eq!(
+            load_strategy(&p2, Context::Replay)
+                .unwrap()
+                .params
+                .get_str("fee_schedule"),
+            "perp"
+        );
+    }
+
+    #[test]
+    fn a_bad_contract_is_a_hard_error() {
+        let d = tmpdir("contracts_bad");
+        let p = write_tmp(
+            &d,
+            "s.toml",
+            "[[contract]]\nasset = \"Y\"\npoint_value = 0.0\nround_turn = 1.0\n",
+        );
+        assert!(load_strategy(&p, Context::Replay)
+            .unwrap_err()
+            .contains("point_value"));
+        let p = write_tmp(&d, "s2.toml", "[[contract]]\nasset = \"Y\"\npoint_value = 1.0\nround_turn = 1.0\nschedule = \"spot\"\n");
+        assert!(load_strategy(&p, Context::Replay)
+            .unwrap_err()
+            .contains("schedule"));
+        let p = write_tmp(
+            &d,
+            "s3.toml",
+            "[[contract]]\nasset = \"Y\"\npoint_value = 1.0\nround_turn = 1.0\nbogus = 1\n",
+        );
+        assert!(load_strategy(&p, Context::Replay).is_err());
+    }
+
+    #[test]
+    fn factory_key_is_inherited_from_base_and_peekable() {
+        let d = tmpdir("factory_base");
+        write_tmp(
+            &d,
+            "base.toml",
+            "factory = \"macross\"\n[strategy]\nrr = 2.0\n",
+        );
+        let child = write_tmp(
+            &d,
+            "child.toml",
+            "base = \"base.toml\"\n[strategy]\nrr = 3.0\n",
+        );
+        assert_eq!(peek_strategy_factory(&child).as_deref(), Some("macross"));
+        let r = load_strategy(&child, Context::Replay).unwrap();
+        assert_eq!(r.strategy_impl.as_deref(), Some("macross"));
+        assert!(!r.roll_adjust);
+        assert!(r.contracts.is_empty());
+        let child2 = write_tmp(
+            &d,
+            "child2.toml",
+            "base = \"base.toml\"\nfactory = \"other\"\n",
+        );
+        assert_eq!(peek_strategy_factory(&child2).as_deref(), Some("other"));
     }
 
     /// A unique temp dir per test, so two tests never race on the same files
