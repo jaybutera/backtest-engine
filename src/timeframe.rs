@@ -2,9 +2,19 @@ use crate::models::{Candle, tf_id, tf_name};
 use chrono::{NaiveDateTime, TimeDelta};
 use std::collections::HashMap;
 
+// Memoized by timeframe ID: this is called once per aggregated timeframe per
+// base candle in `TimeframeBuilder::process`, plus per signal in scoring, and
+// previously took the intern pool's mutex and cloned an `Arc<str>` every time
+// just to re-derive a constant. The `tf_minutes_str` table is unchanged; every
+// value it returns is a small integer, exactly representable in f64, so the
+// round-trip through the memo is lossless.
+static TF_MINUTES_ID: crate::models::TfMemo =
+    crate::models::TfMemo::new(|tf| tf_minutes_str(&tf_name(tf)) as f64);
+
 /// Timeframe durations in minutes (accepts u16 ID).
+#[inline]
 pub fn tf_minutes_id(tf: u16) -> i64 {
-    tf_minutes_str(&tf_name(tf))
+    TF_MINUTES_ID.get(tf) as i64
 }
 
 /// Timeframe durations in minutes (accepts string).
@@ -141,6 +151,23 @@ mod tests {
             let price = 50000.0 + (i as f64) * 10.0;
             make_1m_candle("BTC", i, price, price + 20.0, price - 10.0, price + 5.0)
         }).collect()
+    }
+
+    /// `tf_minutes_id` is memoized through an f64 slot; every value the table
+    /// returns must survive that round trip exactly, on the cold miss and on
+    /// the cached hit.
+    #[test]
+    fn tf_minutes_id_matches_the_string_table() {
+        for name in ["1m", "5m", "15m", "1h", "4h", "1D", "1W", "not-a-timeframe"] {
+            let id = tf_id(name);
+            for pass in 0..2 {
+                assert_eq!(
+                    tf_minutes_id(id),
+                    tf_minutes_str(name),
+                    "tf_minutes_id mismatch for {name:?} on pass {pass}"
+                );
+            }
+        }
     }
 
     #[test]
