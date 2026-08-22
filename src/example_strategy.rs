@@ -28,6 +28,11 @@
 //!    [`Opportunity`], which lets the default [`Strategy::admit`] project the
 //!    take-profit from the run's reward:risk target without the strategy
 //!    knowing what that target is.
+//! 4. **A factory with its own knobs.** [`MaCrossoverFactory`] declares the
+//!    three `[strategy]` keys this strategy reads (`ma_fast`, `ma_slow`,
+//!    `ma_stop_atr_mult`), so a preset can tune them and a typo in one is a
+//!    load error like any other. The binary registers the factory with
+//!    [`crate::driver::main`]; your crate does the same with yours.
 //!
 //! # It is a poor demonstration of the fill lenses
 //!
@@ -46,8 +51,10 @@
 
 use std::collections::HashMap;
 
+use crate::knob;
 use crate::models::{is_1m, Candle, Direction, Opportunity};
-use crate::strategy::Strategy;
+use crate::params::{Knob, Value};
+use crate::strategy::{BuildContext, Strategy, StrategyFactory};
 
 /// Rolling state for one asset.
 #[derive(Debug, Clone)]
@@ -89,6 +96,51 @@ impl MaCrossover {
             stop_atr_mult,
             state: HashMap::new(),
         }
+    }
+}
+
+/// The knobs [`MaCrossoverFactory`] adds to the `[strategy]` table.
+pub static MA_KNOBS: &[Knob] = &[
+    knob!(
+        "ma_fast",
+        U32,
+        Value::U32(20),
+        "Fast moving-average window, in base-timeframe bars."
+    ),
+    knob!(
+        "ma_slow",
+        U32,
+        Value::U32(60),
+        "Slow moving-average window, in base-timeframe bars. Must exceed ma_fast."
+    ),
+    knob!(
+        "ma_stop_atr_mult",
+        F64,
+        Value::F64(2.0),
+        "Stop distance as a multiple of the mean bar range over the slow window."
+    ),
+];
+
+/// Builds [`MaCrossover`] from a preset. Registered under the name
+/// `"macross"`; the reference for how a strategy crate plugs into
+/// [`crate::driver`].
+pub struct MaCrossoverFactory;
+
+impl StrategyFactory for MaCrossoverFactory {
+    fn name(&self) -> &str {
+        "macross"
+    }
+
+    fn knobs(&self) -> &'static [Knob] {
+        MA_KNOBS
+    }
+
+    fn build(&self, ctx: &BuildContext<'_>) -> Box<dyn Strategy> {
+        Box::new(MaCrossover::new(
+            ctx.params.get_u32("ma_fast") as usize,
+            ctx.params.get_u32("ma_slow") as usize,
+            ctx.params.get_f64("ma_stop_atr_mult"),
+        ))
     }
 }
 

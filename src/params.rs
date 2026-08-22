@@ -37,6 +37,7 @@
 //! behaves exactly as it did before that knob existed.
 
 use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 /// A knob's declared type. Determines both how a TOML value is validated on
 /// load and which accessor may read it.
@@ -93,11 +94,27 @@ pub struct Knob {
     pub doc: &'static str,
 }
 
+/// Declare one knob: name, [`Kind`], default, and the reason it exists.
+///
+/// Exported so a strategy crate can declare its own knobs for
+/// [`register_knobs`] / [`crate::strategy::StrategyFactory::knobs`] in the
+/// same form the engine uses:
+///
+/// ```
+/// use backtest_engine::knob;
+/// use backtest_engine::params::{Knob, Value};
+///
+/// static MY_KNOBS: &[Knob] = &[
+///     knob!("lookback", U32, Value::U32(20), "Bars of history the signal reads."),
+/// ];
+/// assert_eq!(MY_KNOBS[0].name, "lookback");
+/// ```
+#[macro_export]
 macro_rules! knob {
     ($name:literal, $kind:ident, $default:expr, $doc:literal) => {
-        Knob {
+        $crate::params::Knob {
             name: $name,
-            kind: Kind::$kind,
+            kind: $crate::params::Kind::$kind,
             default: || $default,
             doc: $doc,
         }
@@ -415,9 +432,73 @@ pub static REGISTRY: &[Knob] = &[
     ),
 ];
 
-/// Look up a knob spec by name.
+/// Knobs declared by a strategy rather than by the engine, registered at
+/// startup through [`register_knobs`].
+///
+/// The engine's own registry is a static table because its knobs are fixed
+/// at compile time. A strategy plugged in through
+/// [`crate::strategy::StrategyFactory`] brings its own knobs, and they have to
+/// be visible to the same validation, typo hints and default lookup as the
+/// built-in ones — otherwise a private `[strategy]` key is either a hard load
+/// error or a silently ignored line, and neither is acceptable. This table is
+/// the extension point: it is consulted after `REGISTRY` everywhere a knob is
+/// looked up by name.
+static EXTRA: LazyLock<Mutex<Vec<&'static Knob>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Register strategy-declared knobs so they validate and resolve like built-in
+/// ones. Call before loading any config that sets them — the driver does this
+/// for the selected factory's [`crate::strategy::StrategyFactory::knobs`].
+///
+/// A name that collides with a built-in knob is an error: the engine's
+/// meaning of `rr` or `max_hold` must not be redefinable by a plugin.
+/// Re-registering the same slice is a no-op, so a driver that builds several
+/// per-asset strategies may call this freely.
+pub fn register_knobs(knobs: &'static [Knob]) -> Result<(), String> {
+    let mut extra = EXTRA.lock().unwrap();
+    for k in knobs {
+        if REGISTRY.iter().any(|r| r.name == k.name) {
+            return Err(format!(
+                "strategy knob \"{}\" collides with a built-in engine knob",
+                k.name
+            ));
+        }
+        if let Some(existing) = extra.iter().find(|e| e.name == k.name) {
+            if !std::ptr::eq(*existing, k) {
+                return Err(format!(
+                    "strategy knob \"{}\" registered twice with different definitions",
+                    k.name
+                ));
+            }
+            continue;
+        }
+        extra.push(k);
+    }
+    Ok(())
+}
+
+/// Forget every strategy-declared knob. Mainly for tests.
+pub fn clear_registered_knobs() {
+    EXTRA.lock().unwrap().clear();
+}
+
+/// Every knob currently known: the built-in registry followed by any
+/// strategy-declared ones.
+pub fn all_knobs() -> Vec<&'static Knob> {
+    let mut v: Vec<&'static Knob> = REGISTRY.iter().collect();
+    v.extend(EXTRA.lock().unwrap().iter().copied());
+    v
+}
+
+/// Look up a knob spec by name, built-in first, then strategy-declared.
 pub fn spec(name: &str) -> Option<&'static Knob> {
-    REGISTRY.iter().find(|k| k.name == name)
+    REGISTRY.iter().find(|k| k.name == name).or_else(|| {
+        EXTRA
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|k| k.name == name)
+    })
 }
 
 /// The registered default for `name`.
@@ -429,7 +510,7 @@ fn registered_default(name: &str) -> Value {
     match spec(name) {
         Some(k) => (k.default)(),
         None => {
-            panic!("params: knob \"{name}\" is not in REGISTRY — add a knob!() row in params.rs")
+            panic!("params: knob \"{name}\" is not registered — add a knob!() row in params.rs, or register it via params::register_knobs")
         }
     }
 }
@@ -687,8 +768,8 @@ impl Params {
 /// Suggest a close registered name for an unknown key, so a typo says what it
 /// probably meant.
 fn nearest_hint(key: &str) -> String {
-    let best = REGISTRY
-        .iter()
+    let best = all_knobs()
+        .into_iter()
         .map(|k| (edit_distance(key, k.name), k.name))
         .filter(|(d, _)| *d <= 3)
         .min_by_key(|(d, _)| *d);
@@ -756,6 +837,62 @@ fn coerce(raw: &toml::Value, kind: Kind) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The extension registry is process-global; tests that touch it
+    /// serialize on this lock and start from an empty table.
+    static EXTRA_GUARD: Mutex<()> = Mutex::new(());
+
+    static PLUGIN_KNOBS: &[Knob] = &[
+        knob!(
+            "plug_depth",
+            U32,
+            Value::U32(7),
+            "A strategy-declared knob."
+        ),
+        knob!("plug_ratio", F64, Value::F64(0.5), "Another one."),
+    ];
+
+    #[test]
+    fn registered_knobs_validate_and_default_like_builtin_ones() {
+        let _g = EXTRA_GUARD.lock().unwrap();
+        clear_registered_knobs();
+        // Before registration: unknown, and a hard error.
+        assert!(spec("plug_depth").is_none());
+        assert!(Params::from_table(&table("plug_depth = 3"), "t").is_err());
+
+        register_knobs(PLUGIN_KNOBS).unwrap();
+        let p = Params::from_table(&table("plug_depth = 3"), "t").unwrap();
+        assert_eq!(p.get_u32("plug_depth"), 3);
+        // Unset resolves to the declared default, same as a built-in.
+        assert_eq!(p.get_f64("plug_ratio"), 0.5);
+        assert!(!p.is_set("plug_ratio"));
+        // Wrong type is still a hard error.
+        assert!(Params::from_table(&table("plug_ratio = \"x\""), "t").is_err());
+        // Typo hints see strategy knobs too.
+        let err = Params::from_table(&table("plug_dept = 3"), "t").unwrap_err();
+        assert!(err.contains("plug_depth"), "got: {err}");
+        // Registering the same slice again is a no-op.
+        register_knobs(PLUGIN_KNOBS).unwrap();
+        assert_eq!(
+            all_knobs()
+                .iter()
+                .filter(|k| k.name == "plug_depth")
+                .count(),
+            1
+        );
+        clear_registered_knobs();
+    }
+
+    #[test]
+    fn a_strategy_knob_may_not_shadow_a_builtin() {
+        let _g = EXTRA_GUARD.lock().unwrap();
+        clear_registered_knobs();
+        static CLASH: &[Knob] = &[knob!("rr", F64, Value::F64(9.0), "Redefines rr.")];
+        let err = register_knobs(CLASH).unwrap_err();
+        assert!(err.contains("collides"), "got: {err}");
+        assert!(spec("rr").map(|k| (k.default)()) == Some(Value::F64(2.0)));
+        clear_registered_knobs();
+    }
 
     fn table(toml_src: &str) -> toml::value::Table {
         toml_src

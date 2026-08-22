@@ -51,7 +51,7 @@
 //! method. See [`crate::example_strategy`] for a runnable end-to-end example.
 
 use crate::models::{Candle, Direction, Opportunity};
-use crate::params::Params;
+use crate::params::{Knob, Params};
 
 /// Everything a strategy is allowed to know about the run's configuration when
 /// it decides whether to admit an opportunity.
@@ -249,6 +249,92 @@ pub trait Strategy {
     fn admit(&self, opp: &Opportunity, ctx: &AdmitContext<'_>) -> Decision {
         default_admit(opp, ctx)
     }
+}
+
+/// A boxed strategy is a strategy, so a driver can hold strategies of
+/// different concrete types behind one [`crate::pipeline::Pipeline`] type
+/// parameter. [`StrategyFactory::build`] returns this form.
+impl Strategy for Box<dyn Strategy> {
+    fn on_candle(&mut self, candle: &Candle) -> Vec<Opportunity> {
+        (**self).on_candle(candle)
+    }
+    fn admit(&self, opp: &Opportunity, ctx: &AdmitContext<'_>) -> Decision {
+        (**self).admit(opp, ctx)
+    }
+}
+
+/// What a factory is handed to build one per-asset strategy instance.
+///
+/// Everything here is resolved configuration: the factory reads its own
+/// knobs from `params`, its engine pointer from `engine`, and builds state
+/// for `asset` alone — the driver runs one instance per asset, on its own
+/// thread, and they never share state.
+#[derive(Clone, Debug)]
+pub struct BuildContext<'a> {
+    /// The asset this instance trades, as the name that appears in the data
+    /// file stem and the report.
+    pub asset: &'a str,
+    /// The validated knob bag: built-in knobs plus the factory's own.
+    pub params: &'a Params,
+    /// The resolved `engine = "..."` path from the strategy file, if any. The
+    /// engine does not interpret it; a factory that keeps its own larger
+    /// configuration outside the knob bag loads it from here.
+    pub engine: Option<&'a str>,
+    /// Higher timeframes the driver will aggregate and feed to
+    /// [`Strategy::on_candle`], after merging the factory's
+    /// [`StrategyFactory::timeframes`] with any the CLI added.
+    pub timeframes: &'a [String],
+    /// The strategy file the run was configured from, if one was given. A
+    /// factory whose configuration outgrows the knob bag can re-read it with
+    /// its own loader; the engine has already validated the `[strategy]`
+    /// table against the factory's declared knobs.
+    pub strategy_file: Option<&'a std::path::Path>,
+}
+
+/// Builds [`Strategy`] instances, and declares what they need from config.
+///
+/// This is the seam a strategy crate plugs into. The engine's binary is a
+/// thin wrapper around [`crate::driver::main`] that registers one factory (the
+/// bundled example); a private crate registers its own factories with the
+/// same call and gets the whole driver — config loading, data, fills, report
+/// — without copying any of it. A strategy file selects the factory by name
+/// with a top-level `strategy = "<name>"` key.
+///
+/// # Knobs
+///
+/// A factory declares the `[strategy]` keys it reads via [`Self::knobs`].
+/// The driver registers them with [`crate::params::register_knobs`] before
+/// the config loads, so they validate exactly like built-in knobs: unknown
+/// keys are a hard error, wrong types are a hard error, and a key the config
+/// never mentions resolves to its declared default. Built-in knob names are
+/// reserved and cannot be redeclared.
+///
+/// # Toward out-of-process plugins
+///
+/// Nothing here requires the factory to live in the same crate as the
+/// driver; the trait is object-safe and its inputs are plain data. A future
+/// loader could hand the same [`BuildContext`] across a library boundary.
+/// That is not implemented: today a factory is linked in.
+pub trait StrategyFactory: Send + Sync {
+    /// The name a strategy file selects this factory by (`strategy = "..."`).
+    /// Short, lowercase, stable.
+    fn name(&self) -> &str;
+
+    /// Knobs this strategy reads from `[strategy]`, beyond the built-in ones.
+    /// Declare with [`crate::knob!`]. Default: none.
+    fn knobs(&self) -> &'static [Knob] {
+        &[]
+    }
+
+    /// Higher timeframes the strategy wants aggregated and delivered to
+    /// [`Strategy::on_candle`] (`"5m"`, `"1h"`, …). Merged with any `--timeframe`
+    /// the CLI adds. Default: none — the strategy sees base-interval bars only.
+    fn timeframes(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Build one instance for one asset.
+    fn build(&self, ctx: &BuildContext<'_>) -> Box<dyn Strategy>;
 }
 
 /// The engine's built-in admission rule, and the default body of
