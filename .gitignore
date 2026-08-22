@@ -20,3 +20,7 @@ data/
 
 # Backtest output
 *.json.tmp
+ensemble_runs/
+
+# Local tooling state and experiment worktrees
+.claude/

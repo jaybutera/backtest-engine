@@ -110,10 +110,84 @@ position is managed, what it earns in R — belongs to the harness.
 the engine runs end to end out of the box. It is a demonstration of the
 interface. It is not an edge, and it is commented as such.
 
+### Plugging it in
+
+The binary does not know about your strategy, and you do not fork the engine
+to teach it. You write a `StrategyFactory` and a three-line `main` in your own
+crate:
+
+```rust
+use backtest_engine::{driver, knob};
+use backtest_engine::params::{Knob, Value};
+use backtest_engine::strategy::{BuildContext, Strategy, StrategyFactory};
+
+static KNOBS: &[Knob] = &[
+    knob!("lookback", U32, Value::U32(20), "Bars of history the signal reads."),
+];
+
+struct MyFactory;
+
+impl StrategyFactory for MyFactory {
+    fn name(&self) -> &str { "mine" }
+    fn knobs(&self) -> &'static [Knob] { KNOBS }
+    fn build(&self, ctx: &BuildContext<'_>) -> Box<dyn Strategy> {
+        Box::new(MyStrategy::new(ctx.params.get_u32("lookback")))
+    }
+}
+
+fn main() {
+    driver::main(&[&MyFactory]);
+}
+```
+
+That binary has the whole driver: config loading, data, fill lenses, fees,
+the report, `--json-sidecar` for the visualizer. The shipped `backtest` binary
+is exactly this with the example factory registered (`src/main.rs`).
+
+A strategy file names its factory with a top-level `factory = "mine"` key, or
+the run passes `--factory mine`; a binary with one factory registered needs
+neither. The factory's knobs validate alongside the engine's: a preset may set
+`lookback = 30`, and `lookbak = 30` is a load error with a did-you-mean hint,
+same as a typo in `rr`. Built-in knob names are reserved, so a factory cannot
+redefine what `max_hold` means. `ctx.engine` carries the file's `engine = ...`
+path untouched, for a strategy whose configuration outgrows a flat knob bag.
+
+Strategy code, presets and the factory binary can all live in a private crate
+that depends on this one by path or version. Nothing about the engine needs
+to be rebuilt or modified for it. Factories are linked in today; the trait is
+object-safe and its inputs are plain data, which is deliberate, but loading
+one from a separate library at runtime is not implemented.
+
 Strategy parameters live in `config/strategy/*.toml`, validated against a knob
 registry at load time. A key absent from the registry is a hard load error
 rather than a silently ignored line — a typo'd knob name should not quietly
 grade a different strategy than you meant to run.
+
+### Contracts and continuous futures
+
+Flat per-contract fees are declared in the strategy file, so a run's fee
+model is readable from its config:
+
+```toml
+[[contract]]
+asset = "EXAMPLE"
+point_value = 5.0     # dollars per point, per contract
+round_turn = 1.90     # all-in fee per contract, in and out
+schedule = "futures"  # or "futures_full"
+```
+
+Declaring any contract selects the matching flat schedule unless
+`fee_schedule` says otherwise. Without one, every asset is priced as basis
+points of notional at placeholder rates. For an index future quoted in the
+thousands with a stop a few points away, that bps charge is more than an
+order of magnitude larger than the real per-contract fee, and it decides
+the sign of the result.
+
+A continuous futures file stitched unadjusted at contract rolls carries a
+price jump at each roll. `roll_adjust = true` (or `--roll-adjust`) removes
+them at load: each gap detected at a UTC-day boundary is added to every bar
+before it, anchoring the series at the latest contract's prices. It rewrites
+prices, so it is off by default.
 
 ## Trade management
 
@@ -126,7 +200,8 @@ quietly bank profit.
 ## Layout
 
     src/            engine: data, fills, fees, accounting, config
-    src/strategy.rs the trait, and the types crossing it
+    src/driver.rs   the replay driver: CLI, config, threads, report
+    src/strategy.rs the trait, the factory seam, and the types crossing them
     viz/            web UI (Python)
     config/fill/    fill lenses
     config/strategy/ strategy presets

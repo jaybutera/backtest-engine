@@ -81,6 +81,7 @@
 
 pub mod atr;
 pub mod data;
+pub mod driver;
 pub mod example_strategy;
 pub mod fees;
 pub mod hold;
