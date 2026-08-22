@@ -79,6 +79,12 @@ struct StrategyFile {
     #[serde(default)]
     #[allow(dead_code)]
     viz: Option<toml::Value>,
+    /// Free-form parameters for a strategy whose knobs are not registered
+    /// with the engine — a script's. Not validated; handed to the factory
+    /// verbatim via [`crate::strategy::BuildContext::script`]. Child keys
+    /// override base keys one by one, like `[strategy]`.
+    #[serde(default)]
+    script: toml::value::Table,
 }
 
 /// The fill-lens key names. A strategy file carrying any of them is using the
@@ -400,6 +406,9 @@ pub struct ResolvedStrategy {
     /// `[strategy]` table can set. Handed verbatim to whatever consumes the
     /// preset, so there is no second place a knob has to be wired up.
     pub params: Params,
+    /// The unvalidated `[script]` table, for factories whose parameters are
+    /// not registered knobs. Empty when the file has none.
+    pub script: toml::value::Table,
 }
 
 impl ResolvedStrategy {
@@ -551,6 +560,9 @@ fn merge(into: &mut StrategyFile, child: StrategyFile) {
     // per-knob line, so adding a knob costs nothing here.
     for (k, v) in child.strategy {
         into.strategy.insert(k, v);
+    }
+    for (k, v) in child.script {
+        into.script.insert(k, v);
     }
 }
 
@@ -749,6 +761,7 @@ pub fn load_strategy(path: &Path, context: Context) -> Result<ResolvedStrategy, 
         roll_adjust: acc.roll_adjust.unwrap_or(false),
         sources,
         params,
+        script: acc.script,
     })
 }
 

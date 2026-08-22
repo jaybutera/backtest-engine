@@ -27,6 +27,7 @@ comfy-table = "7"
 colored = "2"
 log = "0.4"
 env_logger = "0.11"
+rhai = { version = "1", features = ["unchecked"] }
 
 [dev-dependencies]
 tempfile = "3"

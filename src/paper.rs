@@ -285,6 +285,16 @@ pub struct PaperTrader {
     /// ready_at), kept for the JSON sidecar so the Ready→touch lead of every
     /// trade is analyzable offline. Never drained; merged across assets.
     pub trade_ready_at: HashMap<String, NaiveDateTime>,
+    /// Trades that closed during the most recent [`Self::update_prices`]
+    /// call, as `(index into trades, was_a_genuine_stop_exit)`. Cleared at
+    /// the start of every update, so a strategy's
+    /// [`crate::strategy::Strategy::on_bar_close`] hook sees exactly this
+    /// bar's exits and nothing older.
+    pub closed_this_bar: Vec<(usize, bool)>,
+    /// Strategy-managed stop overrides, keyed by opportunity id (see
+    /// [`Self::set_open_stop`]). An override replaces the planned stop for
+    /// exit resolution only; the planned `|entry - stop|` stays the R unit.
+    stop_overrides: HashMap<String, f64>,
 }
 
 /// A compounding equity curve: per-trade `(opportunity_id, balance_after,
@@ -834,6 +844,8 @@ impl PaperTrader {
             first_touch_ids: HashSet::new(),
             resting_intervals: Vec::new(),
             pending_placed_at: HashMap::new(),
+            closed_this_bar: Vec::new(),
+            stop_overrides: HashMap::new(),
         }
     }
 
@@ -997,6 +1009,7 @@ impl PaperTrader {
     }
 
     pub fn update_prices(&mut self, candle: &Candle) {
+        self.closed_this_bar.clear();
         // Tick-resolution fill mode: if enabled AND this bar has real trade
         // ticks, resolve entries/stops/TPs by walking those ticks in time order
         // (exact crossing timestamps). A bar with no ticks falls through to the
@@ -1121,6 +1134,12 @@ impl PaperTrader {
                     };
                 }
             }
+            // A strategy-managed stop (on_bar_close hook) wins over both the
+            // planned stop and the trailing lock.
+            if let Some(&s) = self.stop_overrides.get(&trade.opportunity_id) {
+                effective_stop = s;
+                trail_active = false;
+            }
 
             // Loss/win R measured from `fill`, always ÷ R_planned (`risk`).
             let loss_r = |px_stop: f64| -> f64 {
@@ -1226,6 +1245,7 @@ impl PaperTrader {
             self.watermarks.remove(&opp_id);
             self.partial_taken.remove(&opp_id);
             self.entry_fee_side.remove(&opp_id);
+            self.stop_overrides.remove(&opp_id);
         }
 
         // Survivors of the race + any freshly-filled trades appended by
@@ -1517,6 +1537,10 @@ impl PaperTrader {
                         };
                     }
                 }
+                if let Some(&s) = self.stop_overrides.get(&trade.opportunity_id) {
+                    effective_stop = s;
+                    trail_active = false;
+                }
 
                 let hit_stop = match trade.direction {
                     Direction::Bull => tick.price <= effective_stop,
@@ -1618,6 +1642,7 @@ impl PaperTrader {
             self.watermarks.remove(&opp_id);
             self.partial_taken.remove(&opp_id);
             self.entry_fee_side.remove(&opp_id);
+            self.stop_overrides.remove(&opp_id);
         }
 
         // Survivors of the tick race stay open for the next bar.
@@ -2037,8 +2062,10 @@ impl PaperTrader {
         is_stop_exit: bool,
     ) {
         let had_partial = self.partial_taken.remove(opp_id);
-        for trade in self.trades.iter_mut() {
+        let mut closed_idx: Option<usize> = None;
+        for (idx, trade) in self.trades.iter_mut().enumerate() {
             if trade.opportunity_id == opp_id && trade.result == TradeResult::Inconclusive {
+                closed_idx = Some(idx);
                 trade.result = result;
                 // Apply partial TP adjustment: half banked at partial_tp_r, half gets final r_pnl
                 let adjusted_r = if had_partial && self.partial_tp_r > 0.0 {
@@ -2108,6 +2135,137 @@ impl PaperTrader {
                 break;
             }
         }
+        if let Some(idx) = closed_idx {
+            self.closed_this_bar.push((idx, is_stop_exit));
+        }
+    }
+
+    /// Book a market entry at this bar's close, on behalf of a strategy's
+    /// [`crate::strategy::Strategy::on_bar_close`] hook.
+    ///
+    /// The position is opened immediately at `candle.close` as an aggressing
+    /// (taker) fill and joins the book like any other fresh fill: it is not
+    /// raced until the next candle, and its hold clock starts then. `stop`
+    /// must sit on the losing side of the close and `tp` on the winning side,
+    /// else nothing is booked and `false` is returned. `opportunity_id` must
+    /// be unique across the run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn book_market_entry(
+        &mut self,
+        opportunity_id: &str,
+        signal_type: u16,
+        direction: Direction,
+        stop: f64,
+        tp: f64,
+        score: f64,
+        candle: &Candle,
+    ) -> bool {
+        let fill = candle.close;
+        let take = TakeParams {
+            entry: fill,
+            stop,
+            tp,
+        };
+        if !take.is_valid(direction) {
+            return false;
+        }
+        if self
+            .trades
+            .iter()
+            .any(|t| t.opportunity_id == opportunity_id)
+        {
+            return false;
+        }
+        let trade = PaperTrade {
+            opportunity_id: opportunity_id.to_string(),
+            signal_type,
+            asset: candle.asset,
+            timeframe: candle.timeframe,
+            direction,
+            entry: fill,
+            stop,
+            tp,
+            fill,
+            score,
+            opened_at: candle.timestamp,
+            filled_at: None,
+            closed_at: None,
+            result: TradeResult::Inconclusive,
+            r_pnl: 0.0,
+            fee_r: 0.0,
+        };
+        self.book_fill(trade, fill, EntryFeeSide::Taker, candle.timestamp);
+        true
+    }
+
+    /// Move an open trade's stop. Applies from the next candle on; the planned
+    /// `|entry - stop|` stays the R unit, so a stop moved to breakeven books a
+    /// 0R exit rather than rescaling the trade. Returns `false` when no open
+    /// trade has this id.
+    pub fn set_open_stop(&mut self, opportunity_id: &str, stop: f64) -> bool {
+        if !self
+            .open_trades
+            .iter()
+            .any(|t| t.opportunity_id == opportunity_id)
+        {
+            return false;
+        }
+        self.stop_overrides
+            .insert(opportunity_id.to_string(), stop);
+        true
+    }
+
+    /// Move an open trade's take-profit. Applies from the next candle on.
+    pub fn set_open_tp(&mut self, opportunity_id: &str, tp: f64) -> bool {
+        match self
+            .open_trades
+            .iter_mut()
+            .find(|t| t.opportunity_id == opportunity_id)
+        {
+            Some(t) => {
+                t.tp = tp;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The effective stop of an open trade: the strategy override if one is
+    /// set, else the planned stop.
+    pub fn effective_stop(&self, trade: &PaperTrade) -> f64 {
+        self.stop_overrides
+            .get(&trade.opportunity_id)
+            .copied()
+            .unwrap_or(trade.stop)
+    }
+
+    /// Close an open trade at this bar's close (a market exit). The R is
+    /// measured from the fill over the planned risk; a negative result books
+    /// as a loss, a flat or positive one as inconclusive — a management exit
+    /// is neither a stop-out nor a target hit.
+    pub fn close_open_at_market(&mut self, opportunity_id: &str, candle: &Candle) -> bool {
+        let Some(pos) = self
+            .open_trades
+            .iter()
+            .position(|t| t.opportunity_id == opportunity_id)
+        else {
+            return false;
+        };
+        let trade = self.open_trades.remove(pos);
+        let risk = (trade.entry - trade.stop).abs();
+        let r = hold::timeout_r(trade.direction, trade.fill, candle.close, risk);
+        let result = if r < 0.0 {
+            TradeResult::Loss
+        } else {
+            TradeResult::Inconclusive
+        };
+        self.close_trade(&trade.opportunity_id, result, r, candle.timestamp, false);
+        self.watermarks.remove(&trade.opportunity_id);
+        self.partial_taken.remove(&trade.opportunity_id);
+        self.entry_fee_side.remove(&trade.opportunity_id);
+        self.hold_counts.remove(&trade.opportunity_id);
+        self.stop_overrides.remove(&trade.opportunity_id);
+        true
     }
 
     pub fn close_remaining(&mut self) {

@@ -8,7 +8,8 @@
 
 use backtest_engine::driver;
 use backtest_engine::example_strategy::MaCrossoverFactory;
+use backtest_engine::rhai_strategy::RhaiFactory;
 
 fn main() {
-    driver::main(&[&MaCrossoverFactory]);
+    driver::main(&[&MaCrossoverFactory, &RhaiFactory]);
 }

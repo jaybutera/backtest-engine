@@ -535,6 +535,18 @@ impl Params {
         }
     }
 
+    /// The resolved value of a knob: what the config set, else the registered
+    /// default.
+    ///
+    /// # Panics
+    /// Panics if `name` is not registered.
+    pub fn get(&self, name: &str) -> Value {
+        match self.set.get(name) {
+            Some(v) => v.clone(),
+            None => registered_default(name),
+        }
+    }
+
     /// Whether a config explicitly set this key, as opposed to inheriting the
     /// registered default. Needed by the handful of knobs whose "unset" state
     /// is semantically distinct from their default value — `min_score` (unset

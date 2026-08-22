@@ -24,3 +24,5 @@ ensemble_runs/
 
 # Local tooling state and experiment worktrees
 .claude/
+# A data symlink (the data/ rule above covers a directory, not a link)
+/data

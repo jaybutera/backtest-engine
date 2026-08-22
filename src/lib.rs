@@ -91,6 +91,7 @@ pub mod models;
 pub mod paper;
 pub mod params;
 pub mod pipeline;
+pub mod rhai_strategy;
 pub mod strategy;
 pub mod strategy_config;
 pub mod timeframe;

@@ -1,0 +1,16 @@
+# The bundled example strategy, as a Rhai script. Runs the same numbers as
+# config/strategy/example.toml through scripts/rhai/macross.rhai.
+factory = "rhai"
+assets = ["EXAMPLE"]
+
+[strategy]
+script = "../../scripts/rhai/macross.rhai"
+min_score = 1.0
+rr = 2.0
+max_hold = 300
+fees = true
+
+[script]
+ma_fast = 20
+ma_slow = 60
+ma_stop_atr_mult = 2.0

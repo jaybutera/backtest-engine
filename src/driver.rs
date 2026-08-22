@@ -33,7 +33,7 @@ use std::time::Instant;
 use crate::models::{self, Candle};
 use crate::paper::{PaperTrader, TickStore};
 use crate::pipeline::Pipeline;
-use crate::strategy::{BuildContext, Strategy, StrategyFactory};
+use crate::strategy::{BuildContext, MarketData, Strategy, StrategyFactory};
 use crate::timeframe::TimeframeBuilder;
 use crate::{data, fees, params, strategy_config};
 
@@ -394,7 +394,24 @@ fn run_replay(mut args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
         }
     }
     let engine_path: Option<String> = resolved.as_ref().and_then(|r| r.engine.clone());
+    let script_table: toml::value::Table = resolved
+        .as_ref()
+        .map(|r| r.script.clone())
+        .unwrap_or_default();
+    let script_table = &script_table;
     let strategy_file: Option<PathBuf> = args.config_strategy.as_ref().map(PathBuf::from);
+
+    // Every series, shared read-only with every strategy for cross-asset
+    // reads. The per-asset loops below iterate their own Arc.
+    let asset_candles: Vec<(String, std::sync::Arc<Vec<Candle>>)> = asset_candles
+        .into_iter()
+        .map(|(a, c)| (a, std::sync::Arc::new(c)))
+        .collect();
+    let mut market = MarketData::new();
+    for (a, c) in &asset_candles {
+        market.insert(a, c.clone());
+    }
+    let market = &market;
 
     // ── One thread per asset ───────────────────────────────────────────────
     // Scoped threads: the factory is borrowed, not `'static`, and every
@@ -425,11 +442,13 @@ fn run_replay(mut args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
                         engine: engine_path.as_deref(),
                         timeframes: &timeframes,
                         strategy_file: strategy_file.as_deref(),
+                        market,
+                        script: script_table,
                     });
                     let mut pipeline = Pipeline::new();
                     pipeline.insert_asset(aid, strategy, TimeframeBuilder::new(&timeframes), pt);
 
-                    for candle in &candles {
+                    for candle in candles.iter() {
                         pipeline.process_candle(candle);
                     }
 

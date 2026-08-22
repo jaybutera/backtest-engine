@@ -50,7 +50,11 @@
 //! configured reward:risk multiple, so the minimal strategy above is only one
 //! method. See [`crate::example_strategy`] for a runnable end-to-end example.
 
-use crate::models::{Candle, Direction, Opportunity};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::models::{Candle, Direction, Opportunity, PaperTrade};
+use crate::paper::PaperTrader;
 use crate::params::{Knob, Params};
 
 /// Everything a strategy is allowed to know about the run's configuration when
@@ -249,6 +253,156 @@ pub trait Strategy {
     fn admit(&self, opp: &Opportunity, ctx: &AdmitContext<'_>) -> Decision {
         default_admit(opp, ctx)
     }
+
+    /// Manage the book after a completed base-timeframe bar has advanced
+    /// fills and exits.
+    ///
+    /// Called once per completed base bar, after the fill simulator has
+    /// filled resting orders and resolved stops, targets and timeouts for
+    /// that bar, and before any higher-timeframe bar the base bar closes is
+    /// offered to [`Self::on_candle`]. The [`Book`] shows what closed on this
+    /// bar and what is open or resting, and accepts management actions:
+    /// move a stop or target, close a position at the bar's close, cancel a
+    /// resting entry, or open a position at the bar's close.
+    ///
+    /// Everything a strategy does here takes effect from the next bar: a
+    /// moved stop is raced by the next candle, a market entry is raced by
+    /// the next candle. Nothing can be undone within the bar that caused it.
+    /// The default does nothing.
+    fn on_bar_close(&mut self, _candle: &Candle, _book: &mut Book<'_>) {}
+}
+
+/// One bar's view of the fill simulator, handed to
+/// [`Strategy::on_bar_close`]: what just closed, what is open or resting,
+/// and the management actions the strategy may take.
+pub struct Book<'a> {
+    trader: &'a mut PaperTrader,
+    candle: &'a Candle,
+}
+
+/// A trade that closed on the bar [`Strategy::on_bar_close`] is looking at.
+#[derive(Debug, Clone)]
+pub struct ClosedTrade {
+    pub trade: PaperTrade,
+    /// True only for a genuine stop-loss exit: not a target, not a timeout,
+    /// not a management close.
+    pub stop_exit: bool,
+}
+
+impl<'a> Book<'a> {
+    /// Wrap a trader for one bar. A driver calls this right after
+    /// [`PaperTrader::update_prices`] for `candle`.
+    pub fn new(trader: &'a mut PaperTrader, candle: &'a Candle) -> Self {
+        Self { trader, candle }
+    }
+
+    /// The bar being managed.
+    pub fn candle(&self) -> &Candle {
+        self.candle
+    }
+
+    /// Trades that closed on this bar, in closing order.
+    pub fn closed(&self) -> Vec<ClosedTrade> {
+        self.trader
+            .closed_this_bar
+            .iter()
+            .map(|&(i, stop_exit)| ClosedTrade {
+                trade: self.trader.trades[i].clone(),
+                stop_exit,
+            })
+            .collect()
+    }
+
+    /// Positions currently open, including any filled on this bar.
+    pub fn open(&self) -> &[PaperTrade] {
+        &self.trader.open_trades
+    }
+
+    /// The effective stop of an open trade (a strategy override if one was
+    /// set, else the planned stop).
+    pub fn effective_stop(&self, trade: &PaperTrade) -> f64 {
+        self.trader.effective_stop(trade)
+    }
+
+    /// Opportunity ids of entry limits still resting unfilled.
+    pub fn pending_ids(&self) -> Vec<String> {
+        self.trader.pending_ids()
+    }
+
+    /// Whether any position is open for this asset.
+    pub fn has_open(&self) -> bool {
+        !self.trader.open_trades.is_empty()
+    }
+
+    /// Open a position at this bar's close as an aggressing fill. See
+    /// [`PaperTrader::book_market_entry`].
+    pub fn market_entry(
+        &mut self,
+        opportunity_id: &str,
+        signal_type: u16,
+        direction: Direction,
+        stop: f64,
+        tp: f64,
+        score: f64,
+    ) -> bool {
+        self.trader.book_market_entry(
+            opportunity_id,
+            signal_type,
+            direction,
+            stop,
+            tp,
+            score,
+            self.candle,
+        )
+    }
+
+    /// Move an open trade's stop; effective from the next bar.
+    pub fn set_stop(&mut self, opportunity_id: &str, stop: f64) -> bool {
+        self.trader.set_open_stop(opportunity_id, stop)
+    }
+
+    /// Move an open trade's take-profit; effective from the next bar.
+    pub fn set_tp(&mut self, opportunity_id: &str, tp: f64) -> bool {
+        self.trader.set_open_tp(opportunity_id, tp)
+    }
+
+    /// Close an open trade at this bar's close.
+    pub fn close(&mut self, opportunity_id: &str) -> bool {
+        self.trader.close_open_at_market(opportunity_id, self.candle)
+    }
+
+    /// Cancel a resting entry limit. No trade is recorded.
+    pub fn cancel(&mut self, opportunity_id: &str) {
+        self.trader
+            .cancel_pending_by_id(opportunity_id, self.candle.timestamp)
+    }
+}
+
+/// Every loaded candle series of the run, by asset name, for strategies
+/// that read other assets (a sibling index for divergence, a proxy for a
+/// thin market). Shared read-only across the per-asset threads.
+///
+/// A strategy must not read past the bar it is being shown; the series are
+/// complete for the run, so lookahead is possible here and is the
+/// strategy's responsibility to avoid. The Rhai binding enforces it by
+/// clamping every window to the current bar.
+#[derive(Clone, Debug, Default)]
+pub struct MarketData {
+    pub series: HashMap<String, Arc<Vec<Candle>>>,
+}
+
+impl MarketData {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, asset: &str, candles: Arc<Vec<Candle>>) {
+        self.series.insert(asset.to_string(), candles);
+    }
+
+    pub fn get(&self, asset: &str) -> Option<&Arc<Vec<Candle>>> {
+        self.series.get(asset)
+    }
 }
 
 /// A boxed strategy is a strategy, so a driver can hold strategies of
@@ -260,6 +414,9 @@ impl Strategy for Box<dyn Strategy> {
     }
     fn admit(&self, opp: &Opportunity, ctx: &AdmitContext<'_>) -> Decision {
         (**self).admit(opp, ctx)
+    }
+    fn on_bar_close(&mut self, candle: &Candle, book: &mut Book<'_>) {
+        (**self).on_bar_close(candle, book)
     }
 }
 
@@ -289,6 +446,11 @@ pub struct BuildContext<'a> {
     /// its own loader; the engine has already validated the `[strategy]`
     /// table against the factory's declared knobs.
     pub strategy_file: Option<&'a std::path::Path>,
+    /// Every asset's loaded candle series, for cross-asset reads.
+    pub market: &'a MarketData,
+    /// The strategy file's free-form `[script]` table, unvalidated. Empty
+    /// when there is none.
+    pub script: &'a toml::value::Table,
 }
 
 /// Builds [`Strategy`] instances, and declares what they need from config.

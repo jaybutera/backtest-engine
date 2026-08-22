@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use crate::models::{asset_name, sig_type_name, Candle, Direction, Opportunity};
 use crate::paper::PaperTrader;
-use crate::strategy::Strategy;
+use crate::strategy::{Book, Strategy};
 use crate::timeframe::TimeframeBuilder;
 
 /// Per-asset runtime for one backtest: the strategy, the timeframe aggregator,
@@ -105,6 +105,13 @@ impl<S: Strategy> Pipeline<S> {
         // ── 2) The completed bar advances fills, races and exits ────────────
         if let Some(pt) = self.traders.get_mut(&aid) {
             pt.update_prices(candle);
+            self.reap_closed(aid);
+        }
+
+        // ── 2b) The strategy manages the book it can now see ────────────────
+        if let (Some(s), Some(pt)) = (self.strategies.get_mut(&aid), self.traders.get_mut(&aid)) {
+            let mut book = Book::new(pt, candle);
+            s.on_bar_close(candle, &mut book);
             self.reap_closed(aid);
         }
 
