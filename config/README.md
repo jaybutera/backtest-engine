@@ -24,6 +24,7 @@ data, should be one flag and not a fork.
 | `[[source]]` | Map an asset onto other parquet stems (see Dataset). |
 | `[[contract]]` | Flat per-contract fee spec: `asset`, `point_value`, `round_turn`, `schedule`. |
 | `roll_adjust = true` | Back-adjust contract-roll gaps out of every loaded series. |
+| `[script]` | Free-form parameters for a scripted strategy (`factory = "rhai"`). Not validated; handed to the script as `cfg.script`. |
 
 Every key in `[strategy]` is validated against a registry at load time: the
 engine's own knobs plus the ones the selected factory declares. A key that is

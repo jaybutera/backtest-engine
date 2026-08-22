@@ -163,6 +163,77 @@ registry at load time. A key absent from the registry is a hard load error
 rather than a silently ignored line — a typo'd knob name should not quietly
 grade a different strategy than you meant to run.
 
+### Scripting a strategy in Rhai
+
+The same seam is reachable without a Rust crate. The shipped binary registers
+a `rhai` factory that runs a strategy written as a [Rhai](https://rhai.rs)
+script, selected from the strategy file:
+
+```toml
+factory = "rhai"
+engine = "my_params.toml"          # optional; handed to the script as a path
+
+[strategy]
+script = "my_strategy.rhai"        # relative to this file
+script_history = 500               # bars of history kept per timeframe
+
+[script]                           # free-form, unvalidated; reaches init(cfg)
+lookback = 20
+```
+
+A script implements the same things a native strategy does, with the same
+information and the same honesty rules. It keeps its own state between bars,
+sees every completed candle of its asset on the base timeframe and on every
+`--timeframe` added to the run, reads candle history and other assets'
+series, emits opportunities, decides their geometry, and manages the book
+after each bar. Nothing is pre-computed for it: what to trade is entirely the
+script's business. `scripts/rhai/macross.rhai` is the bundled example ported
+line for line; run through `config/strategy/example_rhai.toml` it produces
+the same trades as the native version.
+
+```rhai
+fn init(cfg) { #{ n: cfg.script.lookback, above: () } }   // state, bound to `this`
+
+fn on_candle(c) {
+    if c.tf != "1m" { return []; }
+    let h = hist("1m");                  // newest first: h.close(0) == c.close
+    if h.len < this.n { return []; }
+    let o = opp("breakout", "1m", "bull", c.ts);
+    o.entry = c.close; o.stop = c.close - h.atr(14); o.score = 1.0;
+    [o]
+}
+
+fn admit(o, ctx) {                        // optional: geometry or a skip reason
+    if o.score < ctx.min_score { return skip("below_min_score"); }
+    take(o.entry, o.stop, o.entry + ctx.rr_target * (o.entry - o.stop))
+}
+
+fn on_bar_close(c, book) {                // optional: manage the book
+    for t in book.open() { if t.r_open > 1.0 { book.set_stop(t.id, t.fill); } }
+    for t in book.closed() { if t.stop_exit { /* arm a re-entry watch */ } }
+}
+```
+
+What the engine supplies: `hist(tf)` (a ring of completed candles with
+`open/high/low/close/ts(i)`, `atr(n)`, `highest(n)`, `lowest(n)`, `sma(n)`),
+`market(asset)` (any loaded asset's series, read through windows that are
+clamped to the current bar so a sibling's future stays out of reach),
+`dt_utc/dt_offset/dt_tz` (wall-clock fields in a zone), `fee_in_r`,
+`toml_load`, and the book: `closed()`, `open()`, `pending()`, `has_open()`,
+`market_entry(#{...})`, `set_stop`, `set_tp`, `close`, `cancel`. Management
+actions take effect on the next bar, as for a native strategy. Higher
+timeframes arrive on the same `on_candle` stream with `c.tf` set, after the
+base bar that closes them has been processed.
+
+Rhai passes arguments by value, so state is mutated through `this`
+(`this.levels.push(x)`) and helpers that mutate a sub-object are written as
+methods on it. Two things to know before trusting a script's numbers: the
+engine builds Rhai with its `unchecked` feature because the default float
+comparison is approximate (two prices a few ulps apart compare equal, which
+changes which bar a crossing fires on), and a script runs on the order of
+ten to a hundred times slower per bar than the same logic in Rust, depending
+on how much per-bar work it does.
+
 ### Contracts and continuous futures
 
 Flat per-contract fees are declared in the strategy file, so a run's fee
@@ -197,11 +268,22 @@ position after a maximum hold. These are configured per strategy and simulated
 on the same path as the entry fill, so a partial that never filled does not
 quietly bank profit.
 
+A strategy that wants its own management logic implements
+`Strategy::on_bar_close`, called once per completed base bar after fills and
+exits have been resolved. Its `Book` argument lists what closed on that bar
+and what is open or resting, and accepts actions: move a stop or target,
+close a position at the bar's close, cancel a resting entry, or open a
+position at the bar's close as a taker fill. A moved stop keeps the planned
+`|entry - stop|` as the R unit, so moving it to breakeven books a 0R exit
+rather than rescaling the trade.
+
 ## Layout
 
     src/            engine: data, fills, fees, accounting, config
     src/driver.rs   the replay driver: CLI, config, threads, report
     src/strategy.rs the trait, the factory seam, and the types crossing them
+    src/rhai_strategy.rs  the Rhai factory and the script-facing API
+    scripts/rhai/   example scripts
     viz/            web UI (Python)
     config/fill/    fill lenses
     config/strategy/ strategy presets

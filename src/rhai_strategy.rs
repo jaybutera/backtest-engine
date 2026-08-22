@@ -933,6 +933,18 @@ fn register_api(engine: &mut Engine) {
                     .map(|t| {
                         let mut m = trade_map(t, None);
                         m.insert("effective_stop".into(), bk.effective_stop(t).into());
+                        // Unrealized R at this bar's close, over the planned risk.
+                        let risk = (t.entry - t.stop).abs();
+                        let close = bk.candle().close;
+                        let r_open = if risk > 0.0 {
+                            match t.direction {
+                                Direction::Bull => (close - t.fill) / risk,
+                                Direction::Bear => (t.fill - close) / risk,
+                            }
+                        } else {
+                            0.0
+                        };
+                        m.insert("r_open".into(), r_open.into());
                         Dynamic::from_map(m)
                     })
                     .collect()
@@ -992,4 +1004,8 @@ fn register_api(engine: &mut Engine) {
     engine.register_fn("to_int_trunc", |f: f64| f as i64);
     engine.register_fn("fmin", |a: f64, b: f64| a.min(b));
     engine.register_fn("fmax", |a: f64, b: f64| a.max(b));
+    // Round through single precision: for reproducing an f32 accumulator.
+    engine.register_fn("f32", |x: f64| (x as f32) as f64);
+    engine.register_fn("inf", || f64::INFINITY);
+    engine.register_fn("nan", || f64::NAN);
 }
