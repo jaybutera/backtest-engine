@@ -1,0 +1,54 @@
+[package]
+name = "backtest-engine"
+version = "0.1.0"
+edition = "2021"
+description = "A backtest engine with an honest fill model: parquet data loading, tick-resolution order simulation, fee accounting and R-multiple reporting, generic over your strategy."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["backtest", "trading", "finance", "simulation"]
+categories = ["simulation", "finance"]
+
+[[bin]]
+name = "backtest"
+path = "src/main.rs"
+
+[dependencies]
+arrow = { version = "54", features = ["prettyprint"] }
+parquet = { version = "54", features = ["arrow"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+uuid = { version = "1", features = ["v4"] }
+rustc-hash = "2"
+clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
+colored = "2"
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
+
+# Link-time optimization and single-codegen-unit builds are deliberately OFF.
+# The hot loop is dominated by parquet decode, allocation and hash churn, not
+# by cross-crate inlining, so fat LTO costs minutes per edit and buys little.
+# If a profile shows inlining across the arrow/parquet boundary actually
+# matters for your workload, measure before turning it back on.
+[profile.release]
+opt-level = 3
+lto = false
+codegen-units = 16
+
+# Optimize dependencies even in dev builds: parquet and arrow decode dominate
+# runtime, and leaving them at opt-level 0 makes a debug backtest slower by
+# roughly an order of magnitude. This crate's own code stays at opt-level 0 so
+# incremental rebuilds stay fast.
+[profile.dev.package."*"]
+opt-level = 2
+
+# The engine hosts the parquet loader and the per-bar loops, so it needs
+# optimization too; the binary stays at opt-level 0.
+[profile.dev.package.backtest-engine]
+opt-level = 2

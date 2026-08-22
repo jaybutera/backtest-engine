@@ -1,13 +1,11 @@
-# Fill lens: pure resting-limit + 0.1R entry slippage
-# (allow_signal_bar_fill=false, entry_slippage_r=0.1). BACKTEST-ONLY.
+# Fill lens: pure resting limit, plus entry slippage.
 #
-# Same pessimistic resting-limit fill model as limit_only.toml, but assumes we get a 0.1R
-# worse entry. The fill price is entry ± 0.1·R_planned toward the loss; P&L is
-# still divided by R_planned, so every trade drifts ~-0.1R (a stopped-out loss
-# reads -1.1R, a planned +3R win reads +2.9R). Lets us state "allowing 0.1R of
-# entry slippage the book earns X R less."
+# The `limit_only` fill model with a 0.1R worse entry price on every fill. P&L
+# is still divided by the planned R, so each trade drifts about -0.1R: a stopped
+# loss reads -1.1R, a planned +3R win reads +2.9R.
 #
-# See the fill-model design notes.
+# Use it to answer one question — how much of a result survives paying 0.1R at
+# the door.
 
 [fill]
 allow_signal_bar_fill = false

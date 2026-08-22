@@ -1,27 +1,29 @@
-# Fill lens: HYBRID entry-fill — LIVE-FAITHFUL-INTENDED. BACKTEST-ONLY.
+# Fill lens: hybrid resting-limit with a chase watchdog.
 #
-# Describes how the backtest SIMULATES entry fills. Live ignores this file (live
-# fills are real). Cross with any strategy via
-# `replay --strategy <s> --fill config/fill/market_hybrid.toml`.
+# The most detailed of the bundled lenses, and the closest to how a real
+# resting order behaves. It models a GTC limit placed one candle late, watched
+# by a process that will aggress into the market if price starts to leave
+# without it.
 #
-# Models the live resting-GTC-limit + seed/chase watchdog path (ground truth in
-# the live trader), with the INTENDED single-`chase_r`-as-gate-and-cap
-# semantics — NOT the live IOC bug (a live max_chase_r gates WHEN the
-# chase fires, but chase_limit_price hardcodes the IOC price cap at +0.1R, so a
-# chase triggered 0.1–0.3R away fails its IOC and abandons the trade). This lens
-# implements what live WOULD do if the IOC cap honored the gate.
+# Let T be the signal bar and D the first candle after it. T is never eligible:
+# the order did not exist while it printed. Then:
 #
-# The decision bar D = first candle after the signal bar T (T is never eligible;
-# the order didn't exist yet). Case A (D opens at/past the entry) → taker fill at
-# the open (a marketable GTC limit aggresses). Case B (D opens in front) → a
-# seeded watchdog may immediate-chase at the open (taker), else the limit rests
-# and fills maker at the entry or taker at the E±chase_r·R boundary; abandons on
-# a stop-gap, a TP-open/TP-range while unfilled, or 30-min age. See
-# paper.rs::hybrid_fill_action and
-# the hybrid-fill notes.
+#   Case A — D opens at or past the entry. The limit is marketable on arrival
+#            and aggresses immediately: taker fill at D's open.
 #
-# In hybrid mode `allow_signal_bar_fill` and `entry_slippage_r` are IGNORED (the
-# binary warns if either is set).
+#   Case B — D opens in front of the entry. The order rests. From here it can
+#            fill maker at the entry if price comes back; fill taker at the
+#            chase boundary (entry ± chase_r × R) if the watchdog fires and
+#            aggresses; or abandon the entry entirely — because price gapped
+#            through the stop, because the target was reached while still
+#            unfilled, or because the order aged out.
+#
+# `chase_r` does double duty: it gates whether a chase fires at all, and it caps
+# how far past the entry the resulting fill may land. A chase that would fill
+# worse than the cap abandons instead.
+#
+# `entry_fill_mode = "hybrid"` overrides `allow_signal_bar_fill` and
+# `entry_slippage_r`; the binary warns if either is also set.
 
 [fill]
 entry_fill_mode = "hybrid"

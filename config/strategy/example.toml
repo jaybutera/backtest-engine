@@ -1,0 +1,29 @@
+# Example strategy preset, driving the bundled reference strategy.
+#
+# The strategy this configures is a demonstration of the interface, not an
+# edge — see src/example_strategy.rs. It exists so that a fresh checkout runs
+# end to end and produces a report you can open in the visualizer.
+#
+# Copy this file to start your own. Every key under [strategy] is checked
+# against the knob registry at load time; an unrecognized key fails the load
+# rather than being ignored.
+
+assets = ["EXAMPLE"]
+
+[strategy]
+# Minimum score an opportunity needs before the default admission rule takes
+# it. What "score" means is the strategy's business; the engine only compares.
+min_score = 1.0
+
+# Reward:risk multiple. The take-profit is placed this many multiples of the
+# entry-to-stop distance beyond the entry.
+rr = 2.0
+
+# Close any position still open after this many minutes. A backtest without a
+# hold limit will happily carry a position for months and call the result an
+# edge.
+max_hold = 300
+
+# Charge fees. Leaving this off flatters short-hold strategies badly: at a
+# small stop distance the round-trip cost can exceed the entire edge.
+fees = true

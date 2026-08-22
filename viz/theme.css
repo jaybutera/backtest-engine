@@ -1,6 +1,6 @@
 /* ════════════════════════════════════════════════════════════════════════
    Theme A — 端末 TERMINAL: flat, boxy, CJK internet-native, high-contrast.
-   Shared stylesheet for dashboard.html + equity.html (served at /theme.css).
+   Shared stylesheet for every page (served at /theme.css).
    Zero radius. Hard 1px lines. Mono everywhere. Inverted-video states.
    One accent: shu (seal-vermilion) red — spent ONLY on UI state.
    Win/loss are semantic and separate from the accent.
@@ -49,9 +49,8 @@ body {
 .hdr nav a:hover, .hdr nav button:hover { background: var(--ink); color: var(--bg); }
 .hdr nav button:disabled { opacity: .5; cursor: default; }
 
-/* ── Live-strat picker (options come from the registry) ─────────────── */
-/* One sidebar row: small label + dropdown of the deployed strats. Hidden in
-   backtest mode (backtests aren't per-account). Unconfigured = disabled option. */
+/* ── Run picker (options come from the registry) ────────────────────── */
+/* One sidebar row: small label + a dropdown of the runs found on disk. */
 .trader-row {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 12px;
@@ -62,12 +61,6 @@ body {
   white-space: nowrap;
 }
 .trader-row select { flex: 1; width: auto; }
-/* Account equity of the selected bot (filled by /api/balance; empty when N/A). */
-.trader-row #trader-balance {
-  font-variant-numeric: tabular-nums; color: var(--ink);
-  font-size: 12px; white-space: nowrap;
-}
-
 /* Axes label under the page title: the run's canonical UID
    (strategy×fill×dataset@from..to) as a click-to-copy chip. */
 .bt-axes-label {
@@ -88,7 +81,7 @@ body {
 .bt-uid.copied { color: var(--win); border-bottom-color: var(--win); }
 .bt-uid.copied::after { content: " copied"; font-size: 9px; letter-spacing: .1em; }
 
-/* ── Source toggle (Live / Backtest) — boxy segments ────────────────── */
+/* ── Segmented control — boxy segments ──────────────────────────────── */
 .seg2 { display: flex; border-bottom: 1px solid var(--line); }
 .seg2 .seg {
   flex: 1; text-align: center; padding: 7px 0;
@@ -232,8 +225,8 @@ input[type=date]:disabled {
   padding: 7px 12px 7px 0; cursor: pointer;
   border-bottom: 1px solid #1b1b1d;
 }
-/* Mirrored-trader rows carry a tag between dir and when,
-   so they need one extra column; without it the tag pushes pnl off-grid. */
+/* Rows carrying an extra tag between dir and when need one more column;
+   without it the tag pushes pnl off-grid. */
 .trade.has-trader {
   grid-template-columns: 3px 92px 46px auto 1fr 74px;
 }
@@ -285,7 +278,7 @@ input[type=date]:disabled {
    in plain ink; pending/cancelled are quiet non-results. */
 .trade .pnl.open { color: var(--ink); }
 .trade .pnl.pending, .trade .pnl.cancelled { color: var(--dim); font-weight: 400; }
-/* Round-trip fee shown on its own line under the PnL (live HL trades only). */
+/* Round-trip fee on its own line under the PnL; absent on backtest rows. */
 .trade .pnl .fee { display: block; color: var(--dim); font-size: 9px; font-weight: 400; }
 .trade:hover .pnl .fee { color: inherit; }
 /* The price-detail line spans the full row width below the main cells. */

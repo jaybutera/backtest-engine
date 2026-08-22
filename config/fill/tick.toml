@@ -1,47 +1,40 @@
-# Fill lens: TICK-RESOLUTION entry/stop/TP fills + live-faithful entry-chase. BACKTEST-ONLY.
+# Fill lens: tick-resolution fills.
 #
-# Instead of resolving fills on 1-minute OHLC candles (where intrabar order is
-# unknowable and guessed via `intrabar_stop_first`), this lens walks the actual
-# millisecond TRADE ticks within each bar and acts on the FIRST tick that
-# crosses each level. So a stop, TP, or entry fills at the EXACT tick timestamp
-# and price the trade printed through the level — sub-minute, no waiting a whole
-# minute to learn price hit a level.
+# The other lenses resolve fills against 1-minute OHLC bars, where the order of
+# events inside the bar is unknowable and has to be guessed by
+# `intrabar_stop_first`. This lens walks the actual trade prints inside each bar
+# and acts on the first tick that crosses each level, so the guess disappears.
 #
-#   - Entry (resting limit): fills MAKER at the entry price on the first tick
-#     that reaches it, stamped with that tick's time.
-#   - Entry chase (tick_chase, ON): when the limit is armed and a tick reaches
-#     the chase boundary B = E ± chase_r·R BEFORE any tick touches E, the entry
-#     fills TAKER at B — the same chase the live trader performs. Whichever
-#     level a tick reaches first in true tick time wins. Without this branch
-#     every chase becomes a phantom no-fill and the lens systematically drops
-#     the winners live would have chased into (a per-trade tax; see the chase A/B). `tick_nochase.toml` = this lens with it off.
-#   - Stop vs TP: whichever the price touches FIRST in tick time wins — real
-#     ordering, replacing the OHLC stop-first/TP-first heuristic entirely.
-#   - A trade filled mid-bar is raced against the LATER ticks of the same bar
-#     (true intrabar precision), though its hold clock still starts next bar.
-#   - Fallback: a bar with NO ticks (quiet minute, or a gap in the tick archive)
-#     falls back to the OHLC candle logic for that bar so a run never crashes on
-#     missing ticks. The run reports how often this fallback fired.
+#   Entry      A resting limit fills maker at the entry price on the first tick
+#              that reaches it, stamped with that tick's timestamp.
 #
-# DATA: raw trade prints from the Hydromancer Reservoir `fills/perp/all` archive,
-# pulled into data/ticks_reservoir/{stem}_ticks.parquet. The engine derives the tick file
-# from the asset's candle source stem (so the `reservoir` dataset's xyz:GOLD →
-# reservoir_xyz_GOLD_ticks.parquet). History is SHORT (the xyz instruments are
-# young) — use this over a window where ticks exist (GOLD/SILVER/CL from ~2026-05).
+#   Chase      If a tick reaches the chase boundary E ± chase_r × R before any
+#              tick touches E, the entry fills taker at the boundary. Whichever
+#              level a tick reaches first in real time wins. With this branch
+#              disabled (see tick_nochase.toml) every chase becomes a no-fill,
+#              which systematically drops entries a live chase would have taken.
 #
-# HONEST LIMITS: these are real trade-price crossings (good), but (a) a tick-less
-# minute falls back to OHLC; (b) this models trade PRICE crossing a level, NOT L2
-# queue position — a passive limit is assumed to fill when a trade prints through
-# its price (BBO/queue realism is out of scope). `allow_signal_bar_fill=false`
-# keeps the signal bar ineligible (the order didn't exist when it printed).
+#   Stop / TP  Whichever price touches first in tick time wins, replacing the
+#              stop-first heuristic entirely.
+#
+#   Mid-bar    A trade filled mid-bar is raced against the remaining ticks of
+#              that same bar. Its hold clock still starts on the next bar.
+#
+# Requires tick data at data/<stem>_ticks.parquet, with columns timestamp,
+# price, size, side. A bar with no ticks — a quiet minute, or a gap in the
+# archive — falls back to the OHLC logic for that bar rather than failing the
+# run, and the report says how often that happened. Read that number: a lens
+# that fell back on most bars is an OHLC lens wearing a tick label.
+#
+# Honest limits. These are real trade-price crossings, which is the point. But
+# this models a trade printing through your price, NOT queue position: a passive
+# limit is assumed filled when any trade prints through it, which is optimistic
+# for a resting order in a deep book. L2 queue realism is out of scope.
 
 [fill]
 entry_fill_mode = "tick"
-# Live-faithful entry-chase on real tick order (this is also the built-in
-# default; stated explicitly so the lens is self-documenting). Env
-# TICK_CHASE=1|0 force-overrides for quick A/B.
 tick_chase = true
 allow_signal_bar_fill = false
-# intrabar_stop_first is IGNORED in tick mode (real tick order decides); kept at
-# the pessimistic default for the OHLC fallback bars.
+# Ignored in tick mode, where real tick order decides. Kept at the pessimistic
+# default for bars that fall back to OHLC.
 intrabar_stop_first = true

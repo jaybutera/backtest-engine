@@ -1,18 +1,16 @@
-# Fill lens: tick-resolution fills WITHOUT the entry-chase (pure resting maker). BACKTEST-ONLY.
+# Fill lens: tick-resolution fills, chase disabled.
 #
-# Identical to tick.toml except `tick_chase = false`: a resting limit only ever
-# fills MAKER at the entry price; a move that reaches the chase boundary before
-# touching the entry is a NO-FILL (live would have chased taker into it). This
-# is the pre-chase tick model, kept as an A/B counterfactual — it
-# systematically drops chased winners (vs tick.toml), so use it to
-# measure the chase's contribution, not as the live-faithful lens.
+# `tick.toml` with the entry chase turned off: an entry fills only if a tick
+# actually reaches the limit price. When price approaches and turns away without
+# touching, the entry is simply missed.
 #
-# See tick.toml for the tick-walk semantics, data source, and honest limits.
+# The pair exists to measure what the chase is worth. Run both over the same
+# window and the difference is the entries a chasing execution would have taken
+# and a purely passive one would not — which is also the set of entries most
+# sensitive to how fast your execution actually is.
 
 [fill]
 entry_fill_mode = "tick"
 tick_chase = false
 allow_signal_bar_fill = false
-# intrabar_stop_first is IGNORED in tick mode (real tick order decides); kept at
-# the pessimistic default for the OHLC fallback bars.
 intrabar_stop_first = true

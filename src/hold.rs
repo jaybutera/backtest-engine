@@ -1,29 +1,30 @@
-//! Max-hold timeout clock — the ONE implementation of the hold-count
-//! decision, shared by the backtest trade manager (`paper.rs`) and the
-//! live trader (`trader.rs`).
+//! Max-hold timeout clock — the one implementation of the hold-count
+//! decision, so that anything managing a position (the backtest trade
+//! manager in `paper.rs`, or a live execution path) agrees on when a trade
+//! has been open too long.
 //!
-//! Semantics (validated in backtest before this module existed): a filled
-//! position's clock counts completed base-tf candles of its asset, starting
+//! A filled position's clock counts completed base-tf candles of its asset,
+//! starting
 //! with the FIRST candle after the one on which the entry filled (the fill
 //! bar itself is never counted — paper books the fill after the bar's race,
 //! live sees the enclosing bar complete only after the fill event). The
 //! position times out when the count strictly exceeds `max_hold_candles`,
-//! closing at that bar's close (paper) / at market on that bar (live) with
-//! result "inconclusive" — a timeout is neither a win nor a stop-out and
-//! never arms a re-entry watch.
+//! closing at that bar's close with result "inconclusive" — a timeout is
+//! neither a win nor a stop-out, and counting it as either would misreport
+//! the strategy.
 //!
-//! The caller owns everything execution-flavored: which candles belong to
-//! the trade, when the clock starts, and how a `Timeout` becomes a close
-//! (booked at the bar close in paper; bracket-cancel + reduce-only IOC on
-//! live). Keeping those out of this module is what lets both
-//! paths share the boundary decision verbatim.
+//! The caller owns everything execution-flavored: which candles belong to the
+//! trade, when the clock starts, and how a `Timeout` becomes an actual close.
+//! Keeping those out of this module is what lets a simulated and a real
+//! execution path share the boundary decision verbatim, rather than
+//! reimplementing "has this been open too long" twice and drifting.
 
 use crate::models::Direction;
 
-/// The shared hold clock of one filled position. Paper keeps one per open
-/// trade in a map keyed by opportunity id; live embeds one in `LiveTrade`.
-/// Serde derives exist for the live trader's state snapshot (`trader_state`);
-/// the backtest never serializes these.
+/// The hold clock of one filled position. The backtest keeps one per open
+/// trade, keyed by opportunity id. Serde derives exist so an execution path
+/// that needs to survive a restart can snapshot them; the backtest itself
+/// never serializes these.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct HoldClock {
     /// Completed candles of the trade's asset seen since the fill bar.
@@ -95,7 +96,7 @@ mod tests {
 
     #[test]
     fn timeout_r_measured_from_fill() {
-        // Long filled at 100, risk 2: close 100.8 books +0.4R.
+        // Long filled at 100, risk 2: close 100.8 books +0.4R. // leak-check: ok test arithmetic
         assert!((timeout_r(Direction::Bull, 100.0, 100.8, 2.0) - 0.4).abs() < 1e-12);
         // Short symmetric: close below the fill is positive.
         assert!((timeout_r(Direction::Bear, 100.0, 99.0, 2.0) - 0.5).abs() < 1e-12);

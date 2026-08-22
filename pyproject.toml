@@ -1,0 +1,35 @@
+[project]
+name = "backtest-viz"
+version = "0.1.0"
+description = "Web visualizer for backtest-engine runs: trades on candles, equity curve, and a run launcher."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+    # Serves the pages and the JSON API.
+    "aiohttp>=3.9",
+    # Reads the candle parquets and the trade frame.
+    "polars>=0.20",
+    # Parquet footer reads, for row counts without loading the data.
+    "pyarrow>=15",
+]
+
+[project.scripts]
+viz = "viz.server:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.4"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["viz"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

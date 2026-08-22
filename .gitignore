@@ -1,0 +1,22 @@
+# Build artifacts
+target/
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+.ruff_cache/
+.pytest_cache/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Market data. The engine reads parquet from here; none of it is
+# distributable, and most of it is licensed per-user by the vendor.
+data/
+
+# Backtest output
+*.json.tmp

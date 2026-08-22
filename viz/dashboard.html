@@ -1,0 +1,1729 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Trade Viz</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<link rel="stylesheet" href="/theme.css">
+<style>
+  /* Page-specific layout on top of the shared 端末 TERMINAL theme (theme.css). */
+  .app { display: flex; height: 100vh; }
+  .sidebar {
+    width: 500px;
+    background: var(--panel);
+    border-right: 1px solid var(--line-hard);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .chart-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .chart-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line-hard);
+    font-size: 9px; letter-spacing: .22em; text-transform: uppercase; color: var(--dim);
+  }
+  .chart-header h2 {
+    margin: 0; font-size: 11px; font-weight: 700; letter-spacing: .06em;
+    color: var(--ink); text-transform: none;
+  }
+  .chart-header .cjk { color: var(--shu); letter-spacing: .1em; }
+  .chart-header .meta { color: var(--dim); font-size: 10px; letter-spacing: .02em; }
+  .chart-header .meta::before { content: ""; }
+  .chart-header .opp-id {
+    color: var(--ink); cursor: pointer; text-transform: none;
+    border-bottom: 1px dotted var(--dim);
+  }
+  .chart-header .opp-id:hover { color: var(--shu); }
+  .chart-header .opp-id.copied { color: var(--shu); border-bottom-style: solid; }
+  #chart { flex: 1; position: relative; min-height: 0; }
+  .legend {
+    padding: 6px 12px;
+    border-top: 1px solid var(--line);
+    font-size: 9px; letter-spacing: .06em; text-transform: uppercase;
+    color: var(--dim);
+    display: flex; gap: 16px; flex-wrap: wrap;
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .legend .swatch { width: 12px; height: 2px; display: inline-block; }
+  .tv-wrap { position: absolute; inset: 0; overflow-y: auto; --amber: #d2a13f; }
+  .tv-story { padding: 4px 22px 48px; max-width: 920px; font-size: 12px; }
+  .story-hdr {
+    margin-top: 20px; padding-top: 14px; border-top: 1px dashed var(--line-hard);
+    color: var(--dim); font-size: 9px; letter-spacing: .18em; text-transform: uppercase;
+  }
+  .story-sub { color: var(--dim); font-size: 10px; margin: 6px 0 12px; }
+  .story-sub b { color: var(--ink); font-weight: 600; }
+  .story-note { color: var(--amber); font-size: 10px; margin: 4px 0 10px; }
+  .st-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  .st-table td {
+    padding: 5px 8px; border-bottom: 1px solid var(--line);
+    vertical-align: top; line-height: 1.5;
+  }
+  .st-utc { color: var(--dim); white-space: nowrap; width: 62px; }
+  /* Options stories span days-to-weeks, so their timestamps carry a date
+     prefix and need the wider column. */
+  .st-table.opt .st-utc { width: 104px; }
+  .st-n { color: var(--dim); text-align: right; width: 24px; }
+  .st-msg { overflow-wrap: anywhere; }
+  .st-chip {
+    font-size: 9px; color: var(--dim); background: rgba(255,255,255,.07);
+    padding: 1px 5px; border-radius: 2px; white-space: nowrap; margin-left: 6px;
+  }
+  .st-chart {
+    display: block; max-width: min(520px, 100%); max-height: 320px;
+    margin: 6px 0 2px; border: 1px solid var(--line); border-radius: 3px;
+    cursor: zoom-in;
+  }
+  tr.st-tick td { background: rgba(255,255,255,.025); }
+  .st-tick .st-utc::before { content: "↳ "; color: var(--line-hard); }
+  .tag {
+    display: inline-block; font-size: 9px; font-weight: 700; letter-spacing: .08em;
+    padding: 0 5px; border-radius: 2px; border: 1px solid; margin-right: 5px;
+    white-space: nowrap; vertical-align: 1px;
+  }
+  .tag.in   { color: var(--win); border-color: var(--win); }
+  .tag.out  { color: var(--amber); border-color: var(--amber); }
+  .tag.rest { color: #58a6ff; border-color: #58a6ff; }
+  .tag.stop { color: var(--ink); border-color: var(--line-hard); }
+  .tag.hold { color: var(--dim); border-color: var(--line); }
+  .tag.fail { color: var(--loss); border-color: var(--loss); }
+  .st-levels { color: var(--dim); margin-right: 8px; white-space: nowrap; }
+  .st-exec { color: var(--dim); font-size: 10px; }
+  .st-reason { color: var(--dim); margin-top: 3px; }
+  .st-reason summary { cursor: pointer; list-style: none; }
+  .st-reason summary::after { content: " ▸"; color: var(--line-hard); }
+  .st-reason[open] summary::after { content: " ▾"; }
+  .st-reason p { margin: 4px 0 0; white-space: pre-wrap; }
+  tr.st-fill td { color: var(--shu); font-size: 11px; background: rgba(232,69,47,.06); }
+  tr.st-bnd td {
+    background: rgba(210,161,63,.10); color: var(--amber);
+    font-size: 10px; letter-spacing: .04em; padding: 5px 8px;
+  }
+  /* Human-in-the-loop rows (options page): the telegram alerts the daemon sent
+     its owner and the owner's free-text replies, interleaved with the trader
+     timeline. Amber = alert sent, red tint = expiry-week escalation, blue
+     tint = the human speaking. */
+  tr.st-alert td { background: rgba(210,161,63,.05); font-size: 11px; }
+  tr.st-alert.esc td { background: rgba(232,69,47,.08); }
+  tr.st-human td { background: rgba(88,166,255,.07); }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="hdr">
+      <div class="title">
+        <h1><span id="page-title">Trade Viz</span><span class="cjk">取引記録</span></h1>
+        <div id="bt-axes-label" class="bt-axes-label"></div>
+      </div>
+      <nav>
+        <a href="/equity" id="equity-link">Equity</a>
+        <button id="refresh-btn">Refresh</button>
+      </nav>
+    </div>
+    <!-- Run picker: options come from the injected registry (TRADERS),
+         nothing hardcoded. -->
+    <div class="trader-row" id="trader-row">
+      <label for="trader-select">Run</label>
+      <select id="trader-select"></select>
+    </div>
+    <div id="backtest-config">
+      <div class="sect"><span class="cjk">設定</span> backtest config</div>
+      <div class="grid hidden" id="backtest-controls">
+        <label for="bt-from">From</label>
+        <input type="date" id="bt-from">
+        <label for="bt-to">To</label>
+        <input type="date" id="bt-to">
+        <label>Range</label>
+        <label class="switch full" title="Run each asset over its whole file (union of all assets' history) instead of the all-assets-present window.">
+          <input type="checkbox" id="bt-maxhist">
+          <span class="box">Max history</span>
+          <span class="why" id="bt-why">common window · all assets present</span>
+        </label>
+
+        <label for="bt-strategy">Strategy</label>
+        <select id="bt-strategy"></select>
+        <label for="bt-fill" title="How the backtest simulates entry fills (fill lens). market_hybrid = the live-faithful default; other presets model a pessimistic bound or walk raw trade prints for exact intrabar fills (slower, and only meaningful on a dataset with tick files).">Fill lens</label>
+        <select id="bt-fill" title="How the backtest simulates entry fills (fill lens). market_hybrid = the live-faithful default; other presets model a pessimistic bound or walk raw trade prints for exact intrabar fills (slower, and only meaningful on a dataset with tick files)."></select>
+
+        <label for="bt-dataset" title="Which candle files the strategy runs on. A dataset declares only data sources: a source-free one means each asset loads its own parquet, and one with [[source]] tables redirects assets to other file stems.">Dataset</label>
+        <select id="bt-dataset" title="Which candle files the strategy runs on. A dataset declares only data sources: a source-free one means each asset loads its own parquet, and one with [[source]] tables redirects assets to other file stems."></select>
+        <label class="switch full hidden" id="bt-unlock-wrap" title="The selected strategy pins the dataset axis. Tick to choose any dataset anyway — the run is then a deliberate mix, not the preset's published pairing, and the result is badged as such.">
+          <input type="checkbox" id="bt-dataset-unlock">
+          <span class="box">Unlock dataset</span>
+          <span class="why" id="bt-unlock-why"></span>
+        </label>
+        <label>Assets</label>
+        <span id="bt-assets" class="assets-val" title="Assets traded by the selected strategy (defined in its config)."></span>
+      </div>
+      <div class="runrow hidden" id="bt-runrow">
+        <button id="bt-run-btn" class="run">▶ Run backtest</button>
+        <span class="runmeta"><span id="bt-status"></span></span>
+      </div>
+      <div class="warnline" id="bt-freshness" style="display:none;"></div>
+      <div class="warnline" id="bt-override" style="display:none;"></div>
+      <div class="captionline" id="bt-caption"></div>
+      <div class="bt-progress" id="bt-progress">
+        <div class="track"><div class="fill" id="bt-progress-fill"></div></div>
+        <span class="pct" id="bt-progress-pct"></span>
+      </div>
+    </div>
+    <div class="sect"><span class="cjk">取引</span> <span id="summary">trades</span></div>
+    <div class="filters">
+      <select id="asset-filter"><option value="">All assets</option></select>
+      <select id="outcome-filter">
+        <option value="">All outcomes</option>
+        <option value="win">Win</option>
+        <option value="loss">Loss</option>
+        <option value="scratch">Scratch</option>
+      </select>
+      <select id="direction-filter">
+        <option value="">Both directions</option>
+        <option value="long">Long only</option>
+        <option value="short">Short only</option>
+      </select>
+    </div>
+    <div class="trade-list" id="trade-list"></div>
+  </aside>
+  <section class="chart-area">
+    <div class="chart-header" id="chart-header">
+      <h2 id="chart-title">Select a trade</h2>
+      <span class="cjk">図</span>
+      <div class="meta" id="chart-meta"></div>
+    </div>
+    <div id="chart"><div class="empty">Click a trade in the sidebar to render it on candles.</div></div>
+    <div class="legend">
+      <span><span class="swatch" style="background: #58a6ff"></span> Entry</span>
+      <span><span class="swatch" style="background: var(--ink)"></span> Exit</span>
+      <span><span class="swatch" style="background: var(--loss)"></span> Stop (jsonl)</span>
+      <span><span class="swatch" style="background: var(--win)"></span> Target (jsonl)</span>
+      <span>▲ Long entry · ▼ Short entry · ● Exit · small dot = exact fill (bar × price)</span>
+    </div>
+  </section>
+</div>
+<script>
+// The registry (server-side single source of truth) injected inline at serve
+// time by _index — NO trader name is hardcoded in this page. Shape:
+//   [{key, label, kind, configured, default}, ...] in pill/registry order.
+const TRADERS = (/*__TRADERS__*/[]).traders || [];
+const DEFAULT_TRADER = (TRADERS.find(t => t.default) || TRADERS[0] || {}).key;
+// Which trader this page renders: the URL path segment ("/<key>") matched
+// against the injected list; anything unknown (incl. "/") falls back to the
+// registry default. No name literals — the mapping comes entirely from TRADERS.
+const _SEG = location.pathname.replace(/^\/+|\/+$/g, "").split("/")[0];
+const _SPEC = TRADERS.find(t => t.key === _SEG) || TRADERS.find(t => t.default) || {};
+const TRADER = _SPEC.key || DEFAULT_TRADER;
+// Fallback label from the injected registry entry.
+const TRADER_LABEL = _SPEC.label || TRADER;
+// The equity page is trader-scoped too — without the param it falls back to
+// the registry default and would silently chart the wrong account's curve.
+document.getElementById("equity-link").href =
+  "/equity?trader=" + encodeURIComponent(TRADER);
+
+let allTrades = [];
+// Last /api/trades error. Shown as a banner on the empty list so a load
+// failure isn't mistaken for "no trades yet" — the two look identical.
+let lastIngestError = null;
+// HTML-escape for interpolating server text (error strings, trader names) into
+// innerHTML. Module-level so both the trade list and the detail panel share it.
+const esc = s => String(s ?? "—").replace(/[&<>]/g, c =>
+  ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[c]));
+// ─── Shareable-URL state ──────────────────────────────────────────────────────
+// The full backtest spec rides in the URL as ?bt=<uid> — the run's canonical
+// UID (strategy×fill×dataset@from..to, .toml stripped; the same token the
+// copy chip shows) — and the selected trade as ?trade=<id> (opportunity_id
+// when the row has one, else the row key). The address bar is rewritten via
+// history.replaceState as axes/dates/selection change, so it is always a
+// shareable deep link to the current setup. Opening a ?bt= link seeds the
+// controls but deliberately does NOT auto-run: results are a server-wide
+// sidecar shared by every viewer, and a stray link open must not clobber them.
+const URL_QS = new URLSearchParams(location.search);
+
+// Parse a ?bt= value back into axes + dates. Accepts exactly the UID grammar
+// (× separators, optional @from..to, `?` or empty = unspecified axis). A
+// malformed value returns null and simply doesn't move any control.
+function parseBtSpec(raw) {
+  if (!raw) return null;
+  let axesPart = raw, from = null, to = null;
+  const at = raw.indexOf("@");
+  if (at >= 0) {
+    axesPart = raw.slice(0, at);
+    const m = raw.slice(at + 1).match(/^(\d{4}-\d{2}-\d{2}|\?)?\.\.(\d{4}-\d{2}-\d{2}|\?)?$/);
+    if (!m) return null;
+    from = m[1] && m[1] !== "?" ? m[1] : null;
+    to = m[2] && m[2] !== "?" ? m[2] : null;
+  }
+  const parts = axesPart.split("×");
+  if (parts.length !== 3) return null;
+  const ax = parts.map(p => {
+    p = p.trim();
+    if (!p || p === "?") return null;
+    return p.endsWith(".toml") ? p : p + ".toml";
+  });
+  return { strategy: ax[0], fill: ax[1], dataset: ax[2], from, to };
+}
+
+// The UID a parsed spec asks for — for comparing against the loaded run's uid.
+// Mirrors the server's _backtest_uid grammar.
+function specUidOf(s) {
+  const strip = v => (v || "?").replace(/\.toml$/, "");
+  let uid = `${strip(s.strategy)}×${strip(s.fill)}×${strip(s.dataset)}`;
+  if (s.from || s.to) uid += `@${s.from || "?"}..${s.to || "?"}`;
+  return uid;
+}
+
+const urlSpec = parseBtSpec(URL_QS.get("bt"));
+// URL-provided dates override the auto-filled range until the user touches a
+// range control (dataset/max-history/manual edit); see applyDateRange.
+let urlDates = urlSpec && (urlSpec.from || urlSpec.to)
+  ? { from: urlSpec.from, to: urlSpec.to } : null;
+// One-shot: the first trade load compares the loaded sidecar against the
+// URL's requested spec and flags a mismatch (see loadTrades).
+let urlSpecPending = !!urlSpec;
+
+// Every page here charts a backtest run; the constant stays so the per-source
+// branches below keep reading the same way.
+const source = "backtest";
+// Backtest = strategy (algorithm + assets) × dataset (data sources). The
+// dataset picks which candles feed the run: a source-free one means each
+// asset loads its own data/{asset}_1m.parquet, and one with [[source]] tables
+// redirects assets to other file stems. All declared in config/datasets/.
+// Persisted locally; sent to the backtest request. A ?bt= deep link outranks
+// the stored preference on every axis it specifies.
+let selectedDataset = (urlSpec && urlSpec.dataset)
+  || localStorage.getItem("viz.dataset") || "local.toml";
+// Strategy (algorithm) and fill lens (how entry fills are simulated) are the
+// other two orthogonal axes. Persisted locally; sent to the backtest request.
+let selectedStrategy = (urlSpec && urlSpec.strategy)
+  || localStorage.getItem("viz.strategy") || "example.toml";
+let selectedFill = (urlSpec && urlSpec.fill)
+  || localStorage.getItem("viz.fill") || "market_hybrid.toml";
+// Descriptions of the fill presets, keyed by filename, for the caption line.
+let fillDescs = {};
+// Names of tick-resolution fill presets, and the dataset they require. A tick
+// lens reads a trade-print archive keyed off the dataset's own source stems,
+// so it only has data under a dataset whose stems have matching tick files;
+// selecting a tick lens pins the dataset to the one the server names. Null
+// until /api/sources reports one, in which case the pin is simply not applied.
+let tickFills = new Set();
+let tickDataset = null;
+// Per-strategy dataset-axis constraints from /api/sources, keyed by filename:
+// {requires_dataset: [...], own_sources: bool}. A constrained strategy pins the
+// dataset picker (same mechanism as the tick lens above) so a pairing whose
+// sources would be silently discarded can't be built by accident. The "Unlock
+// dataset" toggle overrides the pin deliberately; the server enforces the same
+// rule and needs allow_dataset_override to accept the run.
+let stratConstraints = {};
+// Datasets declaring no [[source]] (live, transplant): the only safe partners
+// for a strategy that carries its own sources.
+let sourcelessDatasets = [];
+// File stems of the CURRENT strategy's own [[source]] tables (e.g.
+// ["CL","ES","NQ","SI"]), from /api/sources?strategy=. Used to relabel the
+// pinned dataset option: for an own-sources preset, a source-free dataset
+// pick doesn't load that dataset's feed at all — it runs the strategy's own
+// source parquets — so the option text must say so. Display only; option
+// VALUES never change.
+let ownSourceStems = [];
+// A short label for those stems, preferred over the raw stem join as the
+// pinned dataset label; the server stamps the same token into the run's UID.
+let ownDatasetLabel = null;
+let selectedKey = null;  // `${entry_epoch}-${asset}`
+// What names the selected trade in the URL: the engine's opportunity_id when
+// the row carries one (stable and quotable), else
+// the row key. Written by selectTrade, cleared on source switch.
+let selectedTradeParam = null;
+
+// The UID the current CONTROLS describe (the axes label chip shows the loaded
+// RESULT's uid instead — the two differ until Run).
+function currentSpecUid() {
+  const strip = v => (v || "?").replace(/\.toml$/, "");
+  const from = document.getElementById("bt-from").value;
+  const to = document.getElementById("bt-to").value;
+  let uid = `${strip(selectedStrategy)}×${strip(selectedFill)}×${strip(selectedDataset)}`;
+  if (from || to) uid += `@${from || "?"}..${to || "?"}`;
+  return uid;
+}
+
+// Rewrite the address bar to deep-link the current view. The query is built by
+// hand so the uid keeps its literal ×/@/: (all legal in a query, and far more
+// readable than %-escapes); URLSearchParams on the way back in accepts either
+// form. Also drops any legacy #pos= hash — ?trade= supersedes it.
+function syncUrl() {
+  const parts = [];
+  if (source === "backtest") parts.push("bt=" + currentSpecUid());
+  // Until the deep-linked trade is resolved (or the user acts), keep the
+  // incoming ?trade= in place — an early date-range sync must not strip it.
+  const tradeVal = selectedTradeParam
+    || (!urlTradeConsumed ? URL_QS.get("trade") : null);
+  if (tradeVal) {
+    parts.push("trade=" + encodeURIComponent(tradeVal).replace(/%3A/gi, ":"));
+  }
+  history.replaceState(null, "", location.pathname + (parts.length ? "?" + parts.join("&") : ""));
+}
+// Flipped the first time a trade is selected or the source is switched; the
+// incoming ?trade= param stops being preserved verbatim from then on.
+let urlTradeConsumed = false;
+let chart = null;
+let candleSeries = null;
+let priceLines = [];
+let overlaySeries = [];  // one-point dot series pinned at exact fill (time, price)
+// Lazy candle-loading state: which series is loaded, its current time bounds,
+// and a guard so we only run one extend fetch at a time per direction.
+let loadedCandles = [];      // sorted [{time,open,...}] currently on the chart
+let loadCtx = null;          // {asset, source} the loaded series belongs to
+let loadingLeft = false;
+let loadingRight = false;
+let loadGen = 0;             // bumped per trade select; stale extends discard
+let lazyLoadWired = false;   // whether the visible-range subscription is active
+
+function fmtAgo(epoch) {
+  if (!epoch) return "";
+  const sec = Math.floor(Date.now() / 1000) - epoch;
+  if (sec < 60) return `${sec}s ago`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
+  return `${Math.floor(sec / 86400)}d ago`;
+}
+
+function fmtR(r) {
+  if (r == null) return "—";
+  const sign = r >= 0 ? "+" : "−";
+  return `${sign}${Math.abs(r).toFixed(2)}R`;
+}
+function fmtPnl(t) {
+  // A backtest trade carries r_pnl (R-multiples); a row from an execution
+  // record carries closed_pnl in currency, gross of fees — show it NET
+  // (gross − fee) to match the summary headline and the equity curve.
+  if (source === "backtest") return fmtR(t.r_pnl);
+  if (t.closed_pnl == null) return fmtDollar(null);
+  return fmtDollar(t.closed_pnl - (t.fee || 0));
+}
+
+// Every wall-clock on the page renders in America/Chicago (CST/CDT,
+// DST-aware) rather than UTC, so the text panels agree with the chart axis.
+// The tz abbreviation is derived per timestamp, reading CDT in summer and CST
+// in winter automatically. Change CENTRAL_TZ to move the whole page.
+const CENTRAL_TZ = "America/Chicago";
+function tzAbbr(d) {
+  const p = new Intl.DateTimeFormat("en-US", { timeZone: CENTRAL_TZ, timeZoneName: "short" })
+    .formatToParts(d).find(x => x.type === "timeZoneName");
+  return p ? p.value : "CT";
+}
+function fmtWhen(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  const date = d.toLocaleDateString("en-CA", { timeZone: CENTRAL_TZ });
+  const time = d.toLocaleTimeString("en-GB", { timeZone: CENTRAL_TZ, hour: "2-digit", minute: "2-digit", hour12: false });
+  return `${date} ${time} ${tzAbbr(d)}`;
+}
+// Time-of-day for the story rows. Everything there carries an epoch, so format
+// from that rather than from any pre-baked wall-clock string — the server's
+// `utc` field is a UTC hh:mm:ss join key, not something to render.
+function fmtHms(epoch) {
+  if (epoch == null) return "—";
+  return new Date(epoch * 1000).toLocaleTimeString("en-GB", { timeZone: CENTRAL_TZ, hour12: false });
+}
+// Story timestamps on the options page span days-to-weeks, so time-of-day
+// alone is ambiguous — prefix the date (month-day, Central) always.
+function fmtDayHms(epoch) {
+  if (epoch == null) return "—";
+  const d = new Date(epoch * 1000);
+  const md = d.toLocaleDateString("en-CA", { timeZone: CENTRAL_TZ }).slice(5);
+  return `${md} ${fmtHms(epoch)}`;
+}
+function fmtPct(x) {
+  if (x == null) return "—";
+  const sign = x >= 0 ? "+" : "−";
+  return `${sign}${Math.abs(x * 100).toFixed(0)}%`;
+}
+function fmtPrice(p) {
+  if (p == null) return "—";
+  if (p >= 1000) return p.toFixed(2);
+  if (p >= 1) return p.toFixed(3);
+  return p.toFixed(5);
+}
+function fmtDollar(n) {
+  if (n == null) return "—";
+  const sign = n >= 0 ? "+" : "−";
+  return `${sign}$${Math.abs(n).toFixed(2)}`;
+}
+// Options rows key on the ledger position id — several positions can share an
+// entry epoch AND an underlying (one alert opens many), so the epoch-asset key
+// the fill-based rows use would collide.
+function keyOf(t) { return t.position_id ? `pos-${t.position_id}` : `${t.entry_epoch}-${t.asset}`; }
+
+// Fraction of the configured risk this trade actually carried:
+// filled size / risk-intended size (risk scales linearly with size, so this
+// IS the R fraction). < 1 when the bot's margin clamp shrank the order or
+// the exchange filled it partially. Returns null when unknown (backtests,
+// pre-clamp log lines) or when the full risk was taken (within rounding).
+function riskFraction(t) {
+  if (t.size == null || t.intended_size == null || !(t.intended_size > 0)) return null;
+  const frac = t.size / t.intended_size;
+  return frac < 0.995 ? frac : null;
+}
+
+// Write the trades summary as a single section-header line: count, the
+// win/loss/scratch tally, win rate, and total P&L. A row from an execution
+// record reports P&L NET of fees, with gross and fee broken out after it. The
+// P&L value is colored win/loss by sign. #summary sits inside the
+// "取引 TRADES" .sect header.
+// Win/loss/scratch tallies + win rate over the resolved ones — shared by the
+// round-trip and options summaries (both grade closed outcomes the same way).
+function outcomeCounts(trades) {
+  const wins = trades.filter(t => t.outcome === "win").length;
+  const losses = trades.filter(t => t.outcome === "loss").length;
+  const scratches = trades.filter(t => t.outcome === "scratch").length;
+  const resolved = wins + losses;
+  const wr = resolved > 0 ? ((wins / resolved) * 100).toFixed(0) : "—";
+  return { wins, losses, scratches, wr };
+}
+
+function renderSummary(trades) {
+  const { wins, losses, scratches, wr } = outcomeCounts(trades);
+  let pnlCell;
+  if (source === "backtest") {
+    const r = trades.reduce((a, t) => a + (t.r_pnl || 0), 0);
+    const cls = r > 0 ? "win" : r < 0 ? "loss" : "";
+    pnlCell = `<b class="${cls}">${fmtR(r)}</b>`;
+  } else {
+    // An execution record reports P&L gross of fees; the headline shows it
+    // NET (gross − total fees), with both figures broken out after.
+    const gross = trades.reduce((a, t) => a + (t.closed_pnl || 0), 0);
+    const fees = trades.reduce((a, t) => a + (t.fee || 0), 0);
+    const net = gross - fees;
+    const cls = net > 0 ? "win" : net < 0 ? "loss" : "";
+    pnlCell = `<b class="${cls}">${fmtDollar(net)}</b> · gross ${fmtDollar(gross)} · fee $${fees.toFixed(2)}`;
+  }
+  document.getElementById("summary").innerHTML =
+    `trades — <b>${trades.length}</b> · <b>${wins}</b>W <b>${losses}</b>L <b>${scratches}</b>S · <b>${wr}%</b> WR · ${pnlCell}`;
+}
+
+function renderTradeList(trades) {
+  const el = document.getElementById("trade-list");
+  if (!trades.length) {
+    if (lastIngestError) {
+      el.innerHTML =
+        `<div class="empty" style="color:var(--loss)">` +
+        `Couldn't load trades — ${esc(lastIngestError)}</div>`;
+    } else {
+      el.innerHTML = `<div class="empty">No trades match.</div>`;
+    }
+    return;
+  }
+  const rows = trades.map((t, i) => {
+    const sel = selectedKey === keyOf(t) ? "selected" : "";
+    const pnlClass = t.outcome;
+    const hold = t.exit_epoch && t.entry_epoch
+      ? `${Math.round((t.exit_epoch - t.entry_epoch) / 60)}m` : "—";
+    const frac = riskFraction(t);
+    const riskTag = frac != null
+      ? ` <span class="risk-cut" title="took ${(frac * 100).toFixed(0)}% of the configured risk` +
+        ` (size ${t.size} of intended ${t.intended_size})">⚠ ${(frac * 100).toFixed(0)}% R</span>`
+      : "";
+    const sizeStr = t.size != null ? `size ${t.size}${riskTag}` : (t.signal_type || "");
+    // Untracked-position reconcile marker: force-closed unowned position
+    // (bug fingerprint) or re-adopted bracketed position (after a restart).
+    const flagTag = t.flag
+      ? ` <span class="flag-tag ${t.flag}" title="${esc(t.flag_detail || "")}">` +
+        `${t.flag === "untracked_close" ? "⚠ UNTRACKED CLOSE" : "RECOVERED"}</span>`
+      : "";
+    // Short direction badge: SHRT / LONG (semantic loss/win colors).
+    const dirTag = t.direction === "short" ? "SHRT" : "LONG";
+    // A round-trip from an execution record carries its total fee (entry +
+    // exit legs); a backtest row has fee null, so no line shows there.
+    const feeLine = t.fee != null
+      ? `<span class="fee">fee $${t.fee.toFixed(2)}</span>` : "";
+    return `
+      <div class="trade ${sel}" data-idx="${i}">
+        <span class="rail"></span>
+        <span class="asset">${t.asset}</span>
+        <span class="dir ${t.direction}">${dirTag}</span>
+        <span class="when">${fmtWhen(t.entry_time)} · ${hold}</span>
+        <span class="pnl ${pnlClass}">${fmtPnl(t)}${feeLine}</span>
+        <span class="detail">${fmtPrice(t.entry_price)} → ${fmtPrice(t.exit_price)} · ${sizeStr}${flagTag}</span>
+      </div>
+    `;
+  }).join("");
+  el.innerHTML = rows;
+  el.querySelectorAll(".trade").forEach((node) => {
+    node.addEventListener("click", () => {
+      const idx = parseInt(node.dataset.idx);
+      selectTrade(trades[idx]);
+    });
+  });
+}
+
+function applyFilters() {
+  const asset = document.getElementById("asset-filter").value;
+  const outcome = document.getElementById("outcome-filter").value;
+  const direction = document.getElementById("direction-filter").value;
+  let filtered = allTrades;
+  if (asset) filtered = filtered.filter(t => t.asset === asset);
+  if (outcome) filtered = filtered.filter(t => t.outcome === outcome);
+  if (direction) filtered = filtered.filter(t => t.direction === direction);
+  renderTradeList(filtered);
+  renderSummary(filtered);
+}
+
+async function loadTrades({refresh = false} = {}) {
+  const btn = document.getElementById("refresh-btn");
+  const prevLabel = btn.textContent;
+  if (refresh) {
+    btn.disabled = true;
+    btn.textContent = "Refreshing…";
+  }
+  try {
+    const qs = new URLSearchParams({source, trader: TRADER});
+    if (refresh && source === "live") qs.set("refresh", "1");
+    const resp = await fetch(`/api/trades?${qs}`);
+    const data = await resp.json();
+    allTrades = data.trades;
+    // Prefer the server's label so two run pages are never confusable at a
+    // glance; fall back to the static registry label otherwise.
+    const traderLabel = data.trader_label || TRADER_LABEL;
+    const label = source === "backtest" ? "Backtest Trades" : traderLabel;
+    document.title = label;
+    document.getElementById("page-title").textContent = label;
+    // Label backtest results with the axes that produced them (from server
+    // metadata, not the current selection — a reload or an in-flight edit could
+    // otherwise mislabel a stale sidecar).
+    updateAxesLabel(source === "backtest" ? data.meta : null);
+    // …and, on a browser with no stored preference, adopt those same axes into
+    // the pickers. Otherwise the controls read live×market_hybrid (the hardcoded
+    // defaults) while the result on screen is whatever was last run — and the
+    // next Run silently grades a DIFFERENT combination than the one displayed.
+    if (source === "backtest" && data.meta) adoptAxesFromMeta(data.meta);
+    const assets = [...new Set(allTrades.map(t => t.asset))].sort();
+    document.getElementById("asset-filter").innerHTML =
+      `<option value="">All assets</option>` +
+      assets.map(a => `<option value="${a}">${a}</option>`).join("");
+    applyFilters();
+    updateBacktestStatus(data.exists, data.generated_at, data.freshness,
+                         source === "backtest" && data.meta ? data.meta.dataset_override : null);
+    lastIngestError = data.ingest_error || null;
+    if (data.ingest_error) {
+      console.warn("live ingest failed:", data.ingest_error);
+      btn.title = `Last refresh failed: ${data.ingest_error}`;
+    } else {
+      btn.title = "";
+    }
+    // Re-render the list now that lastIngestError is known, so an auth/fetch
+    // failure surfaces as a banner instead of a silent "No trades match".
+    applyFilters();
+    // A ?bt= link describes a setup, not the loaded result — if the sidecar on
+    // disk came from a different run, say so once rather than letting the
+    // URL's spec silently pass for the numbers on screen. Axes-only specs
+    // (no @from..to) compare axes only.
+    if (urlSpecPending && source === "backtest" && data.exists
+        && data.meta && data.meta.uid) {
+      urlSpecPending = false;
+      const want = specUidOf(urlSpec);
+      const got = (urlSpec.from || urlSpec.to)
+        ? data.meta.uid : data.meta.uid.split("@")[0];
+      if (got !== want) {
+        document.getElementById("bt-status").innerHTML +=
+          ` · <span class="stale">loaded result is a different run than the URL's spec — click Run to execute it</span>`;
+      }
+    }
+    // Deep link: ?trade=<opportunity_id | row key> — legacy #pos=<position_id>
+    // still honored — auto-selects that trade on first load.
+    if (selectedKey === null) {
+      const posHash = (location.hash.match(/^#pos=(.+)$/) || [])[1];
+      const want = URL_QS.get("trade") || (posHash ? decodeURIComponent(posHash) : null);
+      if (want) {
+        const t = allTrades.find(x => x.opportunity_id === want)
+          || allTrades.find(x => keyOf(x) === want)
+          || allTrades.find(x => x.position_id === want);
+        if (t) selectTrade(t);
+      }
+    }
+  } finally {
+    if (refresh) {
+      btn.disabled = false;
+      btn.textContent = prevLabel;
+    }
+  }
+}
+
+// Seed the three axis pickers from the loaded sidecar's meta, for axes the user
+// has never explicitly chosen on this browser. The sidecar is the only record of
+// what actually produced the numbers on screen, so it is a better default than
+// the hardcoded live×market_hybrid×live — which would otherwise leave the
+// controls describing a run that isn't the one being displayed.
+//
+// A stored preference always wins: once the user has picked an axis, a result
+// loaded from disk must not move their selection under them. Date bounds are
+// deliberately NOT adopted — initBacktestDates() owns those.
+function adoptAxesFromMeta(meta) {
+  const axes = [
+    ["viz.strategy", "bt-strategy", meta.strategy, v => selectedStrategy = v],
+    ["viz.fill",     "bt-fill",     meta.fill,     v => selectedFill = v],
+    ["viz.dataset",  "bt-dataset",  meta.dataset,  v => selectedDataset = v],
+  ];
+  let adopted = false;
+  for (const [key, id, val, assign] of axes) {
+    if (!val || localStorage.getItem(key)) continue;
+    const sel = document.getElementById(id);
+    // Only adopt a value the picker actually offers — a sidecar can outlive the
+    // preset that produced it, and a phantom <option> would post an unknown
+    // preset the run endpoint rejects with a 400.
+    if (!sel || !Array.from(sel.options).some(o => o.value === val)) continue;
+    sel.value = val;
+    assign(val);
+    adopted = true;
+  }
+  if (!adopted) return;
+  // Adopting a strategy/fill can engage the dataset pins, and adopting any axis
+  // changes the backing files behind the date range.
+  updateFillCaption();
+  enforceTickDatasetPin();
+  enforceStrategyDatasetPin();
+  showStrategyAssets(selectedStrategy);
+}
+
+// Render the run's canonical UID (strategy×fill×dataset@from..to, computed
+// server-side alongside the sidecar meta) as a click-to-copy chip, so a run
+// can be quoted verbatim with zero ambiguity about the setup. Passing null
+// (live view, or no run yet) clears it.
+function updateAxesLabel(meta) {
+  const el = document.getElementById("bt-axes-label");
+  if (!el) return;
+  el.textContent = "";
+  if (!meta || !meta.uid) return;
+  const chip = document.createElement("span");
+  chip.className = "bt-uid";
+  chip.textContent = meta.uid;
+  chip.title = meta.uid + " — click to copy";
+  chip.addEventListener("click", async () => {
+    let ok = false;
+    if (navigator.clipboard && window.isSecureContext) {
+      try { await navigator.clipboard.writeText(meta.uid); ok = true; }
+      catch (e) { /* fall through to the legacy path */ }
+    }
+    if (!ok) {
+      // Non-secure context (plain-http over LAN) or writeText refused.
+      const ta = document.createElement("textarea");
+      ta.value = meta.uid;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+      ta.remove();
+    }
+    if (ok) {
+      chip.classList.add("copied");
+      setTimeout(() => chip.classList.remove("copied"), 900);
+    } else {
+      console.warn("uid copy failed");
+    }
+  });
+  el.appendChild(chip);
+}
+
+function updateBacktestStatus(exists, generatedAt, freshness, datasetOverride) {
+  if (source !== "backtest") return;
+  const el = document.getElementById("bt-status");
+  if (!exists) {
+    el.innerHTML = `<span class="stale">No backtest yet — click Run.</span>`;
+  } else {
+    el.textContent = `Last run: ${fmtAgo(generatedAt)}`;
+  }
+  // Flag a run built on incomplete local data: an asset whose candles stop
+  // short silently drops every trade it would have taken after that point.
+  const warn = document.getElementById("bt-freshness");
+  if (warn) {
+    if (freshness && freshness.stale) {
+      warn.textContent = `⚠ built on incomplete data: ${freshness.reason} — re-run once the missing candles are in place`;
+      warn.style.display = "";
+    } else {
+      warn.style.display = "none";
+    }
+  }
+  // Badge a run whose strategy×dataset constraint was deliberately overridden,
+  // so a mixed pairing is never read as the preset's published baseline.
+  // `fromRun` marks the line as owned by a completed run, so the live axis-
+  // conflict note (setDatasetConflictNote) won't clear a real result's badge.
+  const ov = document.getElementById("bt-override");
+  if (ov) {
+    if (exists && datasetOverride) {
+      ov.textContent = `⚠ dataset override: ${datasetOverride}`;
+      ov.style.display = "";
+      ov.dataset.fromRun = "1";
+    } else {
+      ov.dataset.fromRun = "0";
+      ov.style.display = "none";
+      // Re-assert a pending axis conflict the cleared badge may have hidden.
+      enforceStrategyDatasetPin();
+    }
+  }
+}
+
+// Show/hide the whole backtest-config section (header, grid, run row,
+// progress) based on the active source.
+function showBacktestConfig(on) {
+  const cfg = document.getElementById("backtest-config");
+  if (cfg) cfg.style.display = on ? "" : "none";
+}
+
+
+// Handle of the active progress poller, so we never run two at once.
+let btPollTimer = null;
+
+function showBtProgress(on) {
+  document.getElementById("bt-progress").classList.toggle("active", on);
+  if (!on) {
+    const p = document.getElementById("bt-progress");
+    p.classList.remove("indeterminate");
+    document.getElementById("bt-progress-fill").style.width = "0%";
+    document.getElementById("bt-progress-pct").textContent = "";
+  }
+}
+
+function setBtProgress(fraction, etaSeconds, elapsedSeconds, segLabel) {
+  const p = document.getElementById("bt-progress");
+  const fill = document.getElementById("bt-progress-fill");
+  const pct = document.getElementById("bt-progress-pct");
+  // Stitched long run (re-warmed year segments): show which year is running
+  // so a multi-segment run never reads as stalled.
+  const seg = segLabel ? ` · ${segLabel}` : "";
+  // When the server still reports time-based progress under 1.0 but elapsed has
+  // blown past the estimate, switch to the shimmer (the model undershot).
+  const overrun = etaSeconds && elapsedSeconds && elapsedSeconds > etaSeconds * 1.05;
+  if (overrun && fraction < 1) {
+    p.classList.add("indeterminate");
+    pct.textContent = `~${Math.round(elapsedSeconds)}s elapsed${seg}`;
+  } else {
+    p.classList.remove("indeterminate");
+    const w = Math.max(0, Math.min(1, fraction)) * 100;
+    fill.style.width = w.toFixed(1) + "%";
+    pct.textContent = Math.round(w) + "%" + seg;
+  }
+}
+
+// Poll /api/backtest/status until the run is no longer running, updating the
+// bar each tick. Returns the terminal status object (carries error, if any).
+function pollBacktest() {
+  return new Promise((resolve) => {
+    let lastStatus = null;
+    const tick = async () => {
+      try {
+        const s = await (await fetch("/api/backtest/status")).json();
+        lastStatus = s;
+        if (s.running) {
+          const segLabel = s.segments_total > 1
+            ? `year ${Math.min(s.segments_done + 1, s.segments_total)}/${s.segments_total}`
+            : "";
+          setBtProgress(s.progress ?? 0, s.eta_seconds, s.elapsed_seconds, segLabel);
+        } else {
+          clearInterval(btPollTimer);
+          btPollTimer = null;
+          setBtProgress(1, s.eta_seconds, s.elapsed_seconds);
+          resolve(s);
+        }
+      } catch (e) {
+        // Transient fetch error — keep polling; the run is likely still going.
+        console.warn("status poll failed", e);
+      }
+    };
+    btPollTimer = setInterval(tick, 500);
+    tick();  // fire immediately so the bar moves without a 500ms gap
+  });
+}
+
+async function runBacktest() {
+  const btn = document.getElementById("bt-run-btn");
+  const status = document.getElementById("bt-status");
+  if (btPollTimer) { clearInterval(btPollTimer); btPollTimer = null; }
+  btn.disabled = true;
+  status.textContent = "Syncing data…";
+  // A long-lived tab keeps whatever bounds were prefilled at load, so a run
+  // clicked days later would silently end in the past. Re-fetch the range now
+  // and move each bound ONLY if it still equals the last auto-filled value —
+  // a manually edited date wins.
+  const fromEl = document.getElementById("bt-from");
+  const toEl = document.getElementById("bt-to");
+  const prev = {from: fromEl.value, to: toEl.value};
+  const untouched = {from: prev.from === btAutoDates.from, to: prev.to === btAutoDates.to};
+  await refreshBacktestTo();  // rewrites both inputs from the fresh range
+  if (!untouched.from && prev.from) fromEl.value = prev.from;
+  if (!untouched.to && prev.to) toEl.value = prev.to;
+  const from = fromEl.value;
+  const to = toEl.value;
+  status.textContent = "Running…";
+  showBtProgress(true);
+  setBtProgress(0, null, null);
+  try {
+    const strategy = document.getElementById("bt-strategy").value || undefined;
+    const fill = document.getElementById("bt-fill").value || undefined;
+    const dataset = document.getElementById("bt-dataset").value || undefined;
+    // The server enforces the strategy×dataset rule independently of the UI
+    // pin; send the unlock state so a deliberate mix is accepted (and recorded)
+    // while an accidental one is still refused.
+    const unlockEl = document.getElementById("bt-dataset-unlock");
+    const allow_dataset_override = !!(unlockEl && unlockEl.checked);
+    // Warmup depth is the strategy's own [viz] warmup_days annotation — the
+    // server resolves it per preset; there is deliberately no knob here.
+    // Kick off the run (returns immediately with an ETA), then poll for progress.
+    const resp = await fetch("/api/backtest/run", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({from, to, strategy, fill, dataset, allow_dataset_override}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      status.innerHTML = `<span class="stale">Failed: ${data.error || resp.status}</span>`;
+      console.error(data);
+      showBtProgress(false);
+      return;
+    }
+    if (data.eta_seconds) status.textContent = `Running… (~${Math.round(data.eta_seconds)}s)`;
+    const final = await pollBacktest();
+    if (final && final.error) {
+      status.innerHTML = `<span class="stale">Failed: ${final.error.slice(0, 200)}</span>`;
+      console.error(final.error);
+      return;
+    }
+    await loadTrades();
+  } finally {
+    showBtProgress(false);
+    btn.disabled = false;
+  }
+}
+
+// Last /api/backtest/range response: holds both the intersection bounds
+// (earliest/latest — every asset present) and the union bounds
+// (earliest_full/latest_full — each asset over its whole file).
+let btRange = null;
+
+function maxHistOn() {
+  const el = document.getElementById("bt-maxhist");
+  return el && el.checked;
+}
+
+// Set the date inputs from the cached range, choosing union vs intersection
+// based on the "Max history" toggle. Falls back to intersection when the union
+// bounds aren't available. Remembers what it wrote (btAutoDates) so the pre-run
+// refresh can tell an untouched input from a manual edit.
+let btAutoDates = {from: null, to: null};
+
+function applyDateRange() {
+  if (!btRange) return;
+  const useFull = maxHistOn();
+  const from = (useFull && btRange.earliest_full) || btRange.earliest;
+  const to = (useFull && btRange.latest_full) || btRange.latest;
+  if (from) { document.getElementById("bt-from").value = from; btAutoDates.from = from; }
+  if (to) { document.getElementById("bt-to").value = to; btAutoDates.to = to; }
+  // A ?bt= link's dates beat the auto-filled range (they ARE the setup being
+  // shared). btAutoDates keeps the auto values, so the pre-run range refresh
+  // classifies these as manual edits and preserves them. Cleared as soon as
+  // the user touches any range control.
+  if (urlDates) {
+    if (urlDates.from) document.getElementById("bt-from").value = urlDates.from;
+    if (urlDates.to) document.getElementById("bt-to").value = urlDates.to;
+  }
+  syncUrl();
+}
+
+async function refreshBacktestTo() {
+  try {
+    // Pass the selected dataset so the range reflects the files it redirects
+    // to, and the strategy, so an own-sources preset's range comes from ITS
+    // files rather than from a source-free dataset's fallback.
+    const ds = document.getElementById("bt-dataset").value || selectedDataset || "";
+    const st = document.getElementById("bt-strategy").value || selectedStrategy || "";
+    const resp = await fetch("/api/backtest/range?dataset=" + encodeURIComponent(ds)
+      + "&strategy=" + encodeURIComponent(st));
+    btRange = await resp.json();
+    applyDateRange();
+    return btRange;
+  } catch (e) {
+    console.warn("range fetch failed", e);
+  }
+  return null;
+}
+
+async function initBacktestDates() {
+  const iso = d => d.toISOString().slice(0, 10);
+  // Restore the Max-history toggle before fetching the range so applyDateRange
+  // picks the right bounds on first load.
+  const chk = document.getElementById("bt-maxhist");
+  chk.checked = localStorage.getItem("viz.maxHist") === "1";
+  // Max history: when on, run each asset over its whole file, so From/To are
+  // disabled (their .value still feeds runBacktest() — disabled inputs keep it).
+  const applyMaxHist = () => {
+    const on = chk.checked;
+    document.getElementById("bt-from").disabled = on;
+    document.getElementById("bt-to").disabled = on;
+    const why = document.getElementById("bt-why");
+    if (why) {
+      why.textContent = on
+        ? "each asset over its whole file"
+        : "common window · all assets present";
+    }
+  };
+  chk.addEventListener("change", () => {
+    localStorage.setItem("viz.maxHist", chk.checked ? "1" : "0");
+    urlDates = null;
+    applyMaxHist();
+    applyDateRange();
+  });
+  // Manually edited dates are part of the shared setup too.
+  for (const id of ["bt-from", "bt-to"]) {
+    document.getElementById(id).addEventListener("change", () => {
+      urlDates = null;
+      syncUrl();
+    });
+  }
+  applyMaxHist();  // reflect the restored checkbox state on initial load
+  const r = await refreshBacktestTo();
+  if (!r) {
+    document.getElementById("bt-from").value = iso(new Date(Date.now() - 14 * 86400000));
+    document.getElementById("bt-to").value = iso(new Date());
+  }
+}
+
+// ─── Data-source editor ─────────────────────────────────────────────────────
+
+// Show the selected strategy's assets read-only (assets belong to the strategy,
+// not the dataset — there's nothing to edit here, just to see what trades).
+async function showStrategyAssets(strategy) {
+  const el = document.getElementById("bt-assets");
+  if (!el) return;
+  let assets = [];
+  ownSourceStems = [];
+  ownDatasetLabel = null;
+  try {
+    const info = await (await fetch("/api/sources?strategy=" + encodeURIComponent(strategy))).json();
+    assets = info.assets || [];
+    ownSourceStems = info.own_source_stems || [];
+    ownDatasetLabel = info.own_dataset_label || null;
+  } catch (e) { console.warn("strategy assets fetch failed", e); }
+  // The grid supplies the "Assets" label; write just the value here.
+  el.textContent = assets.length ? assets.join(", ") : "—";
+  // Stems arrive async, after enforceStrategyDatasetPin already ran on the
+  // strategy-change event — refresh the pinned option's display text now.
+  updateDatasetPinLabels();
+}
+
+// Display text of the dataset options. Normally each option shows its preset
+// name; while an own-sources strategy pins the picker, the allowed (source-
+// free) options would name a feed the run never touches, since it will
+// actually load the strategy's own [[source]] parquets. Worse, ALL the
+// source-free options are that same run (they contribute nothing to the
+// compose step), so relabelling each of them identically shows N duplicate
+// entries. Collapse instead: one canonical option stays, relabelled with the
+// real stems (e.g. "strategy's own sources (CL+ES+NQ+SI)"); its source-free
+// twins are hidden. Option VALUES are untouched, so the POST/pin/conflict
+// machinery sees no change; ticking "Unlock dataset" or selecting a normal
+// strategy restores the plain, complete list.
+function updateDatasetPinLabels() {
+  const dataSel = document.getElementById("bt-dataset");
+  const unlock = document.getElementById("bt-dataset-unlock");
+  if (!dataSel) return;
+  const c = stratConstraints[selectedStrategy] || {};
+  const ownPin = c.own_sources && !(c.requires_dataset && c.requires_dataset.length)
+    && !(unlock && unlock.checked);
+  const canon = pinnedDatasetCanon();
+  // A registry short name ("full_contracts") is the preferred label — one
+  // stable dataset identity, matching the UID token the server stamps. The
+  // stems join is the fallback for unregistered stem sets.
+  const pinnedText = ownDatasetLabel
+    || (ownSourceStems.length
+      ? `strategy's own sources (${ownSourceStems.join("+")})`
+      : "strategy's own sources");
+  for (const o of dataSel.options) {
+    const plain = o.value.replace(/\.toml$/, "");
+    const isPinned = ownPin && o.value === canon;
+    o.textContent = isPinned ? pinnedText : plain;
+    // The short name hides the stems; keep them reachable on hover.
+    if (isPinned && ownDatasetLabel && ownSourceStems.length) {
+      o.title = ownSourceStems.join("+");
+    }
+    o.hidden = ownPin && o.value !== canon && sourcelessDatasets.includes(o.value);
+  }
+}
+
+// The single dataset option kept visible while an own-sources strategy pins
+// the picker. "live" is the neutral no-contribution choice (and the default
+// dataset); the display label carries the honest stems, so the value only
+// names the UID axis.
+function pinnedDatasetCanon() {
+  return sourcelessDatasets.includes("live.toml") ? "live.toml" : sourcelessDatasets[0];
+}
+
+// Populate an axis <select> from a [{name, desc}] preset list. Each option shows
+// the bare name (no .toml) and carries its description as a title (hover tooltip).
+// Restores `chosen` if present, else `def`. Returns the value actually selected.
+function fillAxisSelect(sel, presets, chosen, def) {
+  sel.innerHTML = "";
+  const names = presets.map(p => p.name);
+  let value = names.includes(chosen) ? chosen : (names.includes(def) ? def : (names[0] || def));
+  for (const p of presets) {
+    const opt = document.createElement("option");
+    opt.value = p.name;
+    opt.textContent = p.name.replace(/\.toml$/, "");
+    if (p.desc) opt.title = p.desc;
+    if (p.name === value) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  return value;
+}
+
+// The tick fill lens only has data under `tickDataset`, so when it's selected we
+// force the dataset there and lock the dropdown (with an explanatory title) so
+// an invalid tick×other-dataset run — which silently falls back to OHLC every
+// bar — can't be built. Deselecting tick restores free dataset choice, returning
+// to the user's last non-tick pick. Returns true if the dataset was changed.
+function enforceTickDatasetPin() {
+  const dataSel = document.getElementById("bt-dataset");
+  if (!dataSel) return false;
+  const isTick = tickFills.has(selectedFill);
+  let changed = false;
+  if (isTick) {
+    const hasTickDs = Array.from(dataSel.options).some(o => o.value === tickDataset);
+    if (hasTickDs && dataSel.value !== tickDataset) {
+      dataSel.value = tickDataset;
+      selectedDataset = tickDataset;
+      localStorage.setItem("viz.dataset", selectedDataset);
+      changed = true;
+    }
+    dataSel.disabled = true;
+    dataSel.title = "Locked to " + tickDataset.replace(/\.toml$/, "")
+      + ": the tick fill lens only has tick data on this dataset "
+      + "(other datasets fall back to OHLC every bar). Pick a non-tick fill "
+      + "lens to change the dataset.";
+  } else {
+    dataSel.disabled = false;
+    dataSel.title = "Which candle files the strategy runs on. A dataset "
+      + "declares only data sources: a source-free one means each asset loads "
+      + "its own parquet, and one with [[source]] tables redirects assets to "
+      + "other file stems.";
+  }
+  return changed;
+}
+
+// Warn about an axis combination that no dataset choice can satisfy (currently
+// only strategy-requires-X × tick-pins-Y). Shares the override warn line, which
+// is otherwise only written after a run completes.
+function setDatasetConflictNote(msg) {
+  const el = document.getElementById("bt-override");
+  if (!el) return;
+  if (msg) { el.textContent = msg; el.style.display = ""; }
+  else if (el.dataset.fromRun !== "1") { el.style.display = "none"; }
+}
+
+// Which datasets the current strategy may run on, or null when unconstrained.
+// `own_sources` presets carry their own [[source]] tables: the compose step
+// would DROP those in favour of any dataset that declares sources, so the only
+// valid partners are the source-free ones (live). A `requires_dataset` list is
+// the strategy author's explicit declaration and wins as-is.
+function allowedDatasetsFor(strategy) {
+  const c = stratConstraints[strategy];
+  if (!c) return null;
+  if (c.requires_dataset && c.requires_dataset.length) return new Set(c.requires_dataset);
+  if (c.own_sources) return new Set(sourcelessDatasets);
+  return null;
+}
+
+// Enforce the strategy's dataset constraint on the picker: invalid options stay
+// VISIBLE but disabled (so the reason is discoverable rather than the option
+// just vanishing), and the selection moves to a valid one. Ticking "Unlock
+// dataset" restores full choice — mixing stays available, it just has to be
+// explicit. Returns true if the selected dataset changed.
+function enforceStrategyDatasetPin() {
+  const dataSel = document.getElementById("bt-dataset");
+  const wrap = document.getElementById("bt-unlock-wrap");
+  const unlock = document.getElementById("bt-dataset-unlock");
+  const why = document.getElementById("bt-unlock-why");
+  if (!dataSel || !wrap || !unlock) return false;
+  const allowedTick = allowedDatasetsFor(selectedStrategy);
+  // The tick pin owns the dataset axis outright (it forces `tickDataset`), so
+  // don't fight it for control. But if the strategy forbids that dataset the
+  // combination is unrunnable on BOTH axes — say so here rather than letting
+  // the run endpoint reject it later with a dataset-shaped error.
+  if (tickFills.has(selectedFill)) {
+    wrap.classList.add("hidden");
+    if (allowedTick && !allowedTick.has(tickDataset)) {
+      const c = stratConstraints[selectedStrategy] || {};
+      const need = (c.requires_dataset && c.requires_dataset.length)
+        ? c.requires_dataset.map(d => d.replace(/\.toml$/, "")).join(" / ")
+        : "a source-free dataset";
+      setDatasetConflictNote(
+        `⚠ ${selectedStrategy.replace(/\.toml$/, "")} cannot run on the tick fill lens: `
+        + `tick pins the dataset to ${tickDataset.replace(/\.toml$/, "")}, but this strategy requires `
+        + `${need}. Pick a non-tick fill lens.`);
+    } else {
+      setDatasetConflictNote(null);
+    }
+    return false;
+  }
+  setDatasetConflictNote(null);
+  // Keep the option display text in sync with the pin (own-sources presets
+  // relabel the source-free options; everything else restores plain names).
+  updateDatasetPinLabels();
+  const allowed = allowedDatasetsFor(selectedStrategy);
+  if (!allowed) {
+    wrap.classList.add("hidden");
+    unlock.checked = false;
+    for (const o of dataSel.options) o.disabled = false;
+    return false;
+  }
+  wrap.classList.remove("hidden");
+  const c = stratConstraints[selectedStrategy] || {};
+  if (why) {
+    why.textContent = (c.requires_dataset && c.requires_dataset.length)
+      ? "pinned to " + c.requires_dataset.map(d => d.replace(/\.toml$/, "")).join(" / ")
+      : "preset carries its own sources";
+  }
+  const free = unlock.checked;
+  let changed = false;
+  for (const o of dataSel.options) o.disabled = free ? false : !allowed.has(o.value);
+  // Own-sources pin: the source-free options are interchangeable (the compose
+  // step appends nothing either way) and updateDatasetPinLabels collapses them
+  // to one visible canonical entry — park the VALUE there too, so the selection
+  // never sits on a hidden twin.
+  const ownPin = c.own_sources && !(c.requires_dataset && c.requires_dataset.length);
+  const want = (!free && ownPin) ? pinnedDatasetCanon() : null;
+  if (want && allowed.has(want) && dataSel.value !== want) {
+    dataSel.value = want;
+    selectedDataset = want;
+    localStorage.setItem("viz.dataset", selectedDataset);
+    changed = true;
+  } else if (!free && !allowed.has(dataSel.value)) {
+    // Move to the first allowed option that actually exists in the picker.
+    const target = Array.from(dataSel.options).find(o => allowed.has(o.value));
+    if (target) {
+      dataSel.value = target.value;
+      selectedDataset = target.value;
+      localStorage.setItem("viz.dataset", selectedDataset);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+// Update the caption line to describe the currently-selected fill lens (the axis
+// most worth explaining), so the user sees what the fill actually does.
+function updateFillCaption() {
+  const cap = document.getElementById("bt-caption");
+  if (!cap) return;
+  // The preset comments themselves start with "Fill lens:" — strip it so the
+  // prepended label doesn't double up ("Fill lens: Fill lens: HYBRID …").
+  const desc = (fillDescs[selectedFill] || "").replace(/^fill lens:\s*/i, "");
+  cap.textContent = desc ? `Fill lens: ${desc}` : "";
+}
+
+// Populate the Strategy, Fill lens, and Dataset dropdowns. A backtest run is the
+// chosen strategy (algorithm + assets) × fill lens (fill simulation) × dataset
+// (data sources) — three orthogonal axes the user picks independently.
+async function initSources() {
+  let strategies = [], fills = [], datasets = [];
+  let defStrat = "example.toml", defFill = "market_hybrid.toml", defData = "local.toml";
+  try {
+    const r = await (await fetch("/api/sources")).json();
+    strategies = r.strategies || [];
+    fills = r.fills || [];
+    datasets = r.datasets || [];
+    defStrat = r.default_strategy || defStrat;
+    defFill = r.default_fill || defFill;
+    defData = r.default_dataset || defData;
+    if (r.tick_dataset) tickDataset = r.tick_dataset;
+    if (r.sourceless_datasets) sourcelessDatasets = r.sourceless_datasets;
+  } catch (e) { console.warn("sources fetch failed", e); }
+
+  fillDescs = {};
+  tickFills = new Set();
+  for (const p of fills) {
+    fillDescs[p.name] = p.desc;
+    if (p.tick) tickFills.add(p.name);
+  }
+  stratConstraints = {};
+  for (const p of strategies) {
+    stratConstraints[p.name] = {
+      requires_dataset: p.requires_dataset || [],
+      own_sources: !!p.own_sources,
+    };
+  }
+
+  const stratSel = document.getElementById("bt-strategy");
+  selectedStrategy = fillAxisSelect(stratSel, strategies, selectedStrategy, defStrat);
+  localStorage.setItem("viz.strategy", selectedStrategy);
+  stratSel.addEventListener("change", () => {
+    selectedStrategy = stratSel.value;
+    localStorage.setItem("viz.strategy", selectedStrategy);
+    // A new strategy may pin the dataset axis; unlocking is per-strategy, so
+    // reset the escape hatch rather than carrying it silently across presets.
+    const unlockEl = document.getElementById("bt-dataset-unlock");
+    if (unlockEl) unlockEl.checked = false;
+    // The new strategy's own-source stems arrive with showStrategyAssets'
+    // fetch below; clear the old ones so the pin label never shows the
+    // PREVIOUS strategy's stems while that request is in flight.
+    ownSourceStems = [];
+    ownDatasetLabel = null;
+    urlDates = null;  // user is editing the setup — the link's dates stop pinning
+    enforceStrategyDatasetPin();
+    // Always refresh the range: it depends on the strategy itself now (an
+    // own-sources preset ranges over its own files), not just the dataset.
+    refreshBacktestTo();
+    showStrategyAssets(stratSel.value);
+    syncUrl();
+  });
+
+  const fillSel = document.getElementById("bt-fill");
+  selectedFill = fillAxisSelect(fillSel, fills, selectedFill, defFill);
+  localStorage.setItem("viz.fill", selectedFill);
+  fillSel.addEventListener("change", () => {
+    selectedFill = fillSel.value;
+    localStorage.setItem("viz.fill", selectedFill);
+    updateFillCaption();
+    // Tick lens pins/locks the dataset; if that moved the dataset, its backing
+    // files (and so the valid date range) changed too. Leaving a tick lens
+    // hands the axis back to the strategy pin, so re-apply that after.
+    urlDates = null;
+    const moved = enforceTickDatasetPin();
+    const moved2 = enforceStrategyDatasetPin();
+    if (moved || moved2) refreshBacktestTo();
+    syncUrl();
+  });
+  updateFillCaption();
+
+  const dataSel = document.getElementById("bt-dataset");
+  selectedDataset = fillAxisSelect(dataSel, datasets, selectedDataset, defData);
+  localStorage.setItem("viz.dataset", selectedDataset);
+  dataSel.addEventListener("change", () => {
+    selectedDataset = dataSel.value;
+    localStorage.setItem("viz.dataset", selectedDataset);
+    urlDates = null;
+    // Different dataset → different backing files → different date range.
+    refreshBacktestTo();
+    syncUrl();
+  });
+  const unlockEl = document.getElementById("bt-dataset-unlock");
+  if (unlockEl) {
+    unlockEl.addEventListener("change", () => {
+      // Re-running the pin either frees every option (unlocked) or snaps the
+      // selection back to a valid one (re-locked).
+      if (enforceStrategyDatasetPin()) refreshBacktestTo();
+      syncUrl();
+    });
+  }
+  // Apply both pins now, in case a persisted tick fill or a constrained
+  // strategy was restored from localStorage above.
+  enforceTickDatasetPin();
+  enforceStrategyDatasetPin();
+
+  await showStrategyAssets(stratSel.value || defStrat);
+}
+
+// The backtest config is the only mode this page has, so its controls are
+// simply revealed at init rather than toggled against a source.
+function initSourceToggle() {
+  document.getElementById("backtest-controls").classList.remove("hidden");
+  document.getElementById("bt-runrow").classList.remove("hidden");
+  showBacktestConfig(true);
+}
+
+// Build the run dropdown from the injected registry (TRADERS): one option per
+// registry entry, in registry order, with the current run selected. Picking a
+// run navigates to its stable "/<key>" URL. No name literals here — every
+// option comes from what the server discovered on disk.
+function initTraderSelect() {
+  const sel = document.getElementById("trader-select");
+  if (!sel) return;
+  sel.innerHTML = "";
+  for (const t of TRADERS) {
+    if (t.archived && t.key !== TRADER) continue;
+    const opt = document.createElement("option");
+    opt.value = t.key;
+    opt.textContent = t.configured ? t.label : `${t.label} — not configured`;
+    opt.disabled = !t.configured;
+    opt.selected = t.key === TRADER;
+    sel.appendChild(opt);
+  }
+  sel.addEventListener("change", () => {
+    if (sel.value !== TRADER) location.href = `/${sel.value}`;
+  });
+}
+
+// Candle `time` values are raw UTC unix seconds. Lightweight-charts renders
+// those on the axis in UTC by default, which disagrees with every text panel
+// on the page (all pinned to Central via CENTRAL_TZ). Route the axis and the
+// crosshair label through America/Chicago too so the whole page reads one tz.
+function centralHM(epoch) {
+  return new Date(epoch * 1000).toLocaleTimeString("en-GB", {
+    timeZone: CENTRAL_TZ, hour: "2-digit", minute: "2-digit", hour12: false });
+}
+function centralMD(epoch) {
+  return new Date(epoch * 1000).toLocaleDateString("en-US", {
+    timeZone: CENTRAL_TZ, day: "numeric", month: "short" });
+}
+// Axis tick: show the date on day-boundary ticks, else HH:MM. `tickType` is
+// TickMarkType (Year=0, Month=1, DayOfMonth=2, Time=3, TimeWithSeconds=4).
+function centralTickMark(epoch, tickType) {
+  return tickType <= 2 ? centralMD(epoch) : centralHM(epoch);
+}
+
+function ensureChart() {
+  if (chart) return;
+  lazyLoadWired = false;  // fresh chart needs a fresh range subscription
+  const container = document.getElementById("chart");
+  container.innerHTML = "";
+  chart = LightweightCharts.createChart(container, {
+    layout: { background: { color: "#0b0b0d" }, textColor: "#ebe9e2" },
+    grid: {
+      vertLines: { color: "#1b1b1d" },
+      horzLines: { color: "#1b1b1d" },
+    },
+    localization: {
+      timeFormatter: (epoch) => `${centralMD(epoch)} ${centralHM(epoch)}`,
+    },
+    timeScale: {
+      timeVisible: true,
+      secondsVisible: false,
+      tickMarkFormatter: (epoch, tickType) => centralTickMark(epoch, tickType),
+      // Lazy-load appends bars while the last bar is on screen (always true
+      // right after fitContent); the default auto-shift would yank the view to
+      // the newest data and scroll the entry/exit markers out of frame.
+      shiftVisibleRangeOnNewBar: false,
+    },
+    rightPriceScale: { borderColor: "#3a3a38" },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
+  candleSeries = chart.addCandlestickSeries({
+    upColor: "#37d67a",
+    downColor: "#ff5d52",
+    borderUpColor: "#37d67a",
+    borderDownColor: "#ff5d52",
+    wickUpColor: "#37d67a",
+    wickDownColor: "#ff5d52",
+  });
+  window.addEventListener("resize", () => chart.resize(container.clientWidth, container.clientHeight));
+}
+
+function clearOverlays() {
+  priceLines.forEach(pl => candleSeries.removePriceLine(pl));
+  priceLines = [];
+  overlaySeries.forEach(s => chart.removeSeries(s));
+  overlaySeries = [];
+  candleSeries.setMarkers([]);
+}
+
+// How many bars-worth of empty space at an edge triggers a fetch, and how big
+// each extend chunk is (minutes of 1m candles to pull beyond the current edge).
+const LAZY_EDGE_BARS = 50;
+const LAZY_CHUNK_MIN = 240;
+
+async function fetchCandleWindow(asset, startEpoch, endEpoch) {
+  const params = new URLSearchParams({
+    asset: asset,
+    entry: String(startEpoch),
+    exit: String(endEpoch),
+    pad_minutes: "0",
+    source: loadCtx ? loadCtx.source : source,
+  });
+  const resp = await fetch("/api/chart?" + params.toString());
+  if (!resp.ok) return [];
+  const data = await resp.json();
+  return (data && data.candles) ? data.candles : [];
+}
+
+// Merge new candles into loadedCandles (dedup by time), keep sorted, and push
+// the full set back to the series. Returns true if anything new was added.
+function mergeCandles(extra) {
+  if (!extra || !extra.length) return false;
+  const seen = new Set(loadedCandles.map(c => c.time));
+  let added = 0;
+  for (const c of extra) {
+    if (!seen.has(c.time)) { loadedCandles.push(c); seen.add(c.time); added++; }
+  }
+  if (!added) return false;
+  loadedCandles.sort((a, b) => a.time - b.time);
+  candleSeries.setData(loadedCandles);
+  return true;
+}
+
+async function extendLeft() {
+  if (loadingLeft || !loadCtx || !loadedCandles.length) return;
+  loadingLeft = true;
+  const gen = loadGen;
+  try {
+    const oldest = loadedCandles[0].time;
+    const extra = await fetchCandleWindow(
+      loadCtx.asset, oldest - LAZY_CHUNK_MIN * 60, oldest);
+    if (gen !== loadGen) return;  // user switched trades mid-fetch
+    mergeCandles(extra);
+  } finally {
+    loadingLeft = false;
+  }
+}
+
+async function extendRight() {
+  if (loadingRight || !loadCtx || !loadedCandles.length) return;
+  loadingRight = true;
+  const gen = loadGen;
+  try {
+    const newest = loadedCandles[loadedCandles.length - 1].time;
+    const extra = await fetchCandleWindow(
+      loadCtx.asset, newest, newest + LAZY_CHUNK_MIN * 60);
+    if (gen !== loadGen) return;  // user switched trades mid-fetch
+    mergeCandles(extra);
+  } finally {
+    loadingRight = false;
+  }
+}
+
+// Subscribe once: when the visible range pans within LAZY_EDGE_BARS of either
+// end of the loaded data, fetch an adjacent chunk so the screen stays filled.
+function ensureLazyLoad() {
+  if (lazyLoadWired || !chart) return;
+  lazyLoadWired = true;
+  chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+    if (!range || !loadedCandles.length) return;
+    const n = loadedCandles.length;
+    // Logical range is in bar-index space: <0 means empty space to the left of
+    // the first bar, >n-1 means empty space past the last bar.
+    if (range.from < LAZY_EDGE_BARS) extendLeft();
+    if (range.to > n - 1 - LAZY_EDGE_BARS) extendRight();
+  });
+}
+
+// Live fill timestamps have second precision but candles are keyed by bar-open
+// time; snap to the bar that CONTAINS the fill (last bar time <= epoch), else
+// lightweight-charts attaches the marker to the following bar.
+function barTimeFor(epoch, candles) {
+  let t = candles[0].time;
+  for (const c of candles) {
+    if (c.time > epoch) break;
+    t = c.time;
+  }
+  return t;
+}
+
+// A dot anchored at the exact (bar, price) of a fill — series markers can't do
+// this (belowBar/aboveBar pin to the bar's extreme), so use a one-point line
+// series with point markers.
+function addFillDot(time, price, color) {
+  const s = chart.addLineSeries({
+    color,
+    lineVisible: false,
+    pointMarkersVisible: true,
+    pointMarkersRadius: 4,
+    lastValueVisible: false,
+    priceLineVisible: false,
+    crosshairMarkerVisible: false,
+  });
+  s.setData([{ time, value: price }]);
+  overlaySeries.push(s);
+}
+
+async function selectTrade(t) {
+  selectedKey = keyOf(t);
+  selectedTradeParam = t.opportunity_id || keyOf(t);
+  urlTradeConsumed = true;
+  syncUrl();
+  applyFilters();
+
+  document.getElementById("chart-title").textContent =
+    `${t.asset} ${t.direction.toUpperCase()}`;
+  const isOpen = !t.exit_epoch;
+  const holdMin = t.exit_epoch && t.entry_epoch
+    ? Math.round((t.exit_epoch - t.entry_epoch) / 60) : null;
+  const priceCell = isOpen
+    ? `${fmtPrice(t.entry_price)} → open`
+    : `${fmtPrice(t.entry_price)} → ${fmtPrice(t.exit_price)}`;
+  const detailFrac = riskFraction(t);
+  const metaParts = [
+    priceCell,
+    t.size != null ? `size ${t.size}` : "",
+    detailFrac != null
+      ? `⚠ took ${(detailFrac * 100).toFixed(0)}% of configured risk (intended size ${t.intended_size})`
+      : "",
+    isOpen ? "OPEN" : fmtPnl(t),
+    t.fee != null ? `fees $${t.fee.toFixed(2)}` : "",
+    fmtWhen(t.entry_time),
+    holdMin != null ? `${holdMin}m hold` : "",
+    t.score != null ? `score ${t.score.toFixed(1)}` : "",
+    t.signal_type || "",
+    t.entry_crossed != null ? `entry: ${t.entry_crossed ? "taker" : "maker"}` : "",
+    t.exit_crossed != null ? `exit: ${t.exit_crossed ? "taker" : "maker"}` : "",
+    t.closed_via ? `closed: ${t.closed_via}` : "",
+    t.flag === "untracked_close"
+      ? `⚠ UNTRACKED CLOSE — ${t.flag_detail || "bot force-flattened an unowned position"}`
+      : "",
+    t.flag === "recovered"
+      ? `RECOVERED — ${t.flag_detail || "bot re-adopted an untracked bracketed position"}`
+      : "",
+  ].filter(Boolean);
+  const metaEl = document.getElementById("chart-meta");
+  metaEl.textContent = metaParts.join(" · ");
+  if (t.opportunity_id) {
+    metaEl.appendChild(document.createTextNode(" · "));
+    const idEl = document.createElement("span");
+    idEl.className = "opp-id";
+    idEl.textContent = t.opportunity_id;
+    idEl.title = "click to copy";
+    idEl.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(t.opportunity_id); } catch (e) { return; }
+      idEl.classList.add("copied");
+      setTimeout(() => idEl.classList.remove("copied"), 900);
+    });
+    metaEl.appendChild(idEl);
+  }
+
+  ensureChart();
+  clearOverlays();
+
+  const params = new URLSearchParams({
+    asset: t.asset,
+    entry: t.entry_epoch,
+    pad_minutes: "60",
+    source: source,
+  });
+  if (t.exit_epoch) params.set("exit", t.exit_epoch);
+  // Backtest charts render the exact (possibly donor-scaled) series the trade was
+  // generated on: the server reads the source map embedded in the backtest JSON
+  // sidecar by asset, so no client-side override is needed here.
+  const resp = await fetch("/api/chart?" + params.toString());
+  const data = await resp.json();
+  if (!data.candles || !data.candles.length) {
+    document.getElementById("chart").innerHTML =
+      `<div class="empty">No candle data for ${t.asset} in this range.</div>`;
+    chart = null;
+    candleSeries = null;
+    return;
+  }
+  loadedCandles = data.candles.slice();
+  loadCtx = { asset: t.asset, source: source };
+  loadGen++;
+  loadingLeft = false;
+  loadingRight = false;
+  candleSeries.setData(loadedCandles);
+  ensureLazyLoad();
+
+  // The line marks where the entry limit was PLACED (strategy intent, from
+  // the jsonl log); the dot below marks where the fill actually landed. They
+  // differ when the watchdog chased a skipped resting limit.
+  // Bit-exact inequality flagged 1-ULP float noise (e.g. 80.27 vs
+  // 80.27000000000001) as a chase; compare with a relative epsilon so only a
+  // real price gap between the placed level and the fill counts.
+  const chased = t.intended_entry != null &&
+    Math.abs(t.intended_entry - t.entry_price) >
+      1e-6 * Math.max(1, Math.abs(t.intended_entry));
+  priceLines.push(candleSeries.createPriceLine({
+    price: t.intended_entry != null ? t.intended_entry : t.entry_price,
+    color: "#58a6ff",
+    lineWidth: 1,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    axisLabelVisible: true,
+    title: "entry",
+  }));
+  if (t.exit_price != null) {
+    priceLines.push(candleSeries.createPriceLine({
+      price: t.exit_price,
+      color: "#ebe9e2",
+      lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dashed,
+      axisLabelVisible: true,
+      title: "exit",
+    }));
+  }
+  // Strategy SL/TP from the bot's structured log (jsonl), when available.
+  if (t.stop_price != null) {
+    priceLines.push(candleSeries.createPriceLine({
+      price: t.stop_price,
+      color: "#ff5d52",
+      lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dotted,
+      axisLabelVisible: true,
+      title: "stop",
+    }));
+  }
+  if (t.tp_price != null) {
+    priceLines.push(candleSeries.createPriceLine({
+      price: t.tp_price,
+      color: "#37d67a",
+      lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dotted,
+      axisLabelVisible: true,
+      title: "tp",
+    }));
+  }
+
+  const markers = [];
+  const entryBarTime = barTimeFor(t.entry_epoch, data.candles);
+  markers.push({
+    time: entryBarTime,
+    position: t.direction === "long" ? "belowBar" : "aboveBar",
+    color: "#58a6ff",
+    shape: t.direction === "long" ? "arrowUp" : "arrowDown",
+    text: chased ? `entry ${fmtPrice(t.entry_price)} (chased)` : `entry ${fmtPrice(t.entry_price)}`,
+  });
+  addFillDot(entryBarTime, t.entry_price, "#58a6ff");
+  if (t.exit_epoch) {
+    const isWin = t.outcome === "win";
+    const isLoss = t.outcome === "loss";
+    const exitColor = isWin ? "#37d67a" : isLoss ? "#ff5d52" : "#8b8a82";
+    const exitBarTime = barTimeFor(t.exit_epoch, data.candles);
+    markers.push({
+      time: exitBarTime,
+      position: t.direction === "long" ? "aboveBar" : "belowBar",
+      color: exitColor,
+      shape: "circle",
+      text: `exit ${fmtPnl(t)}`,
+    });
+    if (t.exit_price != null) addFillDot(exitBarTime, t.exit_price, exitColor);
+  }
+  candleSeries.setMarkers(markers.sort((a, b) => a.time - b.time));
+
+  chart.timeScale().fitContent();
+}
+
+document.getElementById("asset-filter").addEventListener("change", applyFilters);
+document.getElementById("outcome-filter").addEventListener("change", applyFilters);
+document.getElementById("direction-filter").addEventListener("change", applyFilters);
+document.getElementById("refresh-btn").addEventListener("click", () => loadTrades({refresh: true}));
+document.getElementById("bt-run-btn").addEventListener("click", runBacktest);
+
+// If a backtest is already running (started before this page loaded, e.g. a
+// reload mid-run), reattach the progress bar instead of leaving it idle.
+async function reattachBacktest() {
+  if (source !== "backtest") return;
+  try {
+    const s = await (await fetch("/api/backtest/status")).json();
+    if (!s.running) return;
+    const btn = document.getElementById("bt-run-btn");
+    const status = document.getElementById("bt-status");
+    btn.disabled = true;
+    status.textContent = "Running…";
+    showBtProgress(true);
+    setBtProgress(s.progress ?? 0, s.eta_seconds, s.elapsed_seconds);
+    const final = await pollBacktest();
+    if (final && final.error) {
+      status.innerHTML = `<span class="stale">Failed: ${final.error.slice(0, 200)}</span>`;
+    } else {
+      await loadTrades();
+    }
+    showBtProgress(false);
+    btn.disabled = false;
+  } catch (e) { console.warn("reattach failed", e); }
+}
+
+initTraderSelect();
+initSourceToggle();
+// initSources() populates the axis <option> lists; loadTrades() adopts the
+// sidecar's axes into those pickers. Sequence them — racing the two leaves
+// adoption looking at an empty picker and silently skipping.
+initBacktestDates();
+initSources().then(loadTrades, loadTrades);
+reattachBacktest();
+</script>
+</body>
+</html>

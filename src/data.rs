@@ -1,4 +1,4 @@
-use crate::models::{Candle, Tick, asset_id};
+use crate::models::{asset_id, Candle, Tick};
 use arrow::array::{Float64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use chrono::NaiveDateTime;
@@ -9,7 +9,6 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
 use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -19,8 +18,8 @@ use std::sync::Arc;
 /// per-row-group timestamp statistics and skips any row group whose `[min, max]`
 /// range falls entirely before `start` (or entirely after `end`). The collector
 /// emits one row group per minute, so a year-old file may contain hundreds of
-/// thousands of row groups — but a 14-day warmup only needs to decode the
-/// last ~20k of them. If statistics are missing for a row group, the reader
+/// thousands of row groups — but a short warmup window only needs to decode
+/// the last handful of them. If statistics are missing for a row group, the reader
 /// falls back to decoding it (correct, but slower).
 pub fn load_parquet(
     path: &Path,
@@ -60,7 +59,8 @@ pub fn load_parquet(
             None
         };
 
-        let ts_col = find_col(&["timestamp", "ts", "time", "datetime", "date"]).expect("No timestamp column");
+        let ts_col = find_col(&["timestamp", "ts", "time", "datetime", "date"])
+            .expect("No timestamp column");
         let open_col = find_col(&["open", "o"]).expect("No open column");
         let high_col = find_col(&["high", "h"]).expect("No high column");
         let low_col = find_col(&["low", "l"]).expect("No low column");
@@ -110,9 +110,9 @@ pub fn load_parquet(
 // ─── Tick (raw trade print) loading ─────────────────────────────────────────
 
 /// Load raw trade ticks from a per-asset tick parquet, sorted ascending by
-/// timestamp. Schema (written by `the tick puller`):
+/// timestamp. Preferred schema:
 /// `timestamp`(ms, no tz), `price`(f64), `size`(f64), `side`(u8). Also tolerates
-/// the local tick-collector's trades shape (`time` i64 ms, `px`, `sz`, `side`)
+/// an alternative trades shape (`time` i64 ms, `px`, `sz`, `side`)
 /// so either source can back the tick fill mode. Column lookup is
 /// case-insensitive and name-aliased. An optional `[start, end]` bound trims the
 /// stream. Millisecond timestamps are preserved (the whole point of tick mode).
@@ -131,7 +131,9 @@ pub fn load_ticks(
         let keep = select_row_groups(&builder, start, end);
         builder = builder.with_row_groups(keep);
     }
-    let reader = builder.build().expect("Failed to build tick parquet reader");
+    let reader = builder
+        .build()
+        .expect("Failed to build tick parquet reader");
 
     let mut ticks = Vec::new();
     for batch in reader {
@@ -148,7 +150,8 @@ pub fn load_ticks(
             }
             None
         };
-        let ts_col = find_col(&["timestamp", "time", "ts"]).expect("tick file: no timestamp column");
+        let ts_col =
+            find_col(&["timestamp", "time", "ts"]).expect("tick file: no timestamp column");
         let px_col = find_col(&["price", "px"]).expect("tick file: no price column");
         let sz_col = find_col(&["size", "sz", "qty"]);
         let side_col = find_col(&["side"]);
@@ -156,7 +159,7 @@ pub fn load_ticks(
         let timestamps = extract_timestamps(batch.column(ts_col));
         let prices = extract_f64(batch.column(px_col));
         let sizes = sz_col.map(|c| extract_f64(batch.column(c)));
-        // side may be u8 (reservoir) or i64 (local collector); tolerate both.
+        // `side` may be written as u8 or i64 depending on the writer; accept both.
         let sides: Option<Vec<u8>> = side_col.map(|c| {
             let col = batch.column(c);
             if let Some(a) = col.as_any().downcast_ref::<UInt8Array>() {
@@ -190,39 +193,38 @@ pub fn load_ticks(
     ticks
 }
 
-/// Directory holding the per-asset tick parquets written by
-/// `the tick puller`.
-pub const TICKS_DIR: &str = "data/ticks_reservoir";
+/// Subdirectory name searched inside each data dir for per-asset tick
+/// parquets. A tick file for stem `S` is looked up as `{dir}/{TICKS_DIR}/{S}_ticks.parquet`.
+pub const TICKS_DIR: &str = "ticks";
 
 /// Discover the tick parquet for a source `stem` across `data_dirs`, checking
-/// `{dir}/ticks_reservoir/{stem}_ticks.parquet` and `{dir}/{stem}_ticks.parquet`.
+/// `{dir}/{TICKS_DIR}/{stem}_ticks.parquet` then `{dir}/{stem}_ticks.parquet`.
 /// Returns the first existing path, or None.
+///
+/// Every candidate is derived from a caller-supplied `data_dirs` entry, so
+/// nothing here depends on the process working directory.
 pub fn tick_file_for_stem(stem: &str, data_dirs: &[&Path]) -> Option<PathBuf> {
+    let file = format!("{}_ticks.parquet", stem);
     for dir in data_dirs {
-        let a = dir.join("ticks_reservoir").join(format!("{}_ticks.parquet", stem));
-        if a.exists() {
-            return Some(a);
+        let nested = dir.join(TICKS_DIR).join(&file);
+        if nested.exists() {
+            return Some(nested);
         }
-        let b = dir.join(format!("{}_ticks.parquet", stem));
-        if b.exists() {
-            return Some(b);
+        let flat = dir.join(&file);
+        if flat.exists() {
+            return Some(flat);
         }
-    }
-    // Absolute fallback under the repo's canonical ticks dir.
-    let c = PathBuf::from(TICKS_DIR).join(format!("{}_ticks.parquet", stem));
-    if c.exists() {
-        return Some(c);
     }
     None
 }
 
 /// Load ticks for `asset` by resolving its backing source stems through the
-/// `SourceMap` (so a `[[source]]` override like reservoir maps xyz:GOLD →
-/// `reservoir_xyz_GOLD_ticks.parquet`) and falling back to the asset's own name
-/// as the stem. Returns the merged, time-sorted tick stream, or an empty Vec if
-/// no tick file exists for any of the asset's stems. The `[start, end]` bound is
-/// widened by one day on each side by the caller if warmup crossing is needed;
-/// here it is applied verbatim.
+/// `SourceMap` — so a `[[source]]` override pointing an asset at a differently
+/// named file finds that file's ticks too — falling back to the asset's own
+/// name as the stem. Returns the merged, time-sorted tick stream, or an empty
+/// Vec when no tick file exists for any of the asset's stems. The
+/// `[start, end]` bound is applied verbatim; widen it in the caller if warmup
+/// needs to cross it.
 pub fn load_asset_ticks(
     asset: &str,
     data_dirs: &[&Path],
@@ -257,7 +259,8 @@ fn extract_timestamps(col: &arrow::array::ArrayRef) -> Vec<NaiveDateTime> {
     use arrow::array::*;
 
     if let Some(arr) = col.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        return arr.iter()
+        return arr
+            .iter()
             .map(|v| {
                 let us = v.unwrap_or(0);
                 let secs = us / 1_000_000;
@@ -269,7 +272,8 @@ fn extract_timestamps(col: &arrow::array::ArrayRef) -> Vec<NaiveDateTime> {
             .collect();
     }
     if let Some(arr) = col.as_any().downcast_ref::<TimestampMillisecondArray>() {
-        return arr.iter()
+        return arr
+            .iter()
             .map(|v| {
                 let ms = v.unwrap_or(0);
                 let secs = ms / 1000;
@@ -281,7 +285,8 @@ fn extract_timestamps(col: &arrow::array::ArrayRef) -> Vec<NaiveDateTime> {
             .collect();
     }
     if let Some(arr) = col.as_any().downcast_ref::<TimestampNanosecondArray>() {
-        return arr.iter()
+        return arr
+            .iter()
             .map(|v| {
                 let ns = v.unwrap_or(0);
                 let secs = ns / 1_000_000_000;
@@ -293,18 +298,18 @@ fn extract_timestamps(col: &arrow::array::ArrayRef) -> Vec<NaiveDateTime> {
             .collect();
     }
     if let Some(arr) = col.as_any().downcast_ref::<TimestampSecondArray>() {
-        return arr.iter()
+        return arr
+            .iter()
             .map(|v| {
                 let s = v.unwrap_or(0);
-                chrono::DateTime::from_timestamp(s, 0)
-                    .unwrap()
-                    .naive_utc()
+                chrono::DateTime::from_timestamp(s, 0).unwrap().naive_utc()
             })
             .collect();
     }
     // Int64 — assume milliseconds epoch
     if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-        return arr.iter()
+        return arr
+            .iter()
             .map(|v| {
                 let ms = v.unwrap_or(0);
                 let secs = ms / 1000;
@@ -317,7 +322,8 @@ fn extract_timestamps(col: &arrow::array::ArrayRef) -> Vec<NaiveDateTime> {
     }
     // Utf8 string timestamps
     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-        return arr.iter()
+        return arr
+            .iter()
             .map(|v| {
                 let s = v.unwrap_or("");
                 NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
@@ -349,32 +355,37 @@ fn extract_f64(col: &arrow::array::ArrayRef) -> Vec<f64> {
 }
 
 /// A backing data source for an asset: a parquet file stem (the part before
-/// `_{iv}.parquet`, e.g. "PAXGUSDT" or "cash:USA500") plus a linear price
-/// transform applied to OHLC at load time so the engine sees the asset in HL
-/// price terms: `hl_price = src_price * scale + offset`.
+/// `_{interval}.parquet`) plus a linear price transform applied to OHLC at
+/// load time, so a donor series quoted on a different scale reads in the
+/// target instrument's price terms: `price = src_price * scale + offset`.
 #[derive(Clone, Debug)]
 pub struct DataSource {
-    /// File stem before the `_{iv}` suffix (the SOURCE symbol, not the asset).
+    /// File stem before the `_{interval}` suffix — the SOURCE symbol, which
+    /// need not equal the asset name.
     pub stem: String,
     /// Multiplicative price scale (1.0 = identity).
     pub scale: f64,
-    /// Additive price offset in HL price units, applied after scale.
+    /// Additive price offset in target price units, applied after `scale`.
     pub offset: f64,
 }
 
 impl DataSource {
     /// Identity source whose stem equals the asset name (the default: an asset
-    /// is backed by its own `{asset}_{iv}.parquet`).
+    /// is backed by its own `{asset}_{interval}.parquet`).
     fn identity(stem: &str) -> Self {
-        DataSource { stem: stem.to_string(), scale: 1.0, offset: 0.0 }
+        DataSource {
+            stem: stem.to_string(),
+            scale: 1.0,
+            offset: 0.0,
+        }
     }
 }
 
 /// Maps an asset name to the ordered list of backing sources it should load
 /// from. An asset absent from the map uses the default: a single identity
-/// source backed by its own `{asset}_{iv}.parquet` (plus the built-in
-/// SP500→USA500 splice). This is the config-driven generalization of the
-/// former hardcoded splice — see `default_map`.
+/// source backed by its own `{asset}_{interval}.parquet`. An override replaces
+/// that list wholesale, letting one asset be assembled from several files —
+/// see `default_sources`.
 #[derive(Clone, Debug, Default)]
 pub struct SourceMap {
     overrides: std::collections::HashMap<String, Vec<DataSource>>,
@@ -382,7 +393,9 @@ pub struct SourceMap {
 
 impl SourceMap {
     pub fn new() -> Self {
-        SourceMap { overrides: std::collections::HashMap::new() }
+        SourceMap {
+            overrides: std::collections::HashMap::new(),
+        }
     }
 
     /// Register an asset's backing sources, replacing any prior entry.
@@ -394,9 +407,8 @@ impl SourceMap {
         self.overrides.is_empty()
     }
 
-    /// The ordered sources for `asset`. Falls back to the built-in default
-    /// (identity self-source plus the SP500→USA500 splice at 1m) when the asset
-    /// has no override. Order matters: earlier sources win on timestamp dedup.
+    /// The ordered sources for `asset`, falling back to the built-in default
+    /// (a single identity self-source) when the asset has no override. Order matters: earlier sources win on timestamp dedup.
     pub fn sources_for(&self, asset: &str) -> Vec<DataSource> {
         if let Some(s) = self.overrides.get(asset) {
             return s.clone();
@@ -405,40 +417,39 @@ impl SourceMap {
     }
 }
 
-/// The built-in (un-overridden) source list for an asset: the asset's own
-/// `{asset}_{iv}` file, plus — for xyz:SP500 at the 1m base only — the
-/// historical cash:USA500 splice (HL listed xyz:SP500 on 2026-04-26; before
-/// that we backfill with the similar cash:USA500 index). This reproduces the
-/// former hardcoded behavior exactly so callers passing no override are
-/// unaffected.
+/// The built-in (un-overridden) source list for an asset: one identity source
+/// backed by the asset's own `{asset}_{interval}` file.
+///
+/// Splicing a second file in front of it — a longer-history donor series, say,
+/// or a predecessor instrument — is what [`SourceMap`] overrides are for.
 fn default_sources(asset: &str) -> Vec<DataSource> {
-    let mut v = vec![DataSource::identity(asset)];
-    // Only valid at the 1m base: the donor file is 1m-only, so splicing it into
-    // a non-1m run would mix grains. Skip when base != "1m".
-    if asset == "xyz:SP500" && crate::models::base_interval() == "1m" {
-        v.push(DataSource::identity("cash:USA500"));
-    }
-    v
+    vec![DataSource::identity(asset)]
 }
 
 /// Glob the on-disk parquet files for a single source `stem` across `data_dirs`:
-/// `{stem}_{iv}.parquet` plus dated shards `{stem}_{iv}_*.parquet`. Returns
+/// `{stem}_{interval}.parquet` plus dated shards `{stem}_{interval}_*.parquet`. Returns
 /// paths in discovery order, deduplicated.
 fn files_for_stem(stem: &str, iv: &str, data_dirs: &[&Path]) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for dir in data_dirs {
-        if !dir.exists() { continue; }
+        if !dir.exists() {
+            continue;
+        }
         let main_file = dir.join(format!("{}_{}.parquet", stem, iv));
         if main_file.exists() && seen.insert(main_file.clone()) {
             paths.push(main_file);
         }
-        // Date-ranged archives: {stem}_{iv}_*.parquet
+        // Date-ranged archives: {stem}_{interval}_*.parquet
         if let Ok(entries) = std::fs::read_dir(dir) {
             let prefix = format!("{}_{}_", stem, iv);
             for entry in entries.flatten() {
                 let path = entry.path();
-                let fstem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                let fstem = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 if fstem.starts_with(&prefix)
                     && path.extension().map(|e| e == "parquet").unwrap_or(false)
                     && seen.insert(path.clone())
@@ -451,9 +462,8 @@ fn files_for_stem(stem: &str, iv: &str, data_dirs: &[&Path]) -> Vec<PathBuf> {
     paths
 }
 
-/// Discover all parquet files for `asset` across `data_dirs`, including the
-/// historical splice for SP500 (cash:USA500 history before HL listed xyz:SP500
-/// on 2026-04-26). This is the single source of truth for "what candles does
+/// Discover all parquet files for `asset` across `data_dirs`, honoring any
+/// configured multi-file splice. This is the single source of truth for "what candles does
 /// asset X have on disk" — called by both the live warmup loader and the
 /// replay/backtest path so they always build engine state from the same input.
 ///
@@ -489,7 +499,7 @@ pub fn load_asset_candles(
 /// Load all candles for `asset` from `data_dirs`, resolving its backing
 /// sources through `sources` (config-driven override, or the built-in default
 /// when the asset is absent). Each source's `scale`/`offset` is applied to OHLC
-/// at load time so the engine sees the asset in HL price terms. Sources are
+/// at load time so the engine sees one coherent price series. Sources are
 /// loaded in order; the first to provide a given timestamp wins (so a primary
 /// real feed takes precedence over a spliced donor). Result is sorted by
 /// timestamp and deduplicated.
@@ -603,7 +613,10 @@ fn select_row_groups<R: parquet::file::reader::ChunkReader + 'static>(
     for (i, col) in schema.columns().iter().enumerate() {
         let name = col.name();
         let lower = name.to_ascii_lowercase();
-        if matches!(lower.as_str(), "timestamp" | "ts" | "time" | "datetime" | "date") {
+        if matches!(
+            lower.as_str(),
+            "timestamp" | "ts" | "time" | "datetime" | "date"
+        ) {
             ts_col = Some(i);
             ts_unit_secs = match col.logical_type() {
                 Some(LogicalType::Timestamp { unit, .. }) => Some(match unit {
@@ -675,12 +688,16 @@ fn select_row_groups<R: parquet::file::reader::ChunkReader + 'static>(
 // ─── append helper ─────────────────────────────────────────────────────────────
 
 /// The writer schema the collector emits. Matches the layout of files
-/// produced by the legacy `collect.sh` (timestamp[us], no tz tag, Float64
+/// produced by older writers (timestamp[us], no tz tag, Float64
 /// OHLCV, columns nullable) so existing parquets can be appended to
 /// without a rewrite and downstream tools see byte-identical schemas.
 pub fn collector_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
         Field::new("open", DataType::Float64, true),
         Field::new("high", DataType::Float64, true),
         Field::new("low", DataType::Float64, true),
@@ -709,7 +726,7 @@ pub struct CandleRow {
 /// If `path` does not exist we create it from scratch with the same
 /// schema. Rows must be strictly increasing in `timestamp_us` and
 /// strictly greater than the file's existing max timestamp; the caller
-/// is responsible for dedup against `.collector.state.json` before
+/// is responsible for deduplicating against its own written-through mark before
 /// calling this.
 pub fn append_row_group(path: &Path, rows: &[CandleRow]) -> std::io::Result<()> {
     if rows.is_empty() {
@@ -742,20 +759,20 @@ pub fn append_row_group(path: &Path, rows: &[CandleRow]) -> std::io::Result<()> 
 
     let next_file = File::create(&next_path)?;
     let mut writer = ArrowWriter::try_new(next_file, schema.clone(), Some(props))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // 1) Stream the existing file's row groups through, decoding and
     //    re-encoding (the parquet 54 ArrowWriter does not expose a raw
     //    row-group-copy API; the spec's "structural concat" reduces in
     //    practice to a decode→encode of historical row groups). The
     //    cost is one full read+write of the asset's history per minute,
-    //    which is fine at 60-day file sizes (~1MB) and forces the
+    //    which is fine at the file sizes this writes and forces the
     //    fallback shard step before it gets prohibitive.
     let mut existing_max_ts: Option<i64> = None;
     if path.exists() {
         let existing = File::open(path)?;
         let rb_builder = ParquetRecordBatchReaderBuilder::try_new(existing)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         // Sanity check: existing schema must match our writer schema.
         let existing_schema = rb_builder.schema().clone();
         if !schema_compatible(&existing_schema, &schema) {
@@ -769,10 +786,9 @@ pub fn append_row_group(path: &Path, rows: &[CandleRow]) -> std::io::Result<()> 
         }
         let reader = rb_builder
             .build()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         for batch in reader {
-            let batch = batch
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            let batch = batch.map_err(|e| std::io::Error::other(e.to_string()))?;
             // Track the max timestamp seen so we can reject backward writes.
             if let Some(ts_col) = batch
                 .column_by_name("timestamp")
@@ -785,14 +801,14 @@ pub fn append_row_group(path: &Path, rows: &[CandleRow]) -> std::io::Result<()> 
             }
             writer
                 .write(&batch)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
         // Force the historical block to flush into its own row group so the
         // append below becomes a separate, small row group (which the tail
         // reader can skip cheaply when warmup_start is past it).
         writer
             .flush()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
     }
 
     if let Some(max_ts) = existing_max_ts {
@@ -811,10 +827,10 @@ pub fn append_row_group(path: &Path, rows: &[CandleRow]) -> std::io::Result<()> 
     let batch = candle_rows_to_batch(&schema, rows)?;
     writer
         .write(&batch)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     writer
         .close()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // 3) fsync the tmpfile, then atomic rename. (Rename alone is atomic
     //    but not a flush; we need both so a power-cut between rename and
@@ -858,20 +874,20 @@ fn candle_rows_to_batch(schema: &Arc<Schema>, rows: &[CandleRow]) -> std::io::Re
             Arc::new(vols),
         ],
     )
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Read the last timestamp written to a parquet file, in microseconds.
 /// Returns None if the file does not exist or has no rows. Used by the
-/// collector to verify dedup against `.collector.state.json` on startup
+/// writer to verify its dedup mark on startup
 /// and as a sanity check.
 pub fn last_timestamp_us(path: &Path) -> std::io::Result<Option<i64>> {
     if !path.exists() {
         return Ok(None);
     }
     let file = File::open(path)?;
-    let reader = SerializedFileReader::new(file)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let reader =
+        SerializedFileReader::new(file).map_err(|e| std::io::Error::other(e.to_string()))?;
     let meta = reader.metadata();
     if meta.num_row_groups() == 0 {
         return Ok(None);
@@ -897,15 +913,14 @@ pub fn last_timestamp_us(path: &Path) -> std::io::Result<Option<i64>> {
     if max_ts.is_none() {
         let file = File::open(path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         let last_rg = builder.metadata().num_row_groups() - 1;
         let reader = builder
             .with_row_groups(vec![last_rg])
             .build()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         for batch in reader {
-            let batch = batch
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            let batch = batch.map_err(|e| std::io::Error::other(e.to_string()))?;
             if let Some(arr) = batch
                 .column_by_name("timestamp")
                 .and_then(|c| c.as_any().downcast_ref::<TimestampMicrosecondArray>())
@@ -920,15 +935,9 @@ pub fn last_timestamp_us(path: &Path) -> std::io::Result<Option<i64>> {
     Ok(max_ts)
 }
 
-// Silence the unused-import lint for `Read` (kept for potential future
-// streaming uses; no current call site).
-#[allow(dead_code)]
-fn _read_marker<R: Read>(_r: R) {}
-
 #[cfg(test)]
 mod append_tests {
     use super::*;
-    use chrono::NaiveDate;
     use tempfile::TempDir;
 
     fn row(ts_us: i64, base: f64) -> CandleRow {
@@ -1028,11 +1037,5 @@ mod append_tests {
         .naive_utc();
         let candles = load_parquet(&p, "BTC", Some(start_dt), None);
         assert_eq!(candles.len(), 2);
-    }
-
-    #[test]
-    fn _suppress_unused_naivedate() {
-        // Touch NaiveDate so the `use` above isn't dead.
-        let _ = NaiveDate::from_ymd_opt(2026, 1, 1);
     }
 }

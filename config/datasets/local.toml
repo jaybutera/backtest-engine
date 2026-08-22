@@ -1,0 +1,23 @@
+# Local files: every asset loads its own data/<ASSET>_1m.parquet.
+#
+# This is the source-free default. It declares no [[source]] tables at all,
+# which means it contributes nothing to a composed run — the strategy runs
+# exactly as written, against the files named after its own assets.
+#
+# It is also the only valid partner for a strategy that carries its own
+# [[source]] tables: with nothing to append, composition is skipped and the
+# preset's data mapping survives intact. Pairing such a strategy with a
+# source-declaring dataset would silently discard the strategy's mapping, so
+# the visualizer refuses that combination outright.
+#
+# To point assets at other files, copy this and add entries:
+#
+#     [[source]]
+#     asset = "EXAMPLE"
+#     files = ["OTHER_STEM"]     # data/OTHER_STEM_1m.parquet, spliced in order
+#     scale = 1.0                # price = raw * scale + offset, applied at load
+#     offset = 0.0
+#
+# An asset with no entry in a dataset that declares any is DROPPED from the
+# run rather than falling back to its own file. Silently mixing feeds is a
+# good way to grade a strategy against data you did not intend.

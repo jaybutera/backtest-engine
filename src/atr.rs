@@ -21,10 +21,12 @@ pub fn compute_atr(candles: &[Candle], period: usize) -> f64 {
 
 /// ATR with optional exclusion of zero-range bars (high == low).
 ///
-/// Thin CME books print a 1m bar only when a trade happens, and quiet minutes
-/// print single-tick bars with high == low; those bars drag the ATR toward
-/// zero and implicitly tighten every ATR-denominated detector gate (sweep
-/// noise_atr, equal-H/L cluster tolerance, registry clustering, FVG floors).
+/// A thin book prints a bar only when a trade happens, so quiet minutes print
+/// single-tick bars with high == low. Those bars drag the ATR toward zero and
+/// implicitly tighten every threshold denominated in it — a stop floor, a
+/// volatility gate, anything scaled by "typical range" silently becomes
+/// tighter during the quietest part of the session, which is the opposite of
+/// what the scaling was for.
 /// With `skip_zero_range`, the ATR is computed over the last `period` bars
 /// that actually traded a range, using the previous *kept* bar's close for
 /// the true-range gap term. Feeds with no zero-range bars (HL perps) produce
@@ -52,7 +54,9 @@ pub fn compute_atr_filtered(candles: &[Candle], period: usize, skip_zero_range: 
     for w in kept.windows(2) {
         let c = &candles[w[1]];
         let pc = candles[w[0]].close;
-        let tr = (c.high - c.low).max((c.high - pc).abs()).max((c.low - pc).abs());
+        let tr = (c.high - c.low)
+            .max((c.high - pc).abs())
+            .max((c.low - pc).abs());
         sum += tr;
     }
     sum / (kept.len() - 1) as f64
@@ -88,7 +92,10 @@ mod tests {
             c(10.5, 12.0, 10.0, 11.0),
             c(11.0, 11.5, 10.8, 11.2),
         ];
-        assert_eq!(compute_atr_filtered(&bars, 14, false), compute_atr(&bars, 14));
+        assert_eq!(
+            compute_atr_filtered(&bars, 14, false),
+            compute_atr(&bars, 14)
+        );
         assert_eq!(compute_atr_filtered(&bars, 2, false), compute_atr(&bars, 2));
     }
 

@@ -10,7 +10,6 @@
   .app { display: flex; flex-direction: column; height: 100vh; }
   /* Live/Backtest toggle sits on the left as its own row under the header
      (matching the dashboard), not stretched full-width: segments hug content. */
-  .source-toggle .seg { flex: 0 0 auto; padding: 7px 20px; }
   /* Controls row on this page uses inline labels (top-bar layout, not a grid). */
   .ctlrow {
     display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
@@ -58,15 +57,10 @@
     </div>
     <nav>
       <a href="/" id="trades-link">Trades</a>
-      <a href="/engine">Engine</a>
       <button id="refresh-btn">Refresh</button>
     </nav>
   </div>
-  <div class="seg2 source-toggle">
-    <div class="seg active" data-source="live">Live</div>
-    <div class="seg" data-source="backtest">Backtest</div>
-  </div>
-  <div class="ctlrow hidden" id="bt-controls">
+  <div class="ctlrow" id="bt-controls">
     <label>From <input type="date" id="bt-from"></label>
     <label>To <input type="date" id="bt-to"></label>
     <button id="bt-run-btn" class="run-inline">▶ Run backtest</button>
@@ -87,31 +81,31 @@
   <div class="summary" id="summary"></div>
   <div id="chart"><div class="empty">Loading…</div></div>
   <div class="legend" id="legend">
-    Cumulative net P&amp;L over time, plotted at each trade's exit. Live = USD net of fees · Backtest = R-multiples.
+    Cumulative net P&amp;L over time, plotted at each trade's exit, in R-multiples.
     A strategy with <code>risk_frac</code> set instead plots a <b>$ compounding equity curve</b> (each trade risks risk_frac × balance-at-open).
   </div>
 </div>
 <script>
 let allTrades = [];
 let compoundMeta = null;   // engine-computed {risk_frac, account_size, final_balance, max_dd_frac, multiple}
-// Per-asset source overrides stamped in the backtest sidecar ({asset: {files,
-// scale, offset}}), when the run redirected assets to other feeds (e.g. the
-// CME presets map xyz:XYZ100 -> NQ full-size bars). Used to label series and
-// filter options with the real feed, so an "xyz:" name never reads as
-// one venue's data when the bars underneath are another's. Display only.
+// Per-asset source overrides stamped in the run's sidecar ({asset: {files,
+// scale, offset}}), set when the run redirected an asset to another feed.
+// Used to label series and filter options with the feed actually underneath,
+// so an asset id never passes for data it wasn't graded on. Display only.
 let runSources = null;
 
-// "xyz:XYZ100 (NQ)" when the run sourced this asset from other files, else the
+// "ASSET (STEM)" when the run sourced this asset from other files, else the
 // plain asset id. Labels/option text only — filter VALUES stay the asset id.
 function assetLabel(a) {
   const s = runSources && runSources[a];
   return s && s.files && s.files.length ? `${a} (${s.files.join("+")})` : a;
 }
-let source = localStorage.getItem("viz.source") || "live";
-// Which live account this page charts, carried in from the trades page via
-// ?trader= (the dashboard's Equity link sets it). Without it /api/trades falls
-// back to the registry default, which silently showed one trader's curve from
-// another's page. Empty = server default, kept for direct /equity visits.
+// This page charts a backtest run and nothing else; the constant stays so the
+// per-metric branches below read the same as elsewhere.
+const source = "backtest";
+// Which run this page charts, carried in from the trades page via ?trader=
+// (the dashboard's Equity link sets it). Empty means the server's default run,
+// which is what a direct /equity visit gets.
 const TRADER = new URLSearchParams(location.search).get("trader") || "";
 document.getElementById("trades-link").href =
   TRADER ? `/${encodeURIComponent(TRADER)}` : "/";
@@ -173,7 +167,7 @@ function maxDrawdown(curve) {
 }
 
 // Compounding is a STRATEGY/engine concern: a backtest whose strategy set
-// `risk_frac > 0` embeds a dollar equity curve in the
+// `risk_frac > 0` (e.g. live_compound.toml) embeds a dollar equity curve in the
 // sidecar — per-trade `equity` plus the `compound` summary (compoundMeta). The
 // page just plots it; there is no client-side knob. Active only on the backtest
 // source when that data is present and the view is unfiltered (the embedded
@@ -332,20 +326,15 @@ async function loadTrades({refresh = false} = {}) {
   try {
     const qs = new URLSearchParams({source});
     if (TRADER) qs.set("trader", TRADER);
-    if (refresh && source === "live") qs.set("refresh", "1");
     const resp = await fetch(`/api/trades?${qs}`);
     const data = await resp.json();
     allTrades = data.trades;
     // Engine-embedded compounding summary (present when the strategy set
     // risk_frac>0); null otherwise. When set, the page plots the $ equity curve.
-    compoundMeta = (source === "backtest" && data.compound) || null;
-    runSources = (source === "backtest" && data.sources) || null;
-    // Name the account being charted (server label, e.g. "Live Trader
-    // (main)") so live curves are never ambiguous about whose money it is.
-    const who = source !== "backtest" && data.trader_label ? ` — ${data.trader_label}` : "";
-    document.title = (source === "backtest" ? "Backtest Equity" : "Live Equity") + who;
-    document.getElementById("page-title").textContent =
-      (source === "backtest" ? "Backtest Equity Curve" : "Live Equity Curve") + who;
+    compoundMeta = data.compound || null;
+    runSources = data.sources || null;
+    document.title = "Backtest Equity";
+    document.getElementById("page-title").textContent = "Backtest Equity Curve";
     const assets = [...new Set(allTrades.map(t => t.asset))].sort();
     const cur = document.getElementById("asset-filter").value;
     document.getElementById("asset-filter").innerHTML =
@@ -362,36 +351,24 @@ async function loadTrades({refresh = false} = {}) {
 }
 
 function updateBacktestStatus(exists, generatedAt, freshness) {
-  if (source !== "backtest") return;
   const el = document.getElementById("bt-status");
   if (!exists) {
     el.textContent = "No backtest yet — click Run.";
   } else {
     el.textContent = `Last run: ${fmtAgo(generatedAt)}`;
   }
-  // Flag when the last run was built on incomplete local data — a lagging
-  // asset or interior gap silently drops just-formed trades from the backtest
-  // (a stale-sidecar divergence). Without this a stale sidecar looks fine.
+  // Flag a run built on incomplete local data: an asset whose candles stop
+  // short silently drops the trades it would have taken after that point, and
+  // the resulting sidecar looks no different from a complete one.
   const warn = document.getElementById("bt-freshness");
   if (warn) {
     if (freshness && freshness.stale) {
-      warn.textContent = `⚠ built on incomplete data: ${freshness.reason} — re-run once the collector backfills`;
+      warn.textContent = `⚠ built on incomplete data: ${freshness.reason} — re-run once the missing candles are in place`;
       warn.style.display = "";
     } else {
       warn.style.display = "none";
     }
   }
-}
-
-function setSource(next) {
-  if (source === next) return;
-  source = next;
-  localStorage.setItem("viz.source", source);
-  document.querySelectorAll(".source-toggle .seg").forEach(el => {
-    el.classList.toggle("active", el.dataset.source === source);
-  });
-  document.getElementById("bt-controls").classList.toggle("hidden", source !== "backtest");
-  loadTrades();
 }
 
 async function runBacktest() {
@@ -435,21 +412,12 @@ async function initBacktestDates() {
   document.getElementById("bt-to").value = to;
 }
 
-function initSourceToggle() {
-  document.querySelectorAll(".source-toggle .seg").forEach(el => {
-    el.classList.toggle("active", el.dataset.source === source);
-    el.addEventListener("click", () => setSource(el.dataset.source));
-  });
-  document.getElementById("bt-controls").classList.toggle("hidden", source !== "backtest");
-}
-
 document.getElementById("asset-filter").addEventListener("change", render);
 document.getElementById("direction-filter").addEventListener("change", render);
 document.getElementById("per-asset-toggle").addEventListener("change", render);
 document.getElementById("refresh-btn").addEventListener("click", () => loadTrades({refresh: true}));
 document.getElementById("bt-run-btn").addEventListener("click", runBacktest);
 
-initSourceToggle();
 initBacktestDates();
 loadTrades();
 </script>

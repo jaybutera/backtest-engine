@@ -24,7 +24,10 @@ pub fn liq_safe_leverage(stop_frac: f64, max_lev: u32, beta: f64) -> u32 {
     if max_lev == 0 {
         return 1;
     }
-    if !(stop_frac > 0.0) || !(beta > 0.0) {
+    // Written as explicit finite-and-positive tests rather than negated
+    // comparisons: a NaN input must land here too, and NaN fails every
+    // comparison, so `stop_frac <= 0.0` alone would let it through.
+    if !stop_frac.is_finite() || stop_frac <= 0.0 || !beta.is_finite() || beta <= 0.0 {
         // Degenerate input: fall back to the cap (a zero-width stop has no
         // meaningful liq constraint; the caller rejects risk<=0 trades anyway).
         return max_lev;

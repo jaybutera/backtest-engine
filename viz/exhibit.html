@@ -49,9 +49,9 @@
 // ── Exhibit: a self-contained chart permalink ───────────────────────────────
 // Everything needed to draw the exhibit lives in the URL: asset, marker
 // groups (entry/exit/sl/tp), level lines, provenance chips. Candles come from
-// /api/chart (local collector parquets, optionally donor files/scale/offset
-// passed through) — markers are drawn AS QUOTED, never recomputed, so links
-// stay valid regardless of how the engine evolves.
+// /api/chart (local candle parquets, optionally with a source override and
+// scale/offset passed through) — markers are drawn AS QUOTED, never
+// recomputed, so links stay valid regardless of how the engine evolves.
 //
 // Grammar (query params):
 //   asset=EXAMPLE                       required
@@ -61,7 +61,7 @@
 //   lvl=96.965@swept swing_low          repeated — horizontal level line
 //   from=TS&to=TS                       optional explicit window
 //   pad=60                              window padding, minutes
-//   src=backtest | live | …      provenance chip (display only)
+//   src=backtest | …                    provenance chip (display only)
 //   uid=strategy×fill×dataset@a..b      backtest uid chip (click-to-copy)
 //   title=…  note=…                     heading / footer context
 //   files=stem1,stem2&scale=&offset=    donor-source override for candles
@@ -183,7 +183,7 @@ function showHelp() {
       <p><b>Minimal:</b><br>
       <code>/exhibit?asset=EXAMPLE&amp;dir=bull&amp;in=TS@96.887&amp;out=TS@97.966&amp;sl=96.505&amp;tp=97.966</code></p>
       <p><b>Comparison (repeated <code>t</code> groups):</b><br>
-      <code>/exhibit?asset=EXAMPLE&amp;t=label:phantom,dir:bull,in:TS@PX,out:TS@PX&amp;t=label:live fill,dir:bull,in:TS@PX,out:TS@PX</code></p>
+      <code>/exhibit?asset=EXAMPLE&amp;t=label:lens a,dir:bull,in:TS@PX,out:TS@PX&amp;t=label:lens b,dir:bull,in:TS@PX,out:TS@PX</code></p>
       <p><b>Level lines:</b> <code>lvl=96.965@swept swing_low</code> (repeatable) ·
       <b>Provenance:</b> <code>src=backtest&amp;uid=strategy×fill×dataset@a..b</code> ·
       <b>Window:</b> <code>from=TS&amp;to=TS&amp;pad=60</code> ·
@@ -237,7 +237,7 @@ async function main() {
   }
   document.getElementById("foot").textContent =
     (qs.get("note") ? qs.get("note") + " · " : "") +
-    "markers drawn as quoted in the URL on collector candles — not recomputed · times Central";
+    "markers drawn as quoted in the URL on local candles — not recomputed · times Central";
 
   // Candles.
   const p = new URLSearchParams({ asset, entry: from, pad_minutes: pad });
