@@ -172,11 +172,13 @@ impl<S: Strategy> Pipeline<S> {
         let Some(pt) = self.traders.get(&aid) else {
             return;
         };
+        // Only what closed on this bar: the trader records it as it closes,
+        // so the full trade history is not rescanned twice per bar (which
+        // made a run quadratic in its trade count).
         let closed: Vec<String> = pt
-            .trades
+            .closed_this_bar
             .iter()
-            .filter(|t| t.closed_at.is_some())
-            .map(|t| t.opportunity_id.clone())
+            .map(|&(i, _)| pt.trades[i].opportunity_id.clone())
             .collect();
         for id in &closed {
             if let Some(mut opp) = self.active_opps.remove(id) {
