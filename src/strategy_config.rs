@@ -101,6 +101,7 @@ const FILL_KEYS: &[&str] = &[
     "allow_signal_bar_fill",
     "entry_slippage_r",
     "intrabar_stop_first",
+    "exit_gap_at_open",
     "rest_min_lead_secs",
     "tick_chase",
 ];
@@ -199,6 +200,9 @@ struct FillParams {
     allow_signal_bar_fill: Option<bool>,
     entry_slippage_r: Option<f64>,
     intrabar_stop_first: Option<bool>,
+    /// Exit gapped stops and targets at the bar's open. See
+    /// `ResolvedFill::exit_gap_at_open`.
+    exit_gap_at_open: Option<bool>,
     entry_fill_mode: Option<String>,
     chase_r: Option<f64>,
     chase_requires_seed: Option<bool>,
@@ -224,6 +228,11 @@ pub struct ResolvedFill {
     pub allow_signal_bar_fill: bool,
     pub entry_slippage_r: f64,
     pub intrabar_stop_first: bool,
+    /// When a bar opens through an open position's stop or target, book the
+    /// exit at the open instead of at the stop / target price. Off by
+    /// default: every existing lens prices a gapped stop at the stop. See
+    /// `PaperTrader::exit_gap_at_open`.
+    pub exit_gap_at_open: bool,
     pub entry_fill_mode: String,
     pub chase_r: f64,
     pub chase_requires_seed: bool,
@@ -269,6 +278,7 @@ impl ResolvedFill {
             allow_signal_bar_fill: false,
             entry_slippage_r: 0.0,
             intrabar_stop_first: true,
+            exit_gap_at_open: false,
             entry_fill_mode: "limit".to_string(),
             chase_r: 0.1,
             chase_requires_seed: true,
@@ -309,6 +319,7 @@ pub fn load_fill(path: &Path) -> Result<ResolvedFill, String> {
         allow_signal_bar_fill: p.allow_signal_bar_fill.unwrap_or(d.allow_signal_bar_fill),
         entry_slippage_r: p.entry_slippage_r.unwrap_or(d.entry_slippage_r),
         intrabar_stop_first: p.intrabar_stop_first.unwrap_or(d.intrabar_stop_first),
+        exit_gap_at_open: p.exit_gap_at_open.unwrap_or(d.exit_gap_at_open),
         entry_fill_mode: p.entry_fill_mode.unwrap_or(d.entry_fill_mode),
         chase_r: p.chase_r.unwrap_or(d.chase_r),
         chase_requires_seed: p.chase_requires_seed.unwrap_or(d.chase_requires_seed),

@@ -90,6 +90,30 @@
 //! sub-object is written as a method and called on it
 //! (`this.registry.add(lvl)` with `fn add(lvl) { this.levels.push(lvl) }`).
 //!
+//! # Script shape: at window boundaries
+//!
+//! A strategy that decides once per bar of its own timeframe puts one or
+//! more `window(secs, anchor, keep)` aggregators in its state and defines
+//! `on_bar_close` alone. The engine steps every window natively on each
+//! base candle and calls the script only on candles that rolled a window,
+//! closed a trade, or while a window's `wake(true)` stands:
+//!
+//! ```rhai
+//! fn init(cfg) { #{ w: window(1800, 0, 2), in_pos: false } }
+//! fn on_bar_close(c, book) {
+//!     for t in book.closed() { this.in_pos = false; }
+//!     if !this.w.rolled { return; }          // c is the first candle of a window
+//!     let b = this.w.closed;                 // the bar it closed, or ()
+//!     …                                      // decide on closed bars only, then
+//!     book.market_entry(#{ id: "x" + this.w.start, signal_type: "s", direction: "bull",
+//!                          stop: sl, tp: tp, at: "open" });   // fill at c.open
+//! }
+//! ```
+//!
+//! `market_entry` with `at: "open"` is a market-on-open fill, raced against
+//! the same bar; the default `at: "close"` fills at the close and is raced
+//! from the next bar.
+//!
 //! # Selecting a script
 //!
 //! A strategy file names the factory and the script:
@@ -567,12 +591,19 @@ pub struct RhaiStrategy {
     /// Script-side metadata for emitted opportunities, by id, until admitted.
     meta: RefCell<HashMap<String, Map>>,
     has_admit: bool,
+    has_on_candle: bool,
     has_bar_close: bool,
     has_on_bar: bool,
     has_emit: bool,
     has_on_day: bool,
     /// The native scanner the script put in its state under `scan`, if any.
     scan: Option<ScanHandle>,
+    /// Native window aggregators found in the state (top-level values), in
+    /// key order. Stepped on every base candle before the script runs.
+    windows: Vec<WinHandle>,
+    /// Whether any window rolled on the candle being processed; gates
+    /// `on_bar_close` for window-driven scripts.
+    rolled: Cell<bool>,
     asset: String,
     /// Per-hook call counts and time, reported on drop when
     /// `BACKTEST_RHAI_STATS` is set.
@@ -688,8 +719,12 @@ impl RhaiStrategy {
         let has_emit = has_fn("emit");
         let has_on_day = has_fn("on_day");
         let has_on_candle = has_fn("on_candle");
-        if !has_on_candle && !has_on_bar {
-            return Err("script defines neither `on_candle(c)` nor `on_bar(c, atr, sweeps, breaks)`".into());
+        if !has_on_candle && !has_on_bar && !has_bar_close {
+            return Err(
+                "script defines none of `on_candle(c)`, `on_bar(c, atr, sweeps, breaks)` \
+                 or `on_bar_close(c, book)`"
+                    .into(),
+            );
         }
 
         // The configuration the script starts from.
@@ -731,7 +766,15 @@ impl RhaiStrategy {
         let scan = state
             .read_lock::<Map>()
             .and_then(|m| m.get("scan").and_then(|v| v.clone().try_cast::<ScanHandle>()));
-        if scan.is_none() && !has_on_candle {
+        let windows: Vec<WinHandle> = state
+            .read_lock::<Map>()
+            .map(|m| {
+                m.values()
+                    .filter_map(|v| v.clone().try_cast::<WinHandle>())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if scan.is_none() && has_on_bar && !has_on_candle {
             return Err("script defines `on_bar` but its state has no `scan` scanner".into());
         }
 
@@ -746,11 +789,14 @@ impl RhaiStrategy {
             book_ptr,
             meta: RefCell::new(HashMap::new()),
             has_admit,
+            has_on_candle,
             has_bar_close,
             has_on_bar,
             has_emit,
             has_on_day,
             scan,
+            windows,
+            rolled: Cell::new(false),
             asset: asset.to_string(),
             stats: RefCell::new(HashMap::new()),
             stats_on: std::env::var_os("BACKTEST_RHAI_STATS").is_some(),
@@ -902,8 +948,18 @@ impl Strategy for RhaiStrategy {
                 .or_insert_with(|| Series::new(cap))
                 .push(candle, cap);
         }
+        if candle.timeframe == crate::models::base_tf_id() {
+            let mut rolled = false;
+            for w in &self.windows {
+                rolled |= w.0.borrow_mut().step(candle);
+            }
+            self.rolled.set(rolled);
+        }
         let out: Dynamic = match self.scan.clone() {
             Some(scan) => self.drive_scanner(candle, &scan),
+            // A script of only `on_bar_close` (market orders, no limit
+            // opportunities) is not called per candle at all.
+            None if !self.has_on_candle => return Vec::new(),
             None => match self.call("on_candle", (candle.clone(),)) {
                 Ok(v) => v,
                 Err(e) => self.fail("on_candle", e),
@@ -981,6 +1037,15 @@ impl Strategy for RhaiStrategy {
             // Event-driven: only when something closed, or the script asked
             // to be woken on every bar.
             if !scan.0.borrow().wake_book && book.closed().is_empty() {
+                return;
+            }
+        } else if !self.windows.is_empty() {
+            // Window-driven: only when a window rolled on this bar, something
+            // closed, or a window asked for every bar.
+            let awake = self.rolled.get()
+                || self.windows.iter().any(|w| w.0.borrow().wake)
+                || !book.closed().is_empty();
+            if !awake {
                 return;
             }
         }
@@ -1187,7 +1252,23 @@ fn register_api(engine: &mut Engine) {
                 let stop = map_get_f64(&spec, "stop")?;
                 let tp = map_get_f64(&spec, "tp")?;
                 let score = map_get_f64(&spec, "score").unwrap_or(0.0);
-                b.with(|bk| bk.market_entry(&id, sig_type_id(&st), dir, stop, tp, score))
+                let at_open = match spec.get("at").map(|v| v.to_string()).as_deref() {
+                    None | Some("close") => false,
+                    Some("open") => true,
+                    Some(other) => {
+                        return Err(format!(
+                            "market_entry: `at` must be \"close\" or \"open\", got {other:?}"
+                        )
+                        .into())
+                    }
+                };
+                b.with(|bk| {
+                    if at_open {
+                        bk.market_entry_at_open(&id, sig_type_id(&st), dir, stop, tp, score)
+                    } else {
+                        bk.market_entry(&id, sig_type_id(&st), dir, stop, tp, score)
+                    }
+                })
             },
         )
         .register_fn("set_stop", |b: &mut ScriptBook, id: &str, px: f64| {
@@ -1234,6 +1315,317 @@ fn register_api(engine: &mut Engine) {
     engine.register_fn("nan", || f64::NAN);
 
     register_scanner_api(engine);
+    register_window_api(engine);
+}
+
+// ─── Native window aggregators ───────────────────────────────────────────────
+
+/// One closed or forming bar of a [`Window`].
+#[derive(Clone, Copy, Debug)]
+pub struct WinBar {
+    pub ts: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+}
+
+/// A script-owned timeframe aggregator the engine steps natively on every
+/// base candle: bars are grouped by `(ts + anchor) div dur`, a bar's `ts` is
+/// its window start, and a candle in a new group closes the forming bar and
+/// starts the next. Closed bars are kept in a ring of `keep` entries and read
+/// MQL-style, shift 1 being the last closed bar. A script that puts one or
+/// more of these in its state (any top-level key) is called in
+/// `on_bar_close` only on candles that rolled a window, closed a trade, or
+/// while `wake(true)` stands, so a strategy that acts at bar boundaries pays
+/// the interpreter only there.
+pub struct Window {
+    dur: i64,
+    anchor: i64,
+    keep: usize,
+    cur_group: i64,
+    forming: Option<WinBar>,
+    bars: VecDeque<WinBar>,
+    /// Closed bars ever, including those the ring dropped.
+    total: usize,
+    /// The candle just stepped started a new window.
+    rolled: bool,
+    /// Window start of the candle just stepped.
+    start: i64,
+    /// The bar the last step closed, if any.
+    closed: Option<WinBar>,
+    wake: bool,
+}
+
+impl Window {
+    pub fn new(dur: i64, anchor: i64, keep: usize) -> Self {
+        Window {
+            dur,
+            anchor,
+            keep: keep.max(1),
+            cur_group: i64::MIN,
+            forming: None,
+            bars: VecDeque::with_capacity(keep.max(1)),
+            total: 0,
+            rolled: false,
+            start: 0,
+            closed: None,
+            wake: false,
+        }
+    }
+
+    fn push_closed(&mut self, b: WinBar) {
+        if self.bars.len() == self.keep {
+            self.bars.pop_front();
+        }
+        self.bars.push_back(b);
+        self.total += 1;
+    }
+
+    /// Feed one base candle. Returns whether it started a new window.
+    pub fn step(&mut self, c: &Candle) -> bool {
+        let ts = ndt_secs(c.timestamp);
+        let g = (ts + self.anchor).div_euclid(self.dur);
+        self.closed = None;
+        if g != self.cur_group {
+            if let Some(b) = self.forming.take() {
+                self.push_closed(b);
+                self.closed = Some(b);
+            }
+            self.cur_group = g;
+            self.start = g * self.dur - self.anchor;
+            self.forming = Some(WinBar {
+                ts: self.start,
+                open: c.open,
+                high: c.high,
+                low: c.low,
+                close: c.close,
+            });
+            self.rolled = true;
+        } else {
+            // A forming bar finalized by the clock takes nothing newer.
+            if let Some(f) = self.forming.as_mut() {
+                if c.high > f.high {
+                    f.high = c.high;
+                }
+                if c.low < f.low {
+                    f.low = c.low;
+                }
+                f.close = c.close;
+            }
+            self.rolled = false;
+        }
+        self.rolled
+    }
+
+    /// Window end (exclusive) of the forming bar.
+    pub fn forming_end(&self) -> Option<i64> {
+        self.forming.map(|_| (self.cur_group + 1) * self.dur - self.anchor)
+    }
+
+    /// Close the forming bar by the clock: if its window ended at or before
+    /// `t`, push it as closed without waiting for a newer candle. Returns
+    /// whether a bar was closed.
+    pub fn finalize_through(&mut self, t: i64) -> bool {
+        match self.forming_end() {
+            Some(end) if end <= t => {
+                let b = self.forming.take().expect("forming when its end is known");
+                self.push_closed(b);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Closed bar at `shift` (1 = last closed). None beyond the ring.
+    pub fn bar(&self, shift: usize) -> Option<&WinBar> {
+        if shift == 0 || shift > self.bars.len() {
+            return None;
+        }
+        self.bars.get(self.bars.len() - shift)
+    }
+
+    /// Is the bar at `shift` a pivot high of `strength` (strictly above the
+    /// `strength` bars on each side)? False where a neighbour is missing.
+    pub fn pivot_high(&self, shift: usize, strength: usize) -> bool {
+        let Some(h) = self.bar(shift).map(|b| b.high) else {
+            return false;
+        };
+        for k in 1..=strength {
+            if shift <= k {
+                return false;
+            }
+            let (Some(l), Some(r)) = (self.bar(shift - k), self.bar(shift + k)) else {
+                return false;
+            };
+            if h <= l.high || h <= r.high {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Mirror of [`Window::pivot_high`].
+    pub fn pivot_low(&self, shift: usize, strength: usize) -> bool {
+        let Some(lo) = self.bar(shift).map(|b| b.low) else {
+            return false;
+        };
+        for k in 1..=strength {
+            if shift <= k {
+                return false;
+            }
+            let (Some(l), Some(r)) = (self.bar(shift - k), self.bar(shift + k)) else {
+                return false;
+            };
+            if lo >= l.low || lo >= r.low {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The two most recent pivot highs and the two most recent pivot lows,
+    /// scanning shifts `strength + 1 .. scan - strength` from the newest bar
+    /// out, stopping once both pairs are found. Returns
+    /// `(last_high, prev_high, last_low, prev_low)` with 0.0 for a slot not
+    /// found, as the MQL swing scan does.
+    pub fn recent_pivots(&self, strength: usize, scan: usize) -> (f64, f64, f64, f64) {
+        let (mut lh, mut ph, mut ll, mut pl) = (0.0, 0.0, 0.0, 0.0);
+        if scan <= strength {
+            return (lh, ph, ll, pl);
+        }
+        for i in (strength + 1)..(scan - strength) {
+            if lh == 0.0 && self.pivot_high(i, strength) {
+                lh = self.bar(i).map(|b| b.high).unwrap_or(0.0);
+            } else if lh != 0.0 && ph == 0.0 && self.pivot_high(i, strength) {
+                ph = self.bar(i).map(|b| b.high).unwrap_or(0.0);
+            }
+            if ll == 0.0 && self.pivot_low(i, strength) {
+                ll = self.bar(i).map(|b| b.low).unwrap_or(0.0);
+            } else if ll != 0.0 && pl == 0.0 && self.pivot_low(i, strength) {
+                pl = self.bar(i).map(|b| b.low).unwrap_or(0.0);
+            }
+            if ph != 0.0 && pl != 0.0 {
+                break;
+            }
+        }
+        (lh, ph, ll, pl)
+    }
+
+    /// The nearest pivot (high if `highs`, else low) at shifts `from ..
+    /// to` (exclusive), as `(shift, price)`.
+    pub fn first_pivot(&self, highs: bool, strength: usize, from: usize, to: usize) -> Option<(usize, f64)> {
+        for i in from..to {
+            let hit = if highs {
+                self.pivot_high(i, strength)
+            } else {
+                self.pivot_low(i, strength)
+            };
+            if hit {
+                let b = self.bar(i)?;
+                return Some((i, if highs { b.high } else { b.low }));
+            }
+        }
+        None
+    }
+}
+
+/// A script's handle on a [`Window`]. Cloning the handle shares the window.
+#[derive(Clone)]
+pub struct WinHandle(pub Rc<RefCell<Window>>);
+
+fn winbar_map(b: &WinBar) -> Map {
+    let mut m = Map::new();
+    m.insert("ts".into(), b.ts.into());
+    m.insert("open".into(), b.open.into());
+    m.insert("high".into(), b.high.into());
+    m.insert("low".into(), b.low.into());
+    m.insert("close".into(), b.close.into());
+    m
+}
+
+fn opt_winbar(b: Option<WinBar>) -> Dynamic {
+    match b {
+        Some(b) => Dynamic::from_map(winbar_map(&b)),
+        None => Dynamic::UNIT,
+    }
+}
+
+fn shift_usize(i: i64) -> usize {
+    if i < 0 {
+        0
+    } else {
+        i as usize
+    }
+}
+
+fn register_window_api(engine: &mut Engine) {
+    engine.register_fn("window", |dur: i64, anchor: i64, keep: i64| -> WinHandle {
+        WinHandle(Rc::new(RefCell::new(Window::new(dur, anchor, shift_usize(keep)))))
+    });
+    engine.register_fn("window", |dur: i64, anchor: i64| -> WinHandle {
+        WinHandle(Rc::new(RefCell::new(Window::new(dur, anchor, 2))))
+    });
+    engine
+        .register_type_with_name::<WinHandle>("Window")
+        .register_get("rolled", |w: &mut WinHandle| w.0.borrow().rolled)
+        .register_get("start", |w: &mut WinHandle| w.0.borrow().start)
+        .register_get("closed", |w: &mut WinHandle| opt_winbar(w.0.borrow().closed))
+        .register_get("forming", |w: &mut WinHandle| opt_winbar(w.0.borrow().forming))
+        .register_get("forming_end", |w: &mut WinHandle| -> Dynamic {
+            match w.0.borrow().forming_end() {
+                Some(e) => e.into(),
+                None => Dynamic::UNIT,
+            }
+        })
+        .register_get("count", |w: &mut WinHandle| w.0.borrow().total as i64)
+        .register_get("len", |w: &mut WinHandle| w.0.borrow().bars.len() as i64)
+        .register_fn("finalize_through", |w: &mut WinHandle, t: i64| {
+            w.0.borrow_mut().finalize_through(t)
+        })
+        .register_fn("wake", |w: &mut WinHandle, on: bool| w.0.borrow_mut().wake = on)
+        .register_fn("bar", |w: &mut WinHandle, shift: i64| {
+            opt_winbar(w.0.borrow().bar(shift_usize(shift)).copied())
+        })
+        .register_fn("o", |w: &mut WinHandle, shift: i64| {
+            w.0.borrow().bar(shift_usize(shift)).map(|b| b.open).unwrap_or(f64::NAN)
+        })
+        .register_fn("h", |w: &mut WinHandle, shift: i64| {
+            w.0.borrow().bar(shift_usize(shift)).map(|b| b.high).unwrap_or(f64::NAN)
+        })
+        .register_fn("l", |w: &mut WinHandle, shift: i64| {
+            w.0.borrow().bar(shift_usize(shift)).map(|b| b.low).unwrap_or(f64::NAN)
+        })
+        .register_fn("c", |w: &mut WinHandle, shift: i64| {
+            w.0.borrow().bar(shift_usize(shift)).map(|b| b.close).unwrap_or(f64::NAN)
+        })
+        .register_fn("ts", |w: &mut WinHandle, shift: i64| {
+            w.0.borrow().bar(shift_usize(shift)).map(|b| b.ts).unwrap_or(0)
+        })
+        .register_fn("pivot_high", |w: &mut WinHandle, shift: i64, strength: i64| {
+            w.0.borrow().pivot_high(shift_usize(shift), shift_usize(strength))
+        })
+        .register_fn("pivot_low", |w: &mut WinHandle, shift: i64, strength: i64| {
+            w.0.borrow().pivot_low(shift_usize(shift), shift_usize(strength))
+        })
+        .register_fn("recent_pivots", |w: &mut WinHandle, strength: i64, scan: i64| -> Array {
+            let (a, b, c, d) = w.0.borrow().recent_pivots(shift_usize(strength), shift_usize(scan));
+            vec![a.into(), b.into(), c.into(), d.into()]
+        })
+        .register_fn(
+            "first_pivot",
+            |w: &mut WinHandle, highs: bool, strength: i64, from: i64, to: i64| -> Dynamic {
+                match w.0.borrow().first_pivot(highs, shift_usize(strength), shift_usize(from), shift_usize(to)) {
+                    Some((i, px)) => {
+                        let mut m = Map::new();
+                        m.insert("shift".into(), (i as i64).into());
+                        m.insert("price".into(), px.into());
+                        Dynamic::from_map(m)
+                    }
+                    None => Dynamic::UNIT,
+                }
+            },
+        );
 }
 
 // ─── The native scanner ─────────────────────────────────────────────────────
@@ -1533,4 +1925,90 @@ fn register_scanner_api(engine: &mut Engine) {
         .register_fn("day_low", |s: &mut ScanHandle| -> Dynamic {
             opt_f64(s.0.borrow().day().map(|d| d.low))
         });
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    fn c(min: i64, o: f64, h: f64, l: f64, cl: f64) -> Candle {
+        Candle {
+            asset: 0,
+            timeframe: crate::models::base_tf_id(),
+            timestamp: chrono::DateTime::from_timestamp(min * 60, 0).unwrap().naive_utc(),
+            open: o,
+            high: h,
+            low: l,
+            close: cl,
+            volume: 0.0,
+            complete: true,
+        }
+    }
+
+    #[test]
+    fn window_rolls_on_the_first_candle_of_a_new_group() {
+        let mut w = Window::new(300, 0, 10);
+        assert!(w.step(&c(0, 1.0, 2.0, 0.5, 1.5)));
+        assert!(w.closed.is_none());
+        assert!(!w.step(&c(1, 1.5, 3.0, 1.0, 2.0)));
+        assert!(!w.step(&c(4, 2.0, 2.5, 0.2, 0.4)));
+        // Minute 5 starts the next 5-minute group: the first bar closes.
+        assert!(w.step(&c(5, 0.4, 0.6, 0.3, 0.5)));
+        let b = w.closed.unwrap();
+        assert_eq!((b.ts, b.open, b.high, b.low, b.close), (0, 1.0, 3.0, 0.2, 0.4));
+        assert_eq!(w.start, 300);
+        assert_eq!(w.total, 1);
+        assert_eq!(w.bar(1).unwrap().high, 3.0);
+        assert!(w.bar(2).is_none());
+    }
+
+    #[test]
+    fn window_anchor_shifts_the_grid_and_a_gap_still_rolls() {
+        // 4h anchored at 22:00 UTC: the group boundary sits at 22:00, 02:00, …
+        let mut w = Window::new(14400, 7200, 10);
+        w.step(&c(21 * 60 + 59, 1.0, 1.0, 1.0, 1.0));
+        assert_eq!(w.start, 18 * 3600);
+        assert!(w.step(&c(22 * 60, 1.0, 1.0, 1.0, 1.0)));
+        assert_eq!(w.start, 22 * 3600);
+        // A data gap past the next boundary: the next candle rolls, and the
+        // partial bar closes with what it had.
+        assert!(w.step(&c(30 * 60, 5.0, 6.0, 4.0, 5.5)));
+        assert_eq!(w.closed.unwrap().ts, 22 * 3600);
+        // The 02:00 group had no candles; the candle's own group starts 06:00.
+        assert_eq!(w.start, 30 * 3600);
+    }
+
+    #[test]
+    fn finalize_through_closes_a_forming_bar_by_the_clock() {
+        let mut w = Window::new(300, 0, 10);
+        w.step(&c(0, 1.0, 2.0, 0.5, 1.5));
+        assert!(!w.finalize_through(299));
+        assert!(w.finalize_through(300));
+        assert_eq!(w.total, 1);
+        assert!(w.forming.is_none());
+        assert!(!w.finalize_through(1000));
+    }
+
+    #[test]
+    fn pivots_and_recent_pivots_follow_the_shift_convention() {
+        let mut w = Window::new(60, 0, 50);
+        // Highs: 1 2 5 2 1 | 1 2 7 2 1 | 3 (newest). Lows mirror negatively.
+        let highs = [1.0, 2.0, 5.0, 2.0, 1.0, 1.0, 2.0, 7.0, 2.0, 1.0, 3.0];
+        for (i, h) in highs.iter().enumerate() {
+            w.step(&c(i as i64, *h, *h, -*h, *h));
+        }
+        // Close them all: one more candle rolls the last one.
+        w.step(&c(100, 0.0, 0.0, 0.0, 0.0));
+        assert_eq!(w.total, 11);
+        // shift 1 = 3.0 (newest), shift 4 = 7.0, shift 9 = 5.0.
+        assert_eq!(w.bar(4).unwrap().high, 7.0);
+        assert!(w.pivot_high(4, 2));
+        assert!(w.pivot_high(9, 2));
+        assert!(!w.pivot_high(9, 3)); // shift 12 does not exist
+        assert!(!w.pivot_high(1, 1)); // no right neighbour
+        let (lh, ph, ll, pl) = w.recent_pivots(2, 12);
+        assert_eq!((lh, ph), (7.0, 5.0));
+        assert_eq!((ll, pl), (-7.0, -5.0));
+        assert_eq!(w.first_pivot(true, 2, 3, 11), Some((4, 7.0)));
+    }
 }

@@ -592,6 +592,7 @@ fn apply_config(pt: &mut PaperTrader, p: &params::Params, fill: &strategy_config
     pt.allow_signal_bar_fill = fill.allow_signal_bar_fill;
     pt.entry_slippage_r = fill.entry_slippage_r;
     pt.intrabar_stop_first = fill.intrabar_stop_first;
+    pt.exit_gap_at_open = fill.exit_gap_at_open;
     pt.hybrid_fill = fill.entry_fill_mode == "hybrid" || fill.entry_fill_mode == "rest_on_ready";
     pt.rest_on_ready_fill = fill.entry_fill_mode == "rest_on_ready";
     pt.tick_fill = fill.entry_fill_mode == "tick";

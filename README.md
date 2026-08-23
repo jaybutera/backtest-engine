@@ -225,6 +225,33 @@ actions take effect on the next bar, as for a native strategy. Higher
 timeframes arrive on the same `on_candle` stream with `c.tf` set, after the
 base bar that closes them has been processed.
 
+A market entry fills at the bar's close by default. `market_entry(#{...,
+at: "open"})` is a market-on-open order: it fills at the bar's open and is
+raced against the rest of that bar (stop first, by the lens tie-break),
+which is what an order decided at the previous close and sent at the open
+gets. The engine cannot check that the decision did not read the bar it
+fills in; that is the script's contract. A script that only ever books
+market orders can define `on_bar_close` alone and skip `on_candle`.
+
+### Windows: script-owned timeframes
+
+A strategy that acts at bar boundaries of its own timeframe, on its own
+grid, pays the interpreter on every base candle if it aggregates in the
+script: a 1.8M-candle run spent 4.4 s of 5.5 s updating a forming bar. A
+`window(secs, anchor_secs, keep)` in the state is aggregated natively
+instead, grouping base candles by `(ts + anchor) div secs` (so a 4-hour
+window can start at 22:00 UTC rather than midnight), keeping the last
+`keep` closed bars, and the script is called in `on_bar_close` only on a
+candle that rolled a window, closed a trade, or while `w.wake(true)`
+stands. Bars are read MQL-style, shift 1 being the last closed one:
+`w.o(i)`, `w.h(i)`, `w.l(i)`, `w.c(i)`, `w.ts(i)`, `w.bar(i)`; `w.rolled`,
+`w.start`, `w.closed`, `w.count`, `w.forming`, `w.forming_end`,
+`w.finalize_through(t)` close a forming bar by the clock; `w.pivot_high(i,
+n)` / `w.pivot_low(i, n)`, `w.recent_pivots(n, scan)` and
+`w.first_pivot(highs, n, from, to)` are the swing queries. The same RSI
+strategy on a window runs in 1.8 s on that file, against 0.96 s for an
+empty script.
+
 Rhai passes arguments by value, so state is mutated through `this`
 (`this.levels.push(x)`) and helpers that mutate a sub-object are written as
 methods on it. One thing to know before trusting a script's numbers: the
@@ -324,6 +351,13 @@ price jump at each roll. `roll_adjust = true` (or `--roll-adjust`) removes
 them at load: each gap detected at a UTC-day boundary is added to every bar
 before it, anchoring the series at the latest contract's prices. It rewrites
 prices, so it is off by default.
+
+A fill lens can also decide what a gapped exit costs. By default a stop
+that the bar opens through is booked at the stop price, and a target the
+bar opens through at the target. `exit_gap_at_open = true` books both at
+the bar's open instead, which is where a resting stop or target order
+actually fills when the market jumps over it; the stop is checked before
+the target.
 
 ## Trade management
 

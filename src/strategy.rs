@@ -356,6 +356,29 @@ impl<'a> Book<'a> {
         )
     }
 
+    /// Open a position at this bar's OPEN as a market-on-open fill, raced
+    /// against this bar. See [`PaperTrader::book_market_entry_at_open`] for
+    /// the contract: the decision must rest on bars before this one.
+    pub fn market_entry_at_open(
+        &mut self,
+        opportunity_id: &str,
+        signal_type: u16,
+        direction: Direction,
+        stop: f64,
+        tp: f64,
+        score: f64,
+    ) -> bool {
+        self.trader.book_market_entry_at_open(
+            opportunity_id,
+            signal_type,
+            direction,
+            stop,
+            tp,
+            score,
+            self.candle,
+        )
+    }
+
     /// Move an open trade's stop; effective from the next bar.
     pub fn set_stop(&mut self, opportunity_id: &str, stop: f64) -> bool {
         self.trader.set_open_stop(opportunity_id, stop)

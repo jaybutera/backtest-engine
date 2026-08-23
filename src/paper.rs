@@ -119,6 +119,14 @@ pub struct PaperTrader {
     /// Intrabar tie-break when a single candle spans both stop and TP. `true`
     /// (default, pessimistic) = stop resolves first; `false` = TP first.
     pub intrabar_stop_first: bool,
+    /// Exit at the bar's OPEN when the bar opens through the stop or the
+    /// target. A resting stop that is gapped over fills at the first print,
+    /// not at its own price; the same holds for a target. `false` (default)
+    /// books every stop exit at the stop and every target exit at the target,
+    /// whatever the open was. Checked before the intrabar race, so a gap
+    /// through the stop is a stop exit at the open even if the bar also
+    /// reached the target.
+    pub exit_gap_at_open: bool,
     // ─── Hybrid entry-fill model ──────────────────────────────────────────────
     /// `false` (default) = the pure resting-limit model (`fill_action`, honoring
     /// `allow_signal_bar_fill`/`entry_slippage_r`). `true` = the live-faithful
@@ -805,6 +813,7 @@ impl PaperTrader {
             allow_signal_bar_fill: false,
             entry_slippage_r: 0.0,
             intrabar_stop_first: true,
+            exit_gap_at_open: false,
             // Hybrid fill model OFF by default → limit model behavior unchanged.
             hybrid_fill: false,
             // Tick fill model OFF by default → OHLC behavior unchanged.
@@ -1168,6 +1177,55 @@ impl PaperTrader {
             } else {
                 candle.low <= trade.tp
             };
+
+            // Gap exits: the bar OPENED through the stop or the target, so
+            // the order filled at the open. Stop first, as in the race.
+            if self.exit_gap_at_open {
+                let open_past_stop = if trade.direction == Direction::Bull {
+                    candle.open <= effective_stop
+                } else {
+                    candle.open >= effective_stop
+                };
+                let open_past_tp = if trade.direction == Direction::Bull {
+                    candle.open >= trade.tp
+                } else {
+                    candle.open <= trade.tp
+                };
+                let r_at_open = if risk > 0.0 {
+                    if trade.direction == Direction::Bull {
+                        (candle.open - trade.fill) / risk
+                    } else {
+                        (trade.fill - candle.open) / risk
+                    }
+                } else {
+                    0.0
+                };
+                if open_past_stop {
+                    let result = if trail_active {
+                        TradeResult::Inconclusive
+                    } else {
+                        TradeResult::Loss
+                    };
+                    closes.push((
+                        trade.opportunity_id.clone(),
+                        result,
+                        r_at_open,
+                        candle.timestamp,
+                        !trail_active,
+                    ));
+                    continue;
+                }
+                if open_past_tp {
+                    closes.push((
+                        trade.opportunity_id.clone(),
+                        TradeResult::Win,
+                        r_at_open,
+                        candle.timestamp,
+                        false,
+                    ));
+                    continue;
+                }
+            }
 
             // Intrabar tie-break: if one candle spans both, resolve per flag
             // (default stop-first, pessimistic).
@@ -2160,7 +2218,66 @@ impl PaperTrader {
         score: f64,
         candle: &Candle,
     ) -> bool {
-        let fill = candle.close;
+        self.book_market_entry_at(
+            opportunity_id,
+            signal_type,
+            direction,
+            stop,
+            tp,
+            score,
+            candle,
+            false,
+        )
+    }
+
+    /// Book a market entry at this bar's OPEN: a market-on-open order, decided
+    /// at the previous bar's close and filled at the first print of this one.
+    ///
+    /// The fill is `candle.open` (taker), and because the bar has already
+    /// traded around it, the position is raced against this bar at once: a
+    /// low at or through the stop closes it at the stop, a high at or through
+    /// the target closes it at the target, with `intrabar_stop_first` as the
+    /// tie-break. A position that survives carries the bar's favorable
+    /// excursion as its watermark, and its hold clock starts next bar like any
+    /// other fill. The engine cannot check that the decision did not read this
+    /// bar; that is the caller's contract, and it is the reason this exists
+    /// as a separate call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn book_market_entry_at_open(
+        &mut self,
+        opportunity_id: &str,
+        signal_type: u16,
+        direction: Direction,
+        stop: f64,
+        tp: f64,
+        score: f64,
+        candle: &Candle,
+    ) -> bool {
+        self.book_market_entry_at(
+            opportunity_id,
+            signal_type,
+            direction,
+            stop,
+            tp,
+            score,
+            candle,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn book_market_entry_at(
+        &mut self,
+        opportunity_id: &str,
+        signal_type: u16,
+        direction: Direction,
+        stop: f64,
+        tp: f64,
+        score: f64,
+        candle: &Candle,
+        at_open: bool,
+    ) -> bool {
+        let fill = if at_open { candle.open } else { candle.close };
         let take = TakeParams {
             entry: fill,
             stop,
@@ -2195,7 +2312,71 @@ impl PaperTrader {
             fee_r: 0.0,
         };
         self.book_fill(trade, fill, EntryFeeSide::Taker, candle.timestamp);
+        if at_open {
+            self.race_fresh_fill(opportunity_id, candle);
+        }
         true
+    }
+
+    /// Race a position filled at this bar's open against the rest of the bar:
+    /// the same stop / target / tie-break rules as `update_prices_ohlc`, on the
+    /// planned stop (no overrides or trailing can exist yet). The open itself
+    /// is the fill, so there is no gap case.
+    fn race_fresh_fill(&mut self, opportunity_id: &str, candle: &Candle) {
+        let Some(pos) = self
+            .open_trades
+            .iter()
+            .position(|t| t.opportunity_id == opportunity_id)
+        else {
+            return;
+        };
+        let trade = self.open_trades[pos].clone();
+        let risk = (trade.entry - trade.stop).abs();
+        let (hit_stop, hit_tp, favorable_r) = if trade.direction == Direction::Bull {
+            (
+                candle.low <= trade.stop,
+                candle.high >= trade.tp,
+                (candle.high - trade.fill) / risk,
+            )
+        } else {
+            (
+                candle.high >= trade.stop,
+                candle.low <= trade.tp,
+                (trade.fill - candle.low) / risk,
+            )
+        };
+        let resolve_stop = hit_stop && (!hit_tp || self.intrabar_stop_first);
+        let resolve_tp = hit_tp && (!hit_stop || !self.intrabar_stop_first);
+        let close = if resolve_stop {
+            let r = if trade.direction == Direction::Bull {
+                (trade.stop - trade.fill) / risk
+            } else {
+                (trade.fill - trade.stop) / risk
+            };
+            Some((TradeResult::Loss, r, true))
+        } else if resolve_tp {
+            Some((TradeResult::Win, (trade.tp - trade.fill).abs() / risk, false))
+        } else {
+            None
+        };
+        match close {
+            Some((result, r, is_stop)) => {
+                self.open_trades.remove(pos);
+                self.close_trade(opportunity_id, result, r, candle.timestamp, is_stop);
+                self.watermarks.remove(opportunity_id);
+                self.partial_taken.remove(opportunity_id);
+                self.entry_fee_side.remove(opportunity_id);
+                self.stop_overrides.remove(opportunity_id);
+            }
+            None => {
+                if risk > 0.0 {
+                    let wm = self.watermarks.entry(opportunity_id.to_string()).or_insert(0.0);
+                    if favorable_r > *wm {
+                        *wm = favorable_r;
+                    }
+                }
+            }
+        }
     }
 
     /// Move an open trade's stop. Applies from the next candle on; the planned
@@ -3021,6 +3202,97 @@ mod fill_model_tests {
         assert_eq!(pt.losses(), 1);
         let r = pt.trades[0].r_pnl;
         assert!((r - (-1.1)).abs() < 1e-9, "loss should be −1.1R, got {r}");
+    }
+
+    // ─── Gap exits at the open ───────────────────────────────────────────────
+
+    /// Open a bull position at 100 (stop 90, tp 130) through the limit path.
+    fn open_bull(pt: &mut PaperTrader) {
+        place(pt, base_trade(Direction::Bull, 100.0, 90.0, 130.0));
+        pt.update_prices(&candle(0, 105.0, 106.0, 104.0, 105.0));
+        pt.update_prices(&candle(1, 100.5, 101.0, 99.5, 100.0));
+        assert_eq!(pt.open_trades.len(), 1);
+    }
+
+    #[test]
+    fn gap_through_stop_exits_at_open_when_enabled() {
+        let mut pt = PaperTrader::new(0.0, 3.0, 300);
+        pt.exit_gap_at_open = true;
+        open_bull(&mut pt);
+        // Opens at 86, well through the stop at 90: exit at 86 = −1.4R.
+        pt.update_prices(&candle(2, 86.0, 88.0, 85.0, 87.0));
+        assert_eq!(pt.losses(), 1);
+        assert!((pt.trades[0].r_pnl - (-1.4)).abs() < 1e-9, "{}", pt.trades[0].r_pnl);
+    }
+
+    #[test]
+    fn gap_through_stop_exits_at_stop_by_default() {
+        let mut pt = PaperTrader::new(0.0, 3.0, 300);
+        open_bull(&mut pt);
+        pt.update_prices(&candle(2, 86.0, 88.0, 85.0, 87.0));
+        assert_eq!(pt.losses(), 1);
+        assert!((pt.trades[0].r_pnl - (-1.0)).abs() < 1e-9, "{}", pt.trades[0].r_pnl);
+    }
+
+    #[test]
+    fn gap_through_target_exits_at_open_when_enabled() {
+        let mut pt = PaperTrader::new(0.0, 3.0, 300);
+        pt.exit_gap_at_open = true;
+        open_bull(&mut pt);
+        // Opens at 134 past the target at 130: +3.4R, not the planned 3R.
+        pt.update_prices(&candle(2, 134.0, 135.0, 133.0, 134.0));
+        assert_eq!(pt.wins(), 1);
+        assert!((pt.trades[0].r_pnl - 3.4).abs() < 1e-9, "{}", pt.trades[0].r_pnl);
+    }
+
+    #[test]
+    fn gap_exit_prefers_the_stop_when_the_bar_opens_through_it_and_reaches_the_target() {
+        let mut pt = PaperTrader::new(0.0, 3.0, 300);
+        pt.exit_gap_at_open = true;
+        open_bull(&mut pt);
+        pt.update_prices(&candle(2, 89.0, 140.0, 88.0, 139.0));
+        assert_eq!(pt.losses(), 1);
+        assert!((pt.trades[0].r_pnl - (-1.1)).abs() < 1e-9);
+    }
+
+    // ─── Market-on-open entries ───────────────────────────────────────────────
+
+    #[test]
+    fn market_on_open_fills_at_the_open_and_survives_a_quiet_bar() {
+        let mut pt = PaperTrader::new(0.0, 3.0, 300);
+        let c = candle(5, 100.0, 104.0, 98.0, 103.0);
+        assert!(pt.book_market_entry_at_open("m1", 0, Direction::Bull, 90.0, 130.0, 1.0, &c));
+        assert_eq!(pt.open_trades.len(), 1);
+        assert_eq!(pt.open_trades[0].fill, 100.0);
+        // The bar's favorable excursion is already on the watermark.
+        assert!((pt.watermarks["m1"] - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn market_on_open_is_raced_on_its_own_bar_stop_first() {
+        let mut pt = PaperTrader::new(0.0, 3.0, 300);
+        // Low 89 reaches the stop at 90 and the high 131 the target: stop wins.
+        let c = candle(5, 100.0, 131.0, 89.0, 120.0);
+        assert!(pt.book_market_entry_at_open("m1", 0, Direction::Bull, 90.0, 130.0, 1.0, &c));
+        assert!(pt.open_trades.is_empty());
+        assert_eq!(pt.losses(), 1);
+        assert!((pt.trades[0].r_pnl - (-1.0)).abs() < 1e-9);
+        assert_eq!(pt.trades[0].closed_at, Some(ts(5)));
+        assert_eq!(pt.closed_this_bar.len(), 1);
+    }
+
+    #[test]
+    fn market_on_open_takes_the_target_on_its_own_bar() {
+        let mut pt = PaperTrader::new(0.0, 3.0, 300);
+        let c = candle(5, 100.0, 131.0, 95.0, 120.0);
+        assert!(pt.book_market_entry_at_open("m1", 0, Direction::Bear, 110.0, 70.0, 1.0, &c));
+        // Bear: stop 110 not reached (high 131 is through it!) → stop exit.
+        assert_eq!(pt.losses(), 1);
+        let mut pt = PaperTrader::new(0.0, 3.0, 300);
+        let c = candle(6, 100.0, 131.0, 95.0, 120.0);
+        assert!(pt.book_market_entry_at_open("m2", 0, Direction::Bull, 90.0, 130.0, 1.0, &c));
+        assert_eq!(pt.wins(), 1);
+        assert!((pt.trades[0].r_pnl - 3.0).abs() < 1e-9);
     }
 
     #[test]
