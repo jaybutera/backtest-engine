@@ -603,6 +603,7 @@ impl Drop for RhaiStrategy {
 
 impl RhaiStrategy {
     /// Compile `path` and run its top level plus `init`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         path: &Path,
         asset: &str,
@@ -986,8 +987,8 @@ impl Strategy for RhaiStrategy {
         // Erase the borrow's lifetime for the duration of the call; see
         // ScriptBook::with for the invariant.
         let raw: *mut Book<'_> = book;
-        self.book_ptr
-            .set(raw as *mut Book<'static>);
+        let raw: *mut Book<'static> = raw.cast();
+        self.book_ptr.set(raw);
         let sb = ScriptBook {
             ptr: self.book_ptr.clone(),
         };
