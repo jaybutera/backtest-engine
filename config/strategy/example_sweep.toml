@@ -1,0 +1,18 @@
+# The scanner demonstration: a swept level, the first gap after it, entered
+# on the retrace. Runs scripts/rhai/sweep_fvg.rhai on the EXAMPLE asset with
+# 5m and 15m bars added (pass --timeframe 5m --timeframe 15m).
+factory = "rhai"
+assets = ["EXAMPLE"]
+
+[strategy]
+script = "../../scripts/rhai/sweep_fvg.rhai"
+min_score = 3.0
+rr = 2.0
+max_hold = 300
+fees = true
+
+[script]
+noise_atr = 1.0              # a bar must clear a level by this many ATR to count
+min_level_sig = 3.0          # only session and period levels start a watch
+max_bars_after_sweep = 30    # bars to wait for the gap and the retrace
+min_target_rr = 2.0          # nearest opposing level must be this far, in R

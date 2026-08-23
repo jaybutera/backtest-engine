@@ -7,14 +7,15 @@
 //! with the same information: it sees every completed candle of its asset
 //! on every configured timeframe, keeps whatever state it likes between
 //! bars, emits opportunities, decides their geometry, and manages the book
-//! after each bar. Nothing is pre-computed for it. The engine supplies
-//! data access (candle history per timeframe, other assets' series, the
-//! clock), generic helpers (ATR, extremes, fees, time zones, TOML), and
-//! the order API (limit entries via opportunities, market entries, stop and
-//! target changes, closes, cancels). Everything that decides what to trade
-//! is the script's.
+//! after each bar. The engine supplies data access (candle history per
+//! timeframe, other assets' series, the clock), generic helpers (ATR,
+//! extremes, fees, time zones, TOML), the order API (limit entries via
+//! opportunities, market entries, stop and target changes, closes,
+//! cancels), and, for scripts that want it, the native scanner services of
+//! [`crate::liquidity`]. Everything that decides what to trade is the
+//! script's.
 //!
-//! # Script shape
+//! # Script shape: per bar
 //!
 //! ```rhai
 //! fn init(cfg) {            // optional: build the state map. cfg carries
@@ -33,6 +34,55 @@
 //!     for t in book.closed() { if t.stop_exit { /* … */ } }
 //! }
 //! ```
+//!
+//! # Script shape: on events, with the native scanner
+//!
+//! A script that would otherwise rescan its own levels and gaps on every
+//! bar puts a [`Scanner`] in its state under `scan` and replaces
+//! `on_candle` with event hooks. The engine then steps the scanner on every
+//! candle itself and calls the script only when there is something to
+//! decide:
+//!
+//! ```rhai
+//! fn init(cfg) {
+//!     #{ scan: scanner(#{ primitives: #{ … }, significance: #{ … }, levels: #{ … },
+//!                        sweep: #{ … }, fvg: #{ … }, sessions: #{ … }, draw: #{ … } }),
+//!        watching: [] }
+//! }
+//! fn on_bar(c, atr, sweeps, breaks) {   // bars with a sweep or a structure
+//!     for sw in sweeps { … }             // break, plus bars the script asked
+//!     let f = this.scan.fvg_first(c.tf, "bull", false, since, 0.0, -inf(), inf(), px, atr * 0.5);
+//!     this.scan.wake(c.tf, this.watching.len() > 0);   // keep being called
+//!     [ #{ entry: …, stop: … } ]          // candidates for emit()
+//! }
+//! fn emit(c, atr, cand) {               // after the draw map rebuild:
+//!     let o = opp("sweep_fvg", c.tf, "bull", c.ts);   // score and emit, or ()
+//!     o.entry = cand.entry; o
+//! }
+//! fn on_day(c, prev) { … }              // optional: each completed UTC day
+//! ```
+//!
+//! The order within one candle is: scanner step (history, ATR, day
+//! tracker, sessions, swings / gaps / breaks, levels, equal levels, gap
+//! lifecycle, sweeps) → `on_day` → `on_bar` → draw map rebuild when due →
+//! `emit` per candidate → registry maintenance (retest refresh, decay,
+//! pruning). `on_bar` runs when the bar carries a sweep or a break, or the
+//! script has `wake`d that timeframe (`"*"` for all). With a scanner,
+//! `on_bar_close` runs only on bars that closed a trade, or on every bar
+//! while `wake_book(true)` stands. A candidate that is already an `opp(…)`
+//! value is emitted as is, so a script without `emit` returns opportunities
+//! from `on_bar` directly.
+//!
+//! Scanner queries: `significance(src, tf, touch)`, `add_level(price, side,
+//! src, tf, ts, touch, atr)`, `level(id)`, `levels_beyond(side, price,
+//! min_sig)`, `nearest_above(price)` / `nearest_below(price)`,
+//! `find_target(dir, entry, stop, min_rr, min_sig)`, `fvg(id)`,
+//! `fvg_status(id)`, `fvgs_since(tf, dir, inverted, since_ts)`,
+//! `fvg_first(tf, dir, inverted, since_ts, min_gap, zone_lo, zone_hi,
+//! clear_from, min_clear)`, `draw_map()`, `draw_bias()`, `day()`,
+//! `day_high()` / `day_low()`, `last_atr()`, `candle_count()`, `stats()`.
+//! Setting `BACKTEST_RHAI_STATS=1` prints per-hook call counts and time per
+//! asset at the end of a run.
 //!
 //! The state map is bound to `this` in every hook, so a script mutates it
 //! in place (`this.levels.push(x)`) rather than passing it around; Rhai
@@ -76,6 +126,7 @@ use rhai::{Array, CallFnOptions, Dynamic, Engine, EvalAltResult, ImmutableString
 
 use crate::fees::{self, EntryFeeSide};
 use crate::knob;
+use crate::liquidity::{self, BarEvents, Scanner, ScannerCfg, Side};
 use crate::models::{
     asset_name, sig_type_id, sig_type_name, tf_id, tf_name, Candle, Direction, Opportunity,
     PaperTrade,
@@ -157,6 +208,44 @@ fn resolve_relative(p: &str, strategy_file: Option<&Path>) -> PathBuf {
         }
     }
     raw
+}
+
+// ─── Timeframe names without the global intern lock ─────────────────────────
+// `tf_id` / `tf_name` take a process-wide mutex that every asset thread
+// contends for; scripts read `c.tf` and pass timeframe names on every bar,
+// so each thread keeps its own copy of the (tiny, append-only) table.
+
+thread_local! {
+    static TF_NAMES: RefCell<Vec<Option<ImmutableString>>> = const { RefCell::new(Vec::new()) };
+    static TF_IDS: RefCell<HashMap<ImmutableString, u16>> = RefCell::new(HashMap::new());
+}
+
+fn tf_str(id: u16) -> ImmutableString {
+    TF_NAMES.with(|t| {
+        let mut t = t.borrow_mut();
+        let i = id as usize;
+        if i >= t.len() {
+            t.resize(i + 1, None);
+        }
+        if let Some(s) = &t[i] {
+            return s.clone();
+        }
+        let s: ImmutableString = tf_name(id).to_string().into();
+        t[i] = Some(s.clone());
+        s
+    })
+}
+
+fn tf_of(name: &str) -> u16 {
+    TF_IDS.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(&id) = t.get(name) {
+            return id;
+        }
+        let id = tf_id(name);
+        t.insert(name.into(), id);
+        id
+    })
 }
 
 // ─── Data types handed to scripts ───────────────────────────────────────────
@@ -479,7 +568,37 @@ pub struct RhaiStrategy {
     meta: RefCell<HashMap<String, Map>>,
     has_admit: bool,
     has_bar_close: bool,
+    has_on_bar: bool,
+    has_emit: bool,
+    has_on_day: bool,
+    /// The native scanner the script put in its state under `scan`, if any.
+    scan: Option<ScanHandle>,
     asset: String,
+    /// Per-hook call counts and time, reported on drop when
+    /// `BACKTEST_RHAI_STATS` is set.
+    stats: RefCell<HashMap<&'static str, (u64, std::time::Duration)>>,
+    stats_on: bool,
+}
+
+impl Drop for RhaiStrategy {
+    fn drop(&mut self) {
+        if !self.stats_on {
+            return;
+        }
+        let st = self.stats.borrow();
+        let mut rows: Vec<_> = st.iter().collect();
+        rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+        for (name, (n, t)) in rows {
+            eprintln!(
+                "rhai stats {}: {:<14} {:>9} calls {:>8.3} s {:>7.1} us/call",
+                self.asset,
+                name,
+                n,
+                t.as_secs_f64(),
+                if *n > 0 { t.as_secs_f64() * 1e6 / *n as f64 } else { 0.0 }
+            );
+        }
+    }
 }
 
 impl RhaiStrategy {
@@ -511,7 +630,7 @@ impl RhaiStrategy {
             let hist = hist.clone();
             let cap = history;
             engine.register_fn("hist", move |tf: &str| -> Series {
-                let id = tf_id(tf);
+                let id = tf_of(tf);
                 hist.borrow_mut()
                     .entry(id)
                     .or_insert_with(|| Series::new(cap))
@@ -560,11 +679,16 @@ impl RhaiStrategy {
         let mut scope = Scope::new();
         let _ = engine.eval_ast_with_scope::<Dynamic>(&mut scope, &ast)?;
 
-        let has_init = ast.iter_functions().any(|f| f.name == "init");
-        let has_admit = ast.iter_functions().any(|f| f.name == "admit");
-        let has_bar_close = ast.iter_functions().any(|f| f.name == "on_bar_close");
-        if !ast.iter_functions().any(|f| f.name == "on_candle") {
-            return Err("script defines no `on_candle(c)` function".into());
+        let has_fn = |n: &str| ast.iter_functions().any(|f| f.name == n);
+        let has_init = has_fn("init");
+        let has_admit = has_fn("admit");
+        let has_bar_close = has_fn("on_bar_close");
+        let has_on_bar = has_fn("on_bar");
+        let has_emit = has_fn("emit");
+        let has_on_day = has_fn("on_day");
+        let has_on_candle = has_fn("on_candle");
+        if !has_on_candle && !has_on_bar {
+            return Err("script defines neither `on_candle(c)` nor `on_bar(c, atr, sweeps, breaks)`".into());
         }
 
         // The configuration the script starts from.
@@ -603,6 +727,13 @@ impl RhaiStrategy {
             Dynamic::from_map(Map::new())
         };
 
+        let scan = state
+            .read_lock::<Map>()
+            .and_then(|m| m.get("scan").and_then(|v| v.clone().try_cast::<ScanHandle>()));
+        if scan.is_none() && !has_on_candle {
+            return Err("script defines `on_bar` but its state has no `scan` scanner".into());
+        }
+
         Ok(Self {
             engine,
             ast,
@@ -615,15 +746,39 @@ impl RhaiStrategy {
             meta: RefCell::new(HashMap::new()),
             has_admit,
             has_bar_close,
+            has_on_bar,
+            has_emit,
+            has_on_day,
+            scan,
             asset: asset.to_string(),
+            stats: RefCell::new(HashMap::new()),
+            stats_on: std::env::var_os("BACKTEST_RHAI_STATS").is_some(),
         })
     }
 
     fn call(
         &self,
+        name: &'static str,
+        args: impl rhai::FuncArgs,
+    ) -> Result<Dynamic, Box<EvalAltResult>> {
+        if self.stats_on {
+            let t0 = std::time::Instant::now();
+            let r = self.call_inner(name, args);
+            let mut st = self.stats.borrow_mut();
+            let e = st.entry(name).or_insert((0, std::time::Duration::ZERO));
+            e.0 += 1;
+            e.1 += t0.elapsed();
+            return r;
+        }
+        self.call_inner(name, args)
+    }
+
+    fn call_inner(
+        &self,
         name: &str,
         args: impl rhai::FuncArgs,
     ) -> Result<Dynamic, Box<EvalAltResult>> {
+        let name = name.split('(').next().unwrap_or(name);
         let mut state = self.state.borrow_mut();
         let mut scope = Scope::new();
         // The scope is rebuilt per call: the script's persistent state lives
@@ -646,6 +801,90 @@ impl RhaiStrategy {
     }
 }
 
+impl RhaiStrategy {
+    /// Turn a hook's return value into opportunities: `()` or an array of
+    /// `opp(...)` values.
+    fn collect_opps(&self, out: Dynamic, hook: &str) -> Vec<Opportunity> {
+        let mut opps = Vec::new();
+        if out.is_unit() {
+            return opps;
+        }
+        let arr: Array = match out.try_cast::<Array>() {
+            Some(a) => a,
+            None => self.fail(hook, "must return an array of opportunities (or ())".into()),
+        };
+        for item in arr {
+            match item.try_cast::<ScriptOpp>() {
+                Some(o) => {
+                    if !o.meta.is_empty() {
+                        self.meta.borrow_mut().insert(o.inner.id.clone(), o.meta);
+                    }
+                    opps.push(o.inner);
+                }
+                None => self.fail(hook, "array item is not an opportunity".into()),
+            }
+        }
+        opps
+    }
+
+    /// One bar through the native scanner and the script's event hooks.
+    /// Returns what `emit` (or `on_bar`, for scripts without `emit`) produced.
+    fn drive_scanner(&self, candle: &Candle, scan: &ScanHandle) -> Dynamic {
+        let ev: BarEvents = scan.0.borrow_mut().process(candle);
+        if let (Some(day), true) = (ev.day_closed, self.has_on_day) {
+            if let Err(e) = self.call("on_day", (candle.clone(), day_map(&day))) {
+                self.fail("on_day", e);
+            }
+        }
+        let awake = {
+            let s = scan.0.borrow();
+            !ev.sweeps.is_empty()
+                || !ev.breaks.is_empty()
+                || s.wake.contains(&candle.timeframe)
+                || s.wake.contains(&u16::MAX)
+        };
+        let mut cands: Array = Array::new();
+        if awake && self.has_on_bar {
+            let sweeps: Array = ev.sweeps.iter().map(|s| Dynamic::from_map(sweep_map(s))).collect();
+            let breaks: Array = ev.breaks.iter().map(|b| Dynamic::from_map(break_map(b))).collect();
+            let hook: &'static str = if ev.sweeps.is_empty() && ev.breaks.is_empty() {
+                "on_bar(wake)"
+            } else {
+                "on_bar"
+            };
+            match self.call(hook, (candle.clone(), ev.atr, sweeps, breaks)) {
+                Ok(v) => {
+                    if !v.is_unit() {
+                        match v.try_cast::<Array>() {
+                            Some(a) => cands = a,
+                            None => self.fail("on_bar", "must return an array (or ())".into()),
+                        }
+                    }
+                }
+                Err(e) => self.fail("on_bar", e),
+            }
+        }
+        scan.0.borrow_mut().rebuild_draw(candle, &ev);
+        let mut out: Array = Array::new();
+        for cand in cands {
+            if cand.is::<ScriptOpp>() || !self.has_emit {
+                out.push(cand);
+                continue;
+            }
+            match self.call("emit", (candle.clone(), ev.atr, cand)) {
+                Ok(v) => {
+                    if !v.is_unit() {
+                        out.push(v);
+                    }
+                }
+                Err(e) => self.fail("emit", e),
+            }
+        }
+        scan.0.borrow_mut().after_hooks(candle, ev.atr);
+        Dynamic::from_array(out)
+    }
+}
+
 impl Strategy for RhaiStrategy {
     fn on_candle(&mut self, candle: &Candle) -> Vec<Opportunity> {
         if !candle.complete {
@@ -662,35 +901,14 @@ impl Strategy for RhaiStrategy {
                 .or_insert_with(|| Series::new(cap))
                 .push(candle, cap);
         }
-        let out: Dynamic = match self.call("on_candle", (candle.clone(),)) {
-            Ok(v) => v,
-            Err(e) => self.fail("on_candle", e),
+        let out: Dynamic = match self.scan.clone() {
+            Some(scan) => self.drive_scanner(candle, &scan),
+            None => match self.call("on_candle", (candle.clone(),)) {
+                Ok(v) => v,
+                Err(e) => self.fail("on_candle", e),
+            },
         };
-        let mut opps = Vec::new();
-        if out.is_unit() {
-            return opps;
-        }
-        let arr: Array = match out.try_cast::<Array>() {
-            Some(a) => a,
-            None => self.fail(
-                "on_candle",
-                "must return an array of opportunities (or ())".into(),
-            ),
-        };
-        for item in arr {
-            match item.try_cast::<ScriptOpp>() {
-                Some(o) => {
-                    if !o.meta.is_empty() {
-                        self.meta
-                            .borrow_mut()
-                            .insert(o.inner.id.clone(), o.meta);
-                    }
-                    opps.push(o.inner);
-                }
-                None => self.fail("on_candle", "array item is not an opportunity".into()),
-            }
-        }
-        opps
+        self.collect_opps(out, "on_candle")
     }
 
     fn admit(&self, opp: &Opportunity, ctx: &AdmitContext<'_>) -> Decision {
@@ -758,6 +976,13 @@ impl Strategy for RhaiStrategy {
         if !self.has_bar_close {
             return;
         }
+        if let Some(scan) = &self.scan {
+            // Event-driven: only when something closed, or the script asked
+            // to be woken on every bar.
+            if !scan.0.borrow().wake_book && book.closed().is_empty() {
+                return;
+            }
+        }
         // Erase the borrow's lifetime for the duration of the call; see
         // ScriptBook::with for the invariant.
         let raw: *mut Book<'_> = book;
@@ -790,9 +1015,7 @@ fn register_api(engine: &mut Engine) {
         .register_get("c", |c: &mut Candle| c.close)
         .register_get("ts", |c: &mut Candle| ndt_secs(c.timestamp))
         .register_get("complete", |c: &mut Candle| c.complete)
-        .register_get("tf", |c: &mut Candle| -> ImmutableString {
-            tf_name(c.timeframe).to_string().into()
-        })
+        .register_get("tf", |c: &mut Candle| -> ImmutableString { tf_str(c.timeframe) })
         .register_get("asset", |c: &mut Candle| -> ImmutableString {
             asset_name(c.asset).to_string().into()
         })
@@ -1008,4 +1231,305 @@ fn register_api(engine: &mut Engine) {
     engine.register_fn("f32", |x: f64| (x as f32) as f64);
     engine.register_fn("inf", || f64::INFINITY);
     engine.register_fn("nan", || f64::NAN);
+
+    register_scanner_api(engine);
+}
+
+// ─── The native scanner ─────────────────────────────────────────────────────
+
+/// A script's handle on a [`Scanner`]. Cloning the handle shares the scanner.
+#[derive(Clone)]
+pub struct ScanHandle(pub Rc<RefCell<Scanner>>);
+
+fn dir_name(d: Direction) -> ImmutableString {
+    dir_str(d)
+}
+
+fn sweep_map(s: &liquidity::Sweep) -> Map {
+    let mut m = Map::new();
+    m.insert("level_id".into(), s.level_id.into());
+    m.insert("level_price".into(), s.level_price.into());
+    m.insert("level_source".into(), s.level_source.clone().into());
+    m.insert("level_sig".into(), s.level_sig.into());
+    m.insert("level_dir".into(), s.level_side.as_str().into());
+    m.insert("dir".into(), dir_name(s.dir).into());
+    m.insert("start_ts".into(), s.start_ts.into());
+    m.insert("extreme_ts".into(), s.extreme_ts.into());
+    m.insert("extreme_price".into(), s.extreme_price.into());
+    m.insert("magnitude_atr".into(), s.magnitude_atr.into());
+    m.insert("level_formed_at".into(), s.level_formed_at.into());
+    m
+}
+
+fn break_map(b: &liquidity::Break) -> Map {
+    let mut m = Map::new();
+    m.insert("tf".into(), tf_str(b.tf).into());
+    m.insert("ts".into(), b.ts.into());
+    m.insert("level".into(), b.level.into());
+    m.insert("dir".into(), dir_name(b.dir).into());
+    m
+}
+
+fn day_map(d: &liquidity::Day) -> Map {
+    let mut m = Map::new();
+    m.insert("day_ms".into(), d.day_ms.into());
+    m.insert("open".into(), d.open.into());
+    m.insert("high".into(), d.high.into());
+    m.insert("low".into(), d.low.into());
+    m.insert("close".into(), d.close.into());
+    m
+}
+
+fn fvg_map(f: &liquidity::Fvg) -> Map {
+    let mut m = Map::new();
+    m.insert("id".into(), f.id.into());
+    m.insert("dir".into(), dir_name(f.dir).into());
+    m.insert("tf".into(), tf_str(f.tf).into());
+    m.insert("ts".into(), f.ts.into());
+    m.insert("near".into(), f.near.into());
+    m.insert("far".into(), f.far.into());
+    m.insert("ce".into(), f.ce.into());
+    m.insert("status".into(), f.status.as_str().into());
+    m.insert("is_ifvg".into(), f.is_inverted_kind.into());
+    m.insert("c1_stop".into(), opt_f64(f.c1_stop));
+    m
+}
+
+fn level_map(scan: &Scanner, l: &liquidity::Level) -> Map {
+    let mut m = Map::new();
+    m.insert("id".into(), l.id.into());
+    m.insert("price".into(), l.price.into());
+    m.insert("dir".into(), l.side.as_str().into());
+    m.insert("source".into(), scan.source_name_owned(l).into());
+    m.insert("tf".into(), tf_str(l.tf).into());
+    m.insert("ts".into(), l.ts.into());
+    m.insert("touch".into(), l.touch.into());
+    m.insert("sig".into(), l.sig.into());
+    m.insert("last_touch".into(), l.last_touch.into());
+    m
+}
+
+fn draw_map_map(dm: &liquidity::DrawMap) -> Map {
+    let mut m = Map::new();
+    m.insert("ts".into(), dm.ts.into());
+    m.insert("price".into(), dm.price.into());
+    m.insert("atr".into(), dm.atr.into());
+    let targets: Array = dm
+        .targets
+        .iter()
+        .map(|t| {
+            let mut tm = Map::new();
+            tm.insert("level_id".into(), t.level_id.into());
+            tm.insert("price".into(), t.price.into());
+            tm.insert("direction".into(), dir_name(t.dir).into());
+            tm.insert("distance_atr".into(), t.distance_atr.into());
+            tm.insert("significance".into(), t.significance.into());
+            tm.insert("draw_score".into(), t.draw_score.into());
+            Dynamic::from_map(tm)
+        })
+        .collect();
+    m.insert("targets".into(), Dynamic::from_array(targets));
+    m
+}
+
+fn side_from_str(s: &str) -> Result<Side, Box<EvalAltResult>> {
+    Side::parse(s).ok_or_else(|| format!("level side must be \"BSL\" or \"SSL\", got {s:?}").into())
+}
+
+fn register_scanner_api(engine: &mut Engine) {
+    engine.register_type_with_name::<ScanHandle>("Scanner");
+    engine.register_fn(
+        "scanner",
+        |cfg: Map| -> Result<ScanHandle, Box<EvalAltResult>> {
+            let parsed: ScannerCfg = rhai::serde::from_dynamic(&Dynamic::from_map(cfg))
+                .map_err(|e| Box::<EvalAltResult>::from(format!("scanner config: {e}")))?;
+            Ok(ScanHandle(Rc::new(RefCell::new(Scanner::new(parsed)))))
+        },
+    );
+    engine
+        // Hook control.
+        .register_fn("wake", |s: &mut ScanHandle, tf: &str, on: bool| {
+            let id = if tf == "*" { u16::MAX } else { tf_of(tf) };
+            let mut sc = s.0.borrow_mut();
+            if on {
+                sc.wake.insert(id);
+            } else {
+                sc.wake.remove(&id);
+            }
+        })
+        .register_fn("is_awake", |s: &mut ScanHandle, tf: &str| -> bool {
+            s.0.borrow().wake.contains(&tf_of(tf))
+        })
+        .register_fn("wake_book", |s: &mut ScanHandle, on: bool| {
+            s.0.borrow_mut().wake_book = on;
+        })
+        .register_fn("candle_count", |s: &mut ScanHandle| -> i64 {
+            s.0.borrow().candle_count()
+        })
+        .register_fn("last_atr", |s: &mut ScanHandle| -> f64 { s.0.borrow().last_atr() })
+        .register_fn("stats", |s: &mut ScanHandle| -> Map {
+            let (l, la, f, fa, sg) = s.0.borrow().sizes();
+            let mut m = Map::new();
+            m.insert("levels".into(), (l as i64).into());
+            m.insert("active_levels".into(), (la as i64).into());
+            m.insert("fvgs".into(), (f as i64).into());
+            m.insert("active_fvgs".into(), (fa as i64).into());
+            m.insert("signals".into(), (sg as i64).into());
+            m
+        })
+        // Significance and levels.
+        .register_fn(
+            "significance",
+            |s: &mut ScanHandle, source: &str, tf: &str, touch: i64| -> f64 {
+                s.0.borrow_mut().significance_by_name(source, tf_of(tf), touch)
+            },
+        )
+        .register_fn(
+            "add_level",
+            |s: &mut ScanHandle,
+             price: f64,
+             side: &str,
+             source: &str,
+             tf: &str,
+             ts: i64,
+             touch: i64,
+             atr: f64|
+             -> Result<i64, Box<EvalAltResult>> {
+                let side = side_from_str(side)?;
+                Ok(s.0
+                    .borrow_mut()
+                    .add_level_named(price, side, source, tf_of(tf), ts, touch, atr))
+            },
+        )
+        .register_fn("level", |s: &mut ScanHandle, id: i64| -> Dynamic {
+            let sc = s.0.borrow();
+            match sc.level(id) {
+                Some(l) => Dynamic::from_map(level_map(&sc, l)),
+                None => Dynamic::UNIT,
+            }
+        })
+        .register_fn(
+            "levels_beyond",
+            |s: &mut ScanHandle, side: &str, price: f64, min_sig: f64| -> Result<Array, Box<EvalAltResult>> {
+                let side = side_from_str(side)?;
+                let sc = s.0.borrow();
+                Ok(sc
+                    .levels_beyond(side, price, min_sig)
+                    .into_iter()
+                    .map(|l| Dynamic::from_map(level_map(&sc, l)))
+                    .collect())
+            },
+        )
+        .register_fn("nearest_above", |s: &mut ScanHandle, price: f64| -> Dynamic {
+            opt_f64(s.0.borrow().nearest_beyond(Side::Bsl, price).map(|l| l.price))
+        })
+        .register_fn("nearest_below", |s: &mut ScanHandle, price: f64| -> Dynamic {
+            opt_f64(s.0.borrow().nearest_beyond(Side::Ssl, price).map(|l| l.price))
+        })
+        .register_fn(
+            "find_target",
+            |s: &mut ScanHandle, dir: &str, entry: f64, stop: f64, min_rr: f64, min_sig: f64|
+             -> Result<Dynamic, Box<EvalAltResult>> {
+                let d = dir_from_str(dir)?;
+                Ok(match s.0.borrow().find_target(d, entry, stop, min_rr, min_sig) {
+                    Some((price, id, rr)) => {
+                        let mut m = Map::new();
+                        m.insert("price".into(), price.into());
+                        m.insert("level_id".into(), id.into());
+                        m.insert("rr".into(), rr.into());
+                        Dynamic::from_map(m)
+                    }
+                    None => Dynamic::UNIT,
+                })
+            },
+        )
+        // Gaps.
+        .register_fn("fvg", |s: &mut ScanHandle, id: i64| -> Dynamic {
+            match s.0.borrow().fvg(id) {
+                Some(f) => Dynamic::from_map(fvg_map(f)),
+                None => Dynamic::UNIT,
+            }
+        })
+        .register_fn("fvg_status", |s: &mut ScanHandle, id: i64| -> Dynamic {
+            match s.0.borrow().fvg(id) {
+                Some(f) => f.status.as_str().into(),
+                None => Dynamic::UNIT,
+            }
+        })
+        .register_fn(
+            "fvgs_since",
+            |s: &mut ScanHandle, tf: &str, dir: &str, inverted: bool, since_ts: i64|
+             -> Result<Array, Box<EvalAltResult>> {
+                let d = dir_from_str(dir)?;
+                Ok(s.0
+                    .borrow()
+                    .fvgs_since(tf_of(tf), d, inverted, since_ts)
+                    .into_iter()
+                    .map(|f| Dynamic::from_map(fvg_map(f)))
+                    .collect())
+            },
+        )
+        .register_fn(
+            "fvg_first",
+            |s: &mut ScanHandle,
+             tf: &str,
+             dir: &str,
+             inverted: bool,
+             since_ts: i64,
+             min_gap: f64,
+             zone_lo: f64,
+             zone_hi: f64,
+             clear_from: f64,
+             min_clear: f64|
+             -> Result<Dynamic, Box<EvalAltResult>> {
+                let d = dir_from_str(dir)?;
+                Ok(match s.0.borrow().fvg_first(
+                    tf_of(tf),
+                    d,
+                    inverted,
+                    since_ts,
+                    min_gap,
+                    zone_lo,
+                    zone_hi,
+                    clear_from,
+                    min_clear,
+                ) {
+                    Some(f) => Dynamic::from_map(fvg_map(f)),
+                    None => Dynamic::UNIT,
+                })
+            },
+        )
+        // Draw map and day.
+        .register_fn("draw_bias", |s: &mut ScanHandle| -> Dynamic {
+            let mut m = Map::new();
+            match s.0.borrow().draw_bias() {
+                Some((d, conf)) => {
+                    m.insert("direction".into(), dir_name(d).into());
+                    m.insert("confidence".into(), conf.into());
+                }
+                None => {
+                    m.insert("direction".into(), Dynamic::UNIT);
+                    m.insert("confidence".into(), 0.0.into());
+                }
+            }
+            Dynamic::from_map(m)
+        })
+        .register_fn("draw_map", |s: &mut ScanHandle| -> Dynamic {
+            match s.0.borrow().draw_map() {
+                Some(dm) => Dynamic::from_map(draw_map_map(dm)),
+                None => Dynamic::UNIT,
+            }
+        })
+        .register_fn("day", |s: &mut ScanHandle| -> Dynamic {
+            match s.0.borrow().day() {
+                Some(d) => Dynamic::from_map(day_map(d)),
+                None => Dynamic::UNIT,
+            }
+        })
+        .register_fn("day_high", |s: &mut ScanHandle| -> Dynamic {
+            opt_f64(s.0.borrow().day().map(|d| d.high))
+        })
+        .register_fn("day_low", |s: &mut ScanHandle| -> Dynamic {
+            opt_f64(s.0.borrow().day().map(|d| d.low))
+        });
 }

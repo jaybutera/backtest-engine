@@ -227,12 +227,77 @@ base bar that closes them has been processed.
 
 Rhai passes arguments by value, so state is mutated through `this`
 (`this.levels.push(x)`) and helpers that mutate a sub-object are written as
-methods on it. Two things to know before trusting a script's numbers: the
+methods on it. One thing to know before trusting a script's numbers: the
 engine builds Rhai with its `unchecked` feature because the default float
 comparison is approximate (two prices a few ulps apart compare equal, which
-changes which bar a crossing fires on), and a script runs on the order of
-ten to a hundred times slower per bar than the same logic in Rust, depending
-on how much per-bar work it does.
+changes which bar a crossing fires on).
+
+### Native scanner services for scripts
+
+A script that scans its own data structures on every bar pays the
+interpreter for every element of every scan. A strategy of the
+sweep-and-retrace kind keeps a registry of a few hundred price levels and a
+few hundred fair-value gaps and walks both on every candle; written that way
+as a script, a 910k-candle run took 38 minutes where the same strategy in
+Rust took 12 seconds. The per-bar bookkeeping is not where a strategy's
+identity lives, so the engine offers it natively, parameterized by the
+script. `src/liquidity.rs` is a scanner with a level registry
+(cluster-merged, decaying, refreshed on retests), a sweep detector over it,
+a gap tracker with mitigation and inversion, session and previous-period
+levels, swing / gap / structure-break primitives, equal-high / equal-low
+clustering, a ranked draw-on-liquidity map and a UTC day tracker. Every
+table it uses (source significance, timeframe multipliers, session hours,
+caps, cadences) comes from the script.
+
+A script opts in by putting a scanner in its state and replacing
+`on_candle` with event hooks; the engine steps the scanner on every candle
+and calls the script only on bars that carry a sweep or a structure break,
+and on bars the script asked to be woken for:
+
+```rhai
+fn init(cfg) {
+    #{ scan: scanner(#{ primitives: #{ atr_period: 14, swing_lookback: 5, … },
+                        significance: #{ base: #{ pdh: 4.0, … }, … },
+                        levels: #{ cluster_atr_tolerance: 0.5, decay_candles: 300, … },
+                        sweep: #{ noise_atr: 1.0, max_multi_candle: 3 },
+                        sessions: #{ enabled: true, tz_offset_secs: -18000, sessions: [ … ] },
+                        fvg: #{ cap: 500 } }),
+       watching: [] }
+}
+
+fn on_bar(c, atr, sweeps, breaks) {       // detection, before the draw map rebuild
+    for sw in sweeps { this.watching.push(#{ sweep: sw, … }); }
+    let f = this.scan.fvg_first(c.tf, "bull", false, since_ts, 0.0, -inf(), inf(), px, atr * 0.5);
+    let t = this.scan.find_target("bull", entry, stop, 2.0, 0.0);
+    this.scan.wake(c.tf, this.watching.len() > 0);   // keep calling me on this timeframe
+    [ #{ entry: entry, stop: stop, target: t.price } ]   // candidates for emit()
+}
+
+fn emit(c, atr, cand) {                   // scoring, after the rebuild; () drops it
+    let o = opp("sweep_fvg", c.tf, "bull", c.ts);
+    o.entry = cand.entry; o.stop = cand.stop; o.target = cand.target; o.score = 3.0;
+    o
+}
+```
+
+`scripts/rhai/sweep_fvg.rhai` with `config/strategy/example_sweep.toml` is
+the bundled demonstration: a swept session or period level, the first gap
+after it, entered on the retrace, targeting the nearest opposing level. The
+queries a script has: `significance`, `add_level`, `level`,
+`levels_beyond`, `nearest_above` / `nearest_below`, `find_target`, `fvg`,
+`fvg_status`, `fvgs_since`, `fvg_first`, `draw_map`, `draw_bias`, `day`,
+`day_high` / `day_low`, `last_atr`, `candle_count`, `stats`; an `on_day(c,
+prev)` hook reports each completed UTC day; `wake_book(true)` asks for
+`on_bar_close` on every bar rather than only on bars that closed a trade.
+The module docs of `src/rhai_strategy.rs` give the exact per-candle order.
+`BACKTEST_RHAI_STATS=1` prints per-hook call counts and time at the end of a
+run, which is how to find out what a script is still paying for.
+
+With the scanner, the 38-minute strategy above runs in 11 seconds on the
+same data with the same 228 trades, the same fills and the same net result
+to the last digit; its script shrank from 2,000 lines to 1,000, and what
+remained is the part that was the strategy: which sweeps to act on, the
+entry models, the bias, the scoring, the gates, and the re-entry rule.
 
 ### Contracts and continuous futures
 

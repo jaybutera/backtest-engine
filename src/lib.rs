@@ -87,6 +87,7 @@ pub mod fees;
 pub mod hold;
 pub mod l2book;
 pub mod leverage;
+pub mod liquidity;
 pub mod models;
 pub mod paper;
 pub mod params;
