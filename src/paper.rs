@@ -1,3 +1,4 @@
+use crate::events::{BookEvent, CancelReason, ExitReason};
 use crate::fees::{self, EntryFeeSide};
 use crate::hold::{self, HoldClock, HoldTick};
 use crate::models::{
@@ -303,6 +304,14 @@ pub struct PaperTrader {
     /// [`Self::set_open_stop`]). An override replaces the planned stop for
     /// exit resolution only; the planned `|entry - stop|` stays the R unit.
     stop_overrides: HashMap<String, f64>,
+    /// Record a [`BookEvent`] for every book transition. Off by default: a
+    /// batch replay pays nothing. A streaming driver turns it on and drains
+    /// [`Self::take_events`] once per candle. Recording changes NOTHING
+    /// about how the book behaves — the same run books identical trades
+    /// with it on or off.
+    pub record_events: bool,
+    /// Undrained events, oldest first (empty unless `record_events`).
+    events: Vec<BookEvent>,
 }
 
 /// A compounding equity curve: per-trade `(opportunity_id, balance_after,
@@ -855,7 +864,29 @@ impl PaperTrader {
             pending_placed_at: HashMap::new(),
             closed_this_bar: Vec::new(),
             stop_overrides: HashMap::new(),
+            record_events: false,
+            events: Vec::new(),
         }
+    }
+
+    /// Record one book event (a no-op unless `record_events` is on).
+    fn emit(&mut self, ev: BookEvent) {
+        if self.record_events {
+            self.events.push(ev);
+        }
+    }
+
+    /// Drain every event recorded since the last call, oldest first.
+    /// Always empty unless `record_events` is on.
+    pub fn take_events(&mut self) -> Vec<BookEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Provisional trade templates of every still-resting entry limit, for
+    /// a consumer resynchronizing its own order bookkeeping (the geometry
+    /// counterpart of [`Self::pending_ids`]).
+    pub fn pending_trades(&self) -> Vec<PaperTrade> {
+        self.pending.iter().map(|pf| pf.trade.clone()).collect()
     }
 
     /// Place a resting entry order for an admitted opportunity.
@@ -883,6 +914,13 @@ impl PaperTrader {
             Decision::Take(t) => t,
             Decision::Skip(reason) => {
                 *self.skips.entry(reason.as_str().to_string()).or_insert(0) += 1;
+                self.emit(BookEvent::Skipped {
+                    opportunity_id: opp.id.clone(),
+                    asset: opp.asset,
+                    signal_type: opp.signal_type,
+                    reason: reason.as_str().to_string(),
+                    at: opp.created_at,
+                });
                 return None;
             }
         };
@@ -974,6 +1012,18 @@ impl PaperTrader {
         // close out its resting interval when it resolves.
         self.pending_placed_at
             .insert(opp.id.clone(), opp.created_at);
+
+        self.emit(BookEvent::EntryPlaced {
+            opportunity_id: opp.id.clone(),
+            asset: opp.asset,
+            signal_type: opp.signal_type,
+            direction: opp.direction,
+            entry: take.entry,
+            stop: take.stop,
+            tp: take.tp,
+            score: opp.score,
+            at: opp.created_at,
+        });
 
         self.pending.push(PendingFill {
             trade,
@@ -1070,10 +1120,10 @@ impl PaperTrader {
         self.process_pending_fills(candle);
 
         let mut still_open = Vec::new();
-        // 5th field: is_stop_exit — true only for a genuine stop-loss hit (not
-        // TP, not a timeout/de-risk close). Feeds the stop-exit gap penalty in
-        // `close_trade`.
-        let mut closes: Vec<(String, TradeResult, f64, NaiveDateTime, bool)> = Vec::new();
+        // 5th field: the exit reason. `ExitReason::Stop` is a genuine
+        // stop-loss hit (not TP, not a timeout/de-risk close) and feeds the
+        // stop-exit gap penalty in `close_trade`.
+        let mut closes: Vec<(String, TradeResult, f64, NaiveDateTime, ExitReason)> = Vec::new();
         for trade in open_trades {
             if trade.asset != candle.asset {
                 still_open.push(trade);
@@ -1098,7 +1148,7 @@ impl PaperTrader {
                     TradeResult::Inconclusive,
                     timeout_r,
                     candle.timestamp,
-                    false,
+                    ExitReason::Timeout,
                 ));
                 continue;
             }
@@ -1121,7 +1171,14 @@ impl PaperTrader {
 
                 // Track partial TP taken
                 if self.partial_tp_r > 0.0 && *wm >= self.partial_tp_r {
-                    self.partial_taken.insert(trade.opportunity_id.clone());
+                    let first = self.partial_taken.insert(trade.opportunity_id.clone());
+                    if first {
+                        self.emit(BookEvent::PartialBanked {
+                            opportunity_id: trade.opportunity_id.clone(),
+                            asset: trade.asset,
+                            at: candle.timestamp,
+                        });
+                    }
                 }
             }
 
@@ -1211,7 +1268,11 @@ impl PaperTrader {
                         result,
                         r_at_open,
                         candle.timestamp,
-                        !trail_active,
+                        if trail_active {
+                            ExitReason::TrailLock
+                        } else {
+                            ExitReason::Stop
+                        },
                     ));
                     continue;
                 }
@@ -1221,7 +1282,7 @@ impl PaperTrader {
                         TradeResult::Win,
                         r_at_open,
                         candle.timestamp,
-                        false,
+                        ExitReason::Target,
                     ));
                     continue;
                 }
@@ -1247,7 +1308,11 @@ impl PaperTrader {
                     result,
                     r_pnl,
                     candle.timestamp,
-                    !trail_active,
+                    if trail_active {
+                        ExitReason::TrailLock
+                    } else {
+                        ExitReason::Stop
+                    },
                 ));
             } else if resolve_tp {
                 closes.push((
@@ -1255,7 +1320,7 @@ impl PaperTrader {
                     TradeResult::Win,
                     win_r,
                     candle.timestamp,
-                    false,
+                    ExitReason::Target,
                 ));
             } else if self.derisk_after_min > 0
                 && risk > 0.0
@@ -1289,7 +1354,7 @@ impl PaperTrader {
                         result,
                         unreal_r,
                         candle.timestamp,
-                        false,
+                        ExitReason::Derisk,
                     ));
                 } else {
                     still_open.push(trade);
@@ -1298,8 +1363,8 @@ impl PaperTrader {
                 still_open.push(trade);
             }
         }
-        for (opp_id, result, r_pnl, closed_at, is_stop_exit) in closes {
-            self.close_trade(&opp_id, result, r_pnl, closed_at, is_stop_exit);
+        for (opp_id, result, r_pnl, closed_at, reason) in closes {
+            self.close_trade(&opp_id, result, r_pnl, closed_at, reason);
             self.watermarks.remove(&opp_id);
             self.partial_taken.remove(&opp_id);
             self.entry_fee_side.remove(&opp_id);
@@ -1374,6 +1439,12 @@ impl PaperTrader {
             // Deadline lapsed unfilled → cancel (never counted). Bar-open clock.
             if candle.timestamp > pf.deadline {
                 self.end_resting(&pf.trade.opportunity_id, candle.timestamp);
+                self.emit(BookEvent::EntryCancelled {
+                    opportunity_id: pf.trade.opportunity_id.clone(),
+                    asset: pf.trade.asset,
+                    reason: CancelReason::Deadline,
+                    at: candle.timestamp,
+                });
                 continue;
             }
             if is_signal_bar && !self.allow_signal_bar_fill {
@@ -1476,8 +1547,8 @@ impl PaperTrader {
         // to after the tick walk so an intrabar stop/TP wins over a same-bar
         // timeout (matches OHLC, where the race is checked before the count gate
         // only for the CURRENT bar — see note below).
-        // 5th field: is_stop_exit (see `update_prices_ohlc`).
-        let mut closes: Vec<(String, TradeResult, f64, NaiveDateTime, bool)> = Vec::new();
+        // 5th field: the exit reason (see `update_prices_ohlc`).
+        let mut closes: Vec<(String, TradeResult, f64, NaiveDateTime, ExitReason)> = Vec::new();
 
         // Increment hold for pre-existing open trades and short-circuit any that
         // exceed max_hold BEFORE racing (mirrors OHLC ordering: the count gate is
@@ -1501,7 +1572,7 @@ impl PaperTrader {
                     TradeResult::Inconclusive,
                     timeout_r,
                     candle.timestamp,
-                    false,
+                    ExitReason::Timeout,
                 ));
                 timed_out_ids.insert(lv.trade.opportunity_id.clone());
             }
@@ -1528,6 +1599,18 @@ impl PaperTrader {
                 trade.fill = *fill_px;
                 trade.opened_at = pf.trade.opened_at; // signal time (unchanged)
                 trade.filled_at = Some(tick.timestamp);
+                self.emit(BookEvent::EntryFilled {
+                    opportunity_id: trade.opportunity_id.clone(),
+                    asset: trade.asset,
+                    signal_type: trade.signal_type,
+                    direction: trade.direction,
+                    price: *fill_px,
+                    entry: trade.entry,
+                    stop: trade.stop,
+                    tp: trade.tp,
+                    maker: *fee_side == EntryFeeSide::Maker,
+                    at: tick.timestamp,
+                });
                 self.entry_fee_side
                     .insert(trade.opportunity_id.clone(), *fee_side);
                 self.trades.push(trade.clone());
@@ -1573,7 +1656,14 @@ impl PaperTrader {
                     *wm = favorable_r;
                 }
                 if self.partial_tp_r > 0.0 && *wm >= self.partial_tp_r {
-                    self.partial_taken.insert(trade.opportunity_id.clone());
+                    let first = self.partial_taken.insert(trade.opportunity_id.clone());
+                    if first && self.record_events {
+                        self.events.push(BookEvent::PartialBanked {
+                            opportunity_id: trade.opportunity_id.clone(),
+                            asset: trade.asset,
+                            at: tick.timestamp,
+                        });
+                    }
                 }
 
                 // Trailing stop (locks R relative to the fill) once the watermark
@@ -1628,7 +1718,11 @@ impl PaperTrader {
                         result,
                         r_pnl,
                         tick.timestamp,
-                        !trail_active,
+                        if trail_active {
+                            ExitReason::TrailLock
+                        } else {
+                            ExitReason::Stop
+                        },
                     ));
                     resolved_ids.insert(trade.opportunity_id.clone());
                 } else if hit_tp {
@@ -1638,7 +1732,7 @@ impl PaperTrader {
                         TradeResult::Win,
                         win_r,
                         tick.timestamp,
-                        false,
+                        ExitReason::Target,
                     ));
                     resolved_ids.insert(trade.opportunity_id.clone());
                 }
@@ -1687,7 +1781,7 @@ impl PaperTrader {
                         result,
                         unreal_r,
                         candle.timestamp,
-                        false,
+                        ExitReason::Derisk,
                     ));
                     resolved_ids.insert(t.opportunity_id.clone());
                 }
@@ -1695,8 +1789,8 @@ impl PaperTrader {
         }
 
         // Apply all closes (fees, partial TP, closed_at) via the shared path.
-        for (opp_id, result, r_pnl, closed_at, is_stop_exit) in closes {
-            self.close_trade(&opp_id, result, r_pnl, closed_at, is_stop_exit);
+        for (opp_id, result, r_pnl, closed_at, reason) in closes {
+            self.close_trade(&opp_id, result, r_pnl, closed_at, reason);
             self.watermarks.remove(&opp_id);
             self.partial_taken.remove(&opp_id);
             self.entry_fee_side.remove(&opp_id);
@@ -1749,6 +1843,12 @@ impl PaperTrader {
             // invalidated"): drop it, never counted anywhere.
             if candle.timestamp > pf.deadline {
                 self.end_resting(&pf.trade.opportunity_id, candle.timestamp);
+                self.emit(BookEvent::EntryCancelled {
+                    opportunity_id: pf.trade.opportunity_id.clone(),
+                    asset: pf.trade.asset,
+                    reason: CancelReason::Deadline,
+                    at: candle.timestamp,
+                });
                 continue;
             }
 
@@ -1795,16 +1895,24 @@ impl PaperTrader {
             // after a failed fill attempt → applied next bar), so a same-bar
             // touch+condition always resolves to "fill stands" (pessimistic).
             if let Some(reason) = pf.cancel_pending {
-                match reason {
+                let cancel = match reason {
                     HybridAbandon::TargetConsumed => {
-                        self.hybrid_counters.abandon_target_consumed += 1
+                        self.hybrid_counters.abandon_target_consumed += 1;
+                        CancelReason::TargetConsumed
                     }
                     HybridAbandon::SetupInvalidated => {
-                        self.hybrid_counters.abandon_setup_invalidated += 1
+                        self.hybrid_counters.abandon_setup_invalidated += 1;
+                        CancelReason::SetupInvalidated
                     }
                     _ => unreachable!("cancel_pending only carries watchdog reasons"),
-                }
+                };
                 self.end_resting(&pf.trade.opportunity_id, candle.timestamp);
+                self.emit(BookEvent::EntryCancelled {
+                    opportunity_id: pf.trade.opportunity_id.clone(),
+                    asset: pf.trade.asset,
+                    reason: cancel,
+                    at: candle.timestamp,
+                });
                 // Dropped: NO TRADE, never counted in trades/W/L/R.
                 continue;
             }
@@ -1876,6 +1984,12 @@ impl PaperTrader {
             if candle.timestamp > pf.deadline {
                 self.hybrid_counters.abandon_deadline += 1;
                 self.end_resting(&pf.trade.opportunity_id, candle.timestamp);
+                self.emit(BookEvent::EntryCancelled {
+                    opportunity_id: pf.trade.opportunity_id.clone(),
+                    asset: pf.trade.asset,
+                    reason: CancelReason::Deadline,
+                    at: candle.timestamp,
+                });
                 continue;
             }
 
@@ -1964,19 +2078,37 @@ impl PaperTrader {
                     still_pending.push(pf)
                 }
                 HybridAction::Abandon(reason) => {
-                    match reason {
-                        HybridAbandon::GapStop => self.hybrid_counters.abandon_gap_stop += 1,
-                        HybridAbandon::TpOpen => self.hybrid_counters.abandon_tp_open += 1,
-                        HybridAbandon::TpRange => self.hybrid_counters.abandon_tp_range += 1,
-                        HybridAbandon::Age => self.hybrid_counters.abandon_age += 1,
+                    let cancel = match reason {
+                        HybridAbandon::GapStop => {
+                            self.hybrid_counters.abandon_gap_stop += 1;
+                            CancelReason::GapStop
+                        }
+                        HybridAbandon::TpOpen => {
+                            self.hybrid_counters.abandon_tp_open += 1;
+                            CancelReason::TpOpen
+                        }
+                        HybridAbandon::TpRange => {
+                            self.hybrid_counters.abandon_tp_range += 1;
+                            CancelReason::TpRange
+                        }
+                        HybridAbandon::Age => {
+                            self.hybrid_counters.abandon_age += 1;
+                            CancelReason::Age
+                        }
                         // Watchdog cancels are applied at the top of the loop
                         // (from `cancel_pending`), never returned by
                         // `hybrid_fill_action`.
                         HybridAbandon::TargetConsumed | HybridAbandon::SetupInvalidated => {
                             unreachable!("watchdog cancels don't come from hybrid_fill_action")
                         }
-                    }
+                    };
                     self.end_resting(&pf.trade.opportunity_id, candle.timestamp);
+                    self.emit(BookEvent::EntryCancelled {
+                        opportunity_id: pf.trade.opportunity_id.clone(),
+                        asset: pf.trade.asset,
+                        reason: cancel,
+                        at: candle.timestamp,
+                    });
                     // Dropped: NO TRADE, never counted in trades/W/L/R.
                 }
             }
@@ -2058,10 +2190,21 @@ impl PaperTrader {
     /// not resting (already filled, expired, or never existed); it never
     /// touches open trades.
     pub fn cancel_pending_by_id(&mut self, opp_id: &str, at: NaiveDateTime) {
+        let asset = self
+            .pending
+            .iter()
+            .find(|pf| pf.trade.opportunity_id == opp_id)
+            .map(|pf| pf.trade.asset);
         let before = self.pending.len();
         self.pending.retain(|pf| pf.trade.opportunity_id != opp_id);
         if self.pending.len() != before {
             self.end_resting(opp_id, at);
+            self.emit(BookEvent::EntryCancelled {
+                opportunity_id: opp_id.to_string(),
+                asset: asset.unwrap_or(0),
+                reason: CancelReason::Driver,
+                at,
+            });
         }
     }
 
@@ -2085,6 +2228,18 @@ impl PaperTrader {
     ) {
         trade.fill = fill_px;
         trade.filled_at = Some(filled_at);
+        self.emit(BookEvent::EntryFilled {
+            opportunity_id: trade.opportunity_id.clone(),
+            asset: trade.asset,
+            signal_type: trade.signal_type,
+            direction: trade.direction,
+            price: fill_px,
+            entry: trade.entry,
+            stop: trade.stop,
+            tp: trade.tp,
+            maker: entry_side == EntryFeeSide::Maker,
+            at: filled_at,
+        });
         self.entry_fee_side
             .insert(trade.opportunity_id.clone(), entry_side);
         self.trades.push(trade.clone());
@@ -2117,10 +2272,14 @@ impl PaperTrader {
         result: TradeResult,
         r_pnl: f64,
         closed_at: NaiveDateTime,
-        is_stop_exit: bool,
+        reason: ExitReason,
     ) {
+        // Only a genuine stop-loss exit suffers the stop-gap penalty — not a
+        // target, a trailing lock, a timeout or a management close.
+        let is_stop_exit = reason == ExitReason::Stop;
         let had_partial = self.partial_taken.remove(opp_id);
         let mut closed_idx: Option<usize> = None;
+        let mut closed_event: Option<BookEvent> = None;
         for (idx, trade) in self.trades.iter_mut().enumerate() {
             if trade.opportunity_id == opp_id && trade.result == TradeResult::Inconclusive {
                 closed_idx = Some(idx);
@@ -2190,8 +2349,20 @@ impl PaperTrader {
                         (trade.r_pnl * 1000.0).round() as i64;
                 }
                 trade.closed_at = Some(closed_at);
+                closed_event = Some(BookEvent::Closed {
+                    opportunity_id: trade.opportunity_id.clone(),
+                    asset: trade.asset,
+                    reason,
+                    result: trade.result,
+                    r_pnl: trade.r_pnl,
+                    fee_r: trade.fee_r,
+                    at: closed_at,
+                });
                 break;
             }
+        }
+        if let Some(ev) = closed_event {
+            self.emit(ev);
         }
         if let Some(idx) = closed_idx {
             self.closed_this_bar.push((idx, is_stop_exit));
@@ -2353,16 +2524,20 @@ impl PaperTrader {
             } else {
                 (trade.fill - trade.stop) / risk
             };
-            Some((TradeResult::Loss, r, true))
+            Some((TradeResult::Loss, r, ExitReason::Stop))
         } else if resolve_tp {
-            Some((TradeResult::Win, (trade.tp - trade.fill).abs() / risk, false))
+            Some((
+                TradeResult::Win,
+                (trade.tp - trade.fill).abs() / risk,
+                ExitReason::Target,
+            ))
         } else {
             None
         };
         match close {
-            Some((result, r, is_stop)) => {
+            Some((result, r, reason)) => {
                 self.open_trades.remove(pos);
-                self.close_trade(opportunity_id, result, r, candle.timestamp, is_stop);
+                self.close_trade(opportunity_id, result, r, candle.timestamp, reason);
                 self.watermarks.remove(opportunity_id);
                 self.partial_taken.remove(opportunity_id);
                 self.entry_fee_side.remove(opportunity_id);
@@ -2383,28 +2558,48 @@ impl PaperTrader {
     /// `|entry - stop|` stays the R unit, so a stop moved to breakeven books a
     /// 0R exit rather than rescaling the trade. Returns `false` when no open
     /// trade has this id.
-    pub fn set_open_stop(&mut self, opportunity_id: &str, stop: f64) -> bool {
-        if !self
+    pub fn set_open_stop(&mut self, opportunity_id: &str, stop: f64, at: NaiveDateTime) -> bool {
+        let Some(asset) = self
             .open_trades
             .iter()
-            .any(|t| t.opportunity_id == opportunity_id)
-        {
+            .find(|t| t.opportunity_id == opportunity_id)
+            .map(|t| t.asset)
+        else {
             return false;
-        }
-        self.stop_overrides
+        };
+        let prev = self
+            .stop_overrides
             .insert(opportunity_id.to_string(), stop);
+        if prev != Some(stop) {
+            self.emit(BookEvent::StopMoved {
+                opportunity_id: opportunity_id.to_string(),
+                asset,
+                stop,
+                at,
+            });
+        }
         true
     }
 
     /// Move an open trade's take-profit. Applies from the next candle on.
-    pub fn set_open_tp(&mut self, opportunity_id: &str, tp: f64) -> bool {
+    pub fn set_open_tp(&mut self, opportunity_id: &str, tp: f64, at: NaiveDateTime) -> bool {
         match self
             .open_trades
             .iter_mut()
             .find(|t| t.opportunity_id == opportunity_id)
         {
             Some(t) => {
+                let changed = t.tp != tp;
+                let asset = t.asset;
                 t.tp = tp;
+                if changed {
+                    self.emit(BookEvent::TargetMoved {
+                        opportunity_id: opportunity_id.to_string(),
+                        asset,
+                        tp,
+                        at,
+                    });
+                }
                 true
             }
             None => false,
@@ -2440,7 +2635,13 @@ impl PaperTrader {
         } else {
             TradeResult::Inconclusive
         };
-        self.close_trade(&trade.opportunity_id, result, r, candle.timestamp, false);
+        self.close_trade(
+            &trade.opportunity_id,
+            result,
+            r,
+            candle.timestamp,
+            ExitReason::Management,
+        );
         self.watermarks.remove(&trade.opportunity_id);
         self.partial_taken.remove(&trade.opportunity_id);
         self.entry_fee_side.remove(&trade.opportunity_id);

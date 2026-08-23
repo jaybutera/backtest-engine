@@ -143,7 +143,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 
 use chrono::{Datelike, NaiveDateTime, TimeZone, Timelike};
 use rhai::{Array, CallFnOptions, Dynamic, Engine, EvalAltResult, ImmutableString, Map, Scope, AST};
@@ -157,8 +156,8 @@ use crate::models::{
 };
 use crate::params::{Knob, Value};
 use crate::strategy::{
-    AdmitContext, Book, BuildContext, Decision, SkipReason, Strategy, StrategyFactory,
-    TakeParams,
+    AdmitContext, Book, BuildContext, Decision, SharedSeries, SkipReason, Strategy,
+    StrategyFactory, TakeParams,
 };
 
 /// The knobs the Rhai factory adds to `[strategy]`.
@@ -380,53 +379,55 @@ impl Series {
     }
 }
 
-/// Another asset's complete series (or this asset's), read through windows
-/// that never extend past the bar currently being processed.
+/// Another asset's series (or this asset's), read through windows that
+/// never extend past the bar currently being processed. The series may be
+/// growing (a streaming driver appends bars); the clamp to `now` makes a
+/// growing series and a preloaded one indistinguishable to a script.
 #[derive(Clone)]
 pub struct MarketSeries {
-    candles: Arc<Vec<Candle>>,
+    candles: SharedSeries,
     now: Rc<Cell<i64>>,
 }
 
 impl MarketSeries {
-    /// Candles with timestamps in `(lo, hi]`, `hi` clamped to the current bar.
-    fn slice(&self, lo: i64, hi: i64) -> &[Candle] {
+    /// Run `f` over the candles with timestamps in `(lo, hi]`, `hi` clamped
+    /// to the current bar. The read lock is held only for the call.
+    fn with_slice<T>(&self, lo: i64, hi: i64, f: impl FnOnce(&[Candle]) -> T) -> T {
         let hi = hi.min(self.now.get());
-        let start = self
-            .candles
-            .partition_point(|c| c.timestamp.and_utc().timestamp() <= lo);
-        let end = self
-            .candles
-            .partition_point(|c| c.timestamp.and_utc().timestamp() <= hi);
+        let g = self.candles.read();
+        let start = g.partition_point(|c| c.timestamp.and_utc().timestamp() <= lo);
+        let end = g.partition_point(|c| c.timestamp.and_utc().timestamp() <= hi);
         if start >= end {
-            &[]
+            f(&[])
         } else {
-            &self.candles[start..end]
+            f(&g[start..end])
         }
     }
     fn count(&self, lo: i64, hi: i64) -> i64 {
-        self.slice(lo, hi).len() as i64
+        self.with_slice(lo, hi, |s| s.len() as i64)
     }
     fn lowest_low(&self, lo: i64, hi: i64) -> Dynamic {
-        let s = self.slice(lo, hi);
-        if s.is_empty() {
-            return Dynamic::UNIT;
-        }
-        Dynamic::from_float(s.iter().map(|c| c.low).fold(f64::INFINITY, f64::min))
+        self.with_slice(lo, hi, |s| {
+            if s.is_empty() {
+                return Dynamic::UNIT;
+            }
+            Dynamic::from_float(s.iter().map(|c| c.low).fold(f64::INFINITY, f64::min))
+        })
     }
     fn highest_high(&self, lo: i64, hi: i64) -> Dynamic {
-        let s = self.slice(lo, hi);
-        if s.is_empty() {
-            return Dynamic::UNIT;
-        }
-        Dynamic::from_float(
-            s.iter()
-                .map(|c| c.high)
-                .fold(f64::NEG_INFINITY, f64::max),
-        )
+        self.with_slice(lo, hi, |s| {
+            if s.is_empty() {
+                return Dynamic::UNIT;
+            }
+            Dynamic::from_float(
+                s.iter()
+                    .map(|c| c.high)
+                    .fold(f64::NEG_INFINITY, f64::max),
+            )
+        })
     }
     fn window(&self, lo: i64, hi: i64) -> Series {
-        Series::from_slice(self.slice(lo, hi))
+        self.with_slice(lo, hi, Series::from_slice)
     }
 }
 
@@ -642,7 +643,7 @@ impl RhaiStrategy {
         engine_path: Option<&Path>,
         timeframes: &[String],
         history: usize,
-        market: HashMap<String, Arc<Vec<Candle>>>,
+        market: HashMap<String, SharedSeries>,
         script_table: &toml::value::Table,
     ) -> Result<Self, Box<EvalAltResult>> {
         let mut engine = Engine::new();

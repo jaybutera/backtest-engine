@@ -381,12 +381,14 @@ impl<'a> Book<'a> {
 
     /// Move an open trade's stop; effective from the next bar.
     pub fn set_stop(&mut self, opportunity_id: &str, stop: f64) -> bool {
-        self.trader.set_open_stop(opportunity_id, stop)
+        self.trader
+            .set_open_stop(opportunity_id, stop, self.candle.timestamp)
     }
 
     /// Move an open trade's take-profit; effective from the next bar.
     pub fn set_tp(&mut self, opportunity_id: &str, tp: f64) -> bool {
-        self.trader.set_open_tp(opportunity_id, tp)
+        self.trader
+            .set_open_tp(opportunity_id, tp, self.candle.timestamp)
     }
 
     /// Close an open trade at this bar's close.
@@ -401,17 +403,58 @@ impl<'a> Book<'a> {
     }
 }
 
+/// One asset's candle series behind a shared, growable handle.
+///
+/// A batch replay loads the whole series once and never writes it again; a
+/// streaming driver appends each completed base bar as it arrives. Readers
+/// take a short read lock per query, so a series being appended between
+/// bars is safe to share. What keeps lookahead out is not this type but the
+/// clamping every consumer applies: windows never extend past the bar
+/// currently being processed, so a preloaded series and a growing one
+/// return identical slices for the same clamp.
+#[derive(Clone, Debug, Default)]
+pub struct SharedSeries(Arc<std::sync::RwLock<Vec<Candle>>>);
+
+impl SharedSeries {
+    /// Wrap a fully-loaded series (the batch case).
+    pub fn new(candles: Vec<Candle>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(candles)))
+    }
+
+    /// Append one candle. The caller keeps the series in ascending time
+    /// order — the streaming driver feeds bars in time order by contract.
+    pub fn push(&self, candle: Candle) {
+        self.0.write().expect("series lock poisoned").push(candle);
+    }
+
+    /// Read access to the whole series. Hold the guard only as long as the
+    /// read; a batch driver with no writers may hold it for a full pass.
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<Candle>> {
+        self.0.read().expect("series lock poisoned")
+    }
+
+    /// Number of candles currently in the series.
+    pub fn len(&self) -> usize {
+        self.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.read().is_empty()
+    }
+}
+
 /// Every loaded candle series of the run, by asset name, for strategies
 /// that read other assets (a sibling index for divergence, a proxy for a
-/// thin market). Shared read-only across the per-asset threads.
+/// thin market). Shared across the per-asset threads; append-only when a
+/// streaming driver is feeding it live.
 ///
-/// A strategy must not read past the bar it is being shown; the series are
-/// complete for the run, so lookahead is possible here and is the
-/// strategy's responsibility to avoid. The Rhai binding enforces it by
-/// clamping every window to the current bar.
+/// A strategy must not read past the bar it is being shown; a preloaded
+/// series makes lookahead possible here and avoiding it is the strategy's
+/// responsibility. The Rhai binding enforces it by clamping every window
+/// to the current bar.
 #[derive(Clone, Debug, Default)]
 pub struct MarketData {
-    pub series: HashMap<String, Arc<Vec<Candle>>>,
+    pub series: HashMap<String, SharedSeries>,
 }
 
 impl MarketData {
@@ -419,11 +462,11 @@ impl MarketData {
         Self::default()
     }
 
-    pub fn insert(&mut self, asset: &str, candles: Arc<Vec<Candle>>) {
+    pub fn insert(&mut self, asset: &str, candles: SharedSeries) {
         self.series.insert(asset.to_string(), candles);
     }
 
-    pub fn get(&self, asset: &str) -> Option<&Arc<Vec<Candle>>> {
+    pub fn get(&self, asset: &str) -> Option<&SharedSeries> {
         self.series.get(asset)
     }
 }

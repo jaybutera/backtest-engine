@@ -82,6 +82,7 @@
 pub mod atr;
 pub mod data;
 pub mod driver;
+pub mod events;
 pub mod example_strategy;
 pub mod fees;
 pub mod hold;
@@ -93,6 +94,7 @@ pub mod paper;
 pub mod params;
 pub mod pipeline;
 pub mod rhai_strategy;
+pub mod session;
 pub mod strategy;
 pub mod strategy_config;
 pub mod timeframe;

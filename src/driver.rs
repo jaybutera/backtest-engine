@@ -32,9 +32,8 @@ use std::time::Instant;
 
 use crate::models::{self, Candle};
 use crate::paper::{PaperTrader, TickStore};
-use crate::pipeline::Pipeline;
-use crate::strategy::{BuildContext, MarketData, Strategy, StrategyFactory};
-use crate::timeframe::TimeframeBuilder;
+use crate::session::{self, Session};
+use crate::strategy::{BuildContext, MarketData, SharedSeries, Strategy, StrategyFactory};
 use crate::{data, fees, params, strategy_config};
 
 use chrono::NaiveDateTime;
@@ -135,6 +134,14 @@ pub struct ReplayArgs {
     /// (see `data::roll_adjust`). Omitted = the strategy file's `roll_adjust`.
     #[arg(long = "roll-adjust")]
     pub roll_adjust: bool,
+
+    /// Feed every asset through ONE streaming session, candles grouped by
+    /// timestamp — the exact loop a live driver runs over a feed — instead
+    /// of one batch thread per asset. The results are identical by
+    /// construction; the flag exists so that identity can be proven on
+    /// real data (diff the two runs' sidecars).
+    #[arg(long)]
+    pub streaming: bool,
 }
 
 /// Parse the process command line and run it against these factories.
@@ -208,8 +215,68 @@ fn parse_date(s: &str, what: &str) -> NaiveDateTime {
         .unwrap()
 }
 
-fn run_replay(mut args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
-    let started = Instant::now();
+/// Everything a replay run resolves before any data loads: the factory,
+/// the validated knob bag, the fill lens, the asset list, the window
+/// bounds. A batch run and a streaming driver resolve identically —
+/// [`resolve`] is the one place the precedence chains live — and then
+/// differ only in where their candles come from.
+pub struct ResolvedReplay<'f> {
+    pub factory: &'f dyn StrategyFactory,
+    pub params: params::Params,
+    pub fill: strategy_config::ResolvedFill,
+    pub assets: Vec<String>,
+    pub sources: data::SourceMap,
+    pub data_dirs: Vec<PathBuf>,
+    pub window_start: Option<NaiveDateTime>,
+    pub window_end: Option<NaiveDateTime>,
+    /// `window_start` minus the warmup days: candles load from here, but
+    /// trades signalled before `window_start` are dropped from the report.
+    pub load_start: Option<NaiveDateTime>,
+    pub timeframes: Vec<String>,
+    pub engine_path: Option<String>,
+    pub script_table: toml::value::Table,
+    pub strategy_file: Option<PathBuf>,
+    pub roll_adjust: bool,
+    pub tick_mode: bool,
+    pub min_score: f64,
+    pub rr: f64,
+    pub max_hold: usize,
+}
+
+impl ResolvedReplay<'_> {
+    /// A fill simulator configured exactly as this run specifies. Used for
+    /// every per-asset trader and for the merged reporting trader, so the
+    /// report header can never describe a configuration different from the
+    /// one that ran.
+    pub fn build_trader(&self) -> PaperTrader {
+        let mut pt = PaperTrader::new(self.min_score, self.rr, self.max_hold);
+        apply_config(&mut pt, &self.params, &self.fill);
+        pt
+    }
+
+    /// Build one per-asset strategy instance from the run's factory.
+    pub fn build_strategy(&self, asset: &str, market: &MarketData) -> Box<dyn Strategy> {
+        self.factory.build(&BuildContext {
+            asset,
+            params: &self.params,
+            engine: self.engine_path.as_deref(),
+            timeframes: &self.timeframes,
+            strategy_file: self.strategy_file.as_deref(),
+            market,
+            script: &self.script_table,
+        })
+    }
+}
+
+/// Resolve a replay command line into a [`ResolvedReplay`]: pick the
+/// factory, load and validate the strategy and fill configs, register fee
+/// schedules and contracts, discover assets, and fix the window bounds.
+/// Everything the process-global side of a run needs (base interval, knob
+/// registry, fee tables) is in place when this returns.
+pub fn resolve<'f>(
+    mut args: ReplayArgs,
+    factories: &'f [&'f dyn StrategyFactory],
+) -> Result<ResolvedReplay<'f>, String> {
     models::set_base_interval(&args.base_interval);
 
     // ── Factory ────────────────────────────────────────────────────────────
@@ -219,15 +286,9 @@ fn run_replay(mut args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
         .config_strategy
         .as_deref()
         .and_then(|p| strategy_config::peek_strategy_factory(Path::new(p)));
-    let factory = select_factory(args.factory.as_deref(), peeked.as_deref(), factories)
-        .unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        });
-    if let Err(e) = params::register_knobs(factory.knobs()) {
-        eprintln!("error: factory \"{}\": {e}", factory.name());
-        std::process::exit(1);
-    }
+    let factory = select_factory(args.factory.as_deref(), peeked.as_deref(), factories)?;
+    params::register_knobs(factory.knobs())
+        .map_err(|e| format!("factory \"{}\": {e}", factory.name()))?;
 
     // ── Strategy config ────────────────────────────────────────────────────
     let mut resolved: Option<strategy_config::ResolvedStrategy> = None;
@@ -243,19 +304,13 @@ fn run_replay(mut args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
                 legacy.join(", ")
             );
         }
-        let r = strategy_config::load_strategy(p, strategy_config::Context::Replay).unwrap_or_else(
-            |e| {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            },
-        );
+        let r = strategy_config::load_strategy(p, strategy_config::Context::Replay)?;
         if let Some(ref name) = r.strategy_impl {
             if name != factory.name() {
-                eprintln!(
-                    "error: {path} names factory \"{name}\" but --factory selected \"{}\"",
+                return Err(format!(
+                    "{path} names factory \"{name}\" but --factory selected \"{}\"",
                     factory.name()
-                );
-                std::process::exit(1);
+                ));
             }
         }
         args.params = r.params.clone();
@@ -285,10 +340,7 @@ fn run_replay(mut args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
 
     // ── Fill lens ──────────────────────────────────────────────────────────
     let fill = match args.config_fill {
-        Some(ref path) => strategy_config::load_fill(Path::new(path)).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }),
+        Some(ref path) => strategy_config::load_fill(Path::new(path))?,
         None => strategy_config::ResolvedFill::builtin_default(),
     };
 
@@ -298,13 +350,7 @@ fn run_replay(mut args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
         .clone()
         .unwrap_or_else(|| args.params.get_str("fee_schedule"));
     if !schedule_name.is_empty() {
-        match fees::parse_schedule(&schedule_name) {
-            Ok(s) => fees::set_schedule(s),
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        }
+        fees::set_schedule(fees::parse_schedule(&schedule_name)?);
     }
 
     // ── Data discovery ─────────────────────────────────────────────────────
@@ -325,11 +371,11 @@ fn run_replay(mut args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
     };
     assets.retain(|a| !args.exclude_asset.iter().any(|x| a.contains(x.as_str())));
     if assets.is_empty() {
-        eprintln!(
-            "error: no assets to run. Point --data-dir at a directory of \
-             `{{ASSET}}_{{interval}}.parquet` files, or name assets with -a."
+        return Err(
+            "no assets to run. Point --data-dir at a directory of \
+             `{ASSET}_{interval}.parquet` files, or name assets with -a."
+                .to_string(),
         );
-        std::process::exit(1);
     }
 
     // ── Window bounds ──────────────────────────────────────────────────────
@@ -341,51 +387,6 @@ fn run_replay(mut args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
     // Warmup extends the LOAD bound backwards without moving the REPORT bound.
     let load_start = window_start.map(|s| s - chrono::Duration::days(args.warmup_days as i64));
 
-    // ── Load ───────────────────────────────────────────────────────────────
-    let tick_mode = fill.entry_fill_mode == "tick";
-    let mut asset_candles: Vec<(String, Vec<Candle>)> = Vec::new();
-    let mut asset_ticks: HashMap<String, Vec<models::Tick>> = HashMap::new();
-    for asset in &assets {
-        let candles = data::load_asset_candles_with_sources(
-            asset, &dir_refs, load_start, window_end, &sources,
-        );
-        if candles.is_empty() {
-            eprintln!("  {asset}: no candles in range, skipping");
-            continue;
-        }
-        let mut candles = candles;
-        if args.roll_adjust {
-            let n = data::roll_adjust(&mut candles, 600);
-            eprintln!(
-                "  {asset}: {} candles ({n} roll splices adjusted)",
-                candles.len()
-            );
-        } else {
-            eprintln!("  {asset}: {} candles", candles.len());
-        }
-        if tick_mode {
-            let ticks = data::load_asset_ticks(asset, &dir_refs, load_start, window_end, &sources);
-            if ticks.is_empty() {
-                eprintln!(
-                    "  {asset}: tick fill mode requested but no tick file found — \
-                     this asset falls back to bar-resolution fills"
-                );
-            } else {
-                eprintln!("  {asset}: {} ticks", ticks.len());
-                asset_ticks.insert(asset.clone(), ticks);
-            }
-        }
-        asset_candles.push((asset.clone(), candles));
-    }
-    if asset_candles.is_empty() {
-        eprintln!("error: no candles loaded for any asset in the requested range.");
-        std::process::exit(1);
-    }
-
-    let total_candles: usize = asset_candles.iter().map(|(_, c)| c.len()).sum();
-    let min_score = args.params.get_f64("min_score");
-    let rr = args.params.get_f64("rr");
-    let max_hold = args.params.get_u32("max_hold") as usize;
     // Higher timeframes: the factory's declared needs, plus any the CLI adds.
     let mut timeframes = factory.timeframes();
     for tf in &args.timeframe {
@@ -393,112 +394,116 @@ fn run_replay(mut args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
             timeframes.push(tf.clone());
         }
     }
-    let engine_path: Option<String> = resolved.as_ref().and_then(|r| r.engine.clone());
-    let script_table: toml::value::Table = resolved
-        .as_ref()
-        .map(|r| r.script.clone())
-        .unwrap_or_default();
-    let script_table = &script_table;
-    let strategy_file: Option<PathBuf> = args.config_strategy.as_ref().map(PathBuf::from);
 
-    // Every series, shared read-only with every strategy for cross-asset
-    // reads. The per-asset loops below iterate their own Arc.
-    let asset_candles: Vec<(String, std::sync::Arc<Vec<Candle>>)> = asset_candles
-        .into_iter()
-        .map(|(a, c)| (a, std::sync::Arc::new(c)))
-        .collect();
-    let mut market = MarketData::new();
-    for (a, c) in &asset_candles {
-        market.insert(a, c.clone());
+    Ok(ResolvedReplay {
+        factory,
+        min_score: args.params.get_f64("min_score"),
+        rr: args.params.get_f64("rr"),
+        max_hold: args.params.get_u32("max_hold") as usize,
+        tick_mode: fill.entry_fill_mode == "tick",
+        engine_path: resolved.as_ref().and_then(|r| r.engine.clone()),
+        script_table: resolved.map(|r| r.script).unwrap_or_default(),
+        strategy_file: args.config_strategy.as_ref().map(PathBuf::from),
+        params: args.params,
+        fill,
+        assets,
+        sources,
+        data_dirs,
+        window_start,
+        window_end,
+        load_start,
+        timeframes,
+        roll_adjust: args.roll_adjust,
+    })
+}
+
+fn run_replay(args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
+    let started = Instant::now();
+    let want_json = args.output == "json";
+    let json_sidecar = args.json_sidecar.clone();
+    let streaming = args.streaming;
+    let run = resolve(args, factories).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    });
+
+    // ── Load ───────────────────────────────────────────────────────────────
+    let (asset_candles, mut asset_ticks) = load_run_data(&run);
+    if asset_candles.is_empty() {
+        eprintln!("error: no candles loaded for any asset in the requested range.");
+        std::process::exit(1);
     }
+
+    let total_candles: usize = asset_candles.iter().map(|(_, c)| c.len()).sum();
+
+    // Every series, shared with every strategy for cross-asset reads. The
+    // per-asset loops below iterate their own handle under a read guard —
+    // nothing writes after this point.
+    let mut market = MarketData::new();
+    let asset_series: Vec<(String, SharedSeries)> = asset_candles
+        .into_iter()
+        .map(|(a, c)| {
+            let s = SharedSeries::new(c);
+            market.insert(&a, s.clone());
+            (a, s)
+        })
+        .collect();
     let market = &market;
+    let run = &run;
 
     // ── One thread per asset ───────────────────────────────────────────────
     // Scoped threads: the factory is borrowed, not `'static`, and every
-    // per-asset strategy is built on its own thread from that borrow.
-    let traders: Vec<PaperTrader> = std::thread::scope(|scope| {
-        let handles: Vec<_> = asset_candles
+    // per-asset strategy is built on its own thread from that borrow. Each
+    // thread runs a single-asset Session — the identical loop body a
+    // streaming driver runs over a live feed.
+    let traders: Vec<PaperTrader> = if streaming {
+        run_streaming(run, asset_series, &mut asset_ticks)
+    } else {
+        std::thread::scope(|scope| {
+        let handles: Vec<_> = asset_series
             .into_iter()
-            .map(|(asset_str, candles)| {
+            .map(|(asset_str, series)| {
                 let ticks = asset_ticks.remove(&asset_str).unwrap_or_default();
-                let params = args.params.clone();
-                let fill = fill.clone();
-                let timeframes = timeframes.clone();
-                let engine_path = engine_path.clone();
-                let strategy_file = strategy_file.clone();
-
                 scope.spawn(move || {
-                    let aid = models::asset_id(&asset_str);
-
-                    let mut pt = PaperTrader::new(min_score, rr, max_hold);
-                    apply_config(&mut pt, &params, &fill);
-                    if tick_mode && !ticks.is_empty() {
+                    let mut pt = run.build_trader();
+                    if run.tick_mode && !ticks.is_empty() {
                         pt.tick_store = Some(TickStore::new(ticks));
                     }
+                    let strategy = run.build_strategy(&asset_str, market);
 
-                    let strategy: Box<dyn Strategy> = factory.build(&BuildContext {
-                        asset: &asset_str,
-                        params: &params,
-                        engine: engine_path.as_deref(),
-                        timeframes: &timeframes,
-                        strategy_file: strategy_file.as_deref(),
-                        market,
-                        script: script_table,
-                    });
-                    let mut pipeline = Pipeline::new();
-                    pipeline.insert_asset(aid, strategy, TimeframeBuilder::new(&timeframes), pt);
+                    let mut session = Session::new(market.clone(), false, false);
+                    session.add_asset(&asset_str, strategy, &run.timeframes, pt);
 
-                    for candle in candles.iter() {
-                        pipeline.process_candle(candle);
+                    let guard = series.read();
+                    for candle in guard.iter() {
+                        session.push(candle);
                     }
+                    let n_candles = guard.len();
+                    drop(guard);
 
-                    let pt = pipeline.finish(aid).expect("the asset was registered");
+                    let (_, pt) = session
+                        .finish()
+                        .pop()
+                        .expect("the asset was registered");
                     eprintln!(
                         "  {asset_str} done: {} candles, {} trades",
-                        candles.len(),
-                        pt.opportunities_taken
+                        n_candles, pt.opportunities_taken
                     );
                     pt
                 })
             })
             .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("an asset thread panicked"))
-            .collect()
-    });
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("an asset thread panicked"))
+                .collect()
+        })
+    };
 
     // ── Merge ──────────────────────────────────────────────────────────────
-    let mut merged = PaperTrader::new(min_score, rr, max_hold);
-    apply_config(&mut merged, &args.params, &fill);
-    for pt in traders {
-        merged.trades.extend(pt.trades);
-        merged.opportunities_seen += pt.opportunities_seen;
-        merged.opportunities_taken += pt.opportunities_taken;
-        merged.hybrid_counters.merge(&pt.hybrid_counters);
-        merged.resting_intervals.extend(pt.resting_intervals);
-        merged.trade_ready_at.extend(pt.trade_ready_at);
-        merged.tick_resolved_bars += pt.tick_resolved_bars;
-        merged.tick_fallback_bars += pt.tick_fallback_bars;
-        merged.tick_walked += pt.tick_walked;
-        for (reason, n) in pt.skips {
-            *merged.skips.entry(reason).or_insert(0) += n;
-        }
-    }
+    let merged = session::merge_traders(run.build_trader(), traders, run.window_start);
 
-    // Warmup trades were never part of the reporting window: their signals
-    // predate it, and their only job was to populate the strategy's state.
-    if let Some(ws) = window_start {
-        let before = merged.trades.len();
-        merged.trades.retain(|t| t.opened_at >= ws);
-        let dropped = before - merged.trades.len();
-        if dropped > 0 {
-            eprintln!("Dropped {dropped} warmup trades signalled before {ws}");
-            merged.opportunities_taken = merged.trades.len();
-        }
-    }
-
-    if tick_mode {
+    if run.tick_mode {
         let seen = merged.tick_resolved_bars + merged.tick_fallback_bars;
         if seen > 0 {
             eprintln!(
@@ -521,18 +526,17 @@ fn run_replay(mut args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
     // ── Report ─────────────────────────────────────────────────────────────
     let label = format!(
         "{} | {} | {} candles",
-        factory.name(),
-        assets.join(", "),
+        run.factory.name(),
+        run.assets.join(", "),
         total_candles
     );
-    let want_json = args.output == "json";
-    let json = if want_json || args.json_sidecar.is_some() {
+    let json = if want_json || json_sidecar.is_some() {
         Some(merged.render_json(&label))
     } else {
         None
     };
 
-    if let (Some(path), Some(ref body)) = (args.json_sidecar.as_ref(), json.as_ref()) {
+    if let (Some(path), Some(ref body)) = (json_sidecar.as_ref(), json.as_ref()) {
         if let Some(parent) = Path::new(path).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -546,6 +550,106 @@ fn run_replay(mut args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
         Some(body) if want_json => println!("{body}"),
         _ => merged.render_text(&label),
     }
+}
+
+/// The `--streaming` form of a replay: one multi-asset [`Session`] over an
+/// initially EMPTY market, fed same-timestamp groups in time order — the
+/// live loop, replayed. The market grows by appending, exactly as it does
+/// on a feed, so a diff of this run's sidecar against the batch run's
+/// proves the streaming path end to end: the push loop, the market append,
+/// and the clamped cross-asset reads.
+fn run_streaming(
+    run: &ResolvedReplay<'_>,
+    asset_series: Vec<(String, SharedSeries)>,
+    asset_ticks: &mut HashMap<String, Vec<models::Tick>>,
+) -> Vec<PaperTrader> {
+    let mut market = MarketData::new();
+    for (a, _) in &asset_series {
+        market.insert(a, SharedSeries::default());
+    }
+    let mut session = Session::new(market.clone(), true, false);
+    let mut feed: Vec<Candle> = Vec::new();
+    for (asset_str, series) in &asset_series {
+        let ticks = asset_ticks.remove(asset_str).unwrap_or_default();
+        let mut pt = run.build_trader();
+        if run.tick_mode && !ticks.is_empty() {
+            pt.tick_store = Some(TickStore::new(ticks));
+        }
+        let strategy = run.build_strategy(asset_str, &market);
+        session.add_asset(asset_str, strategy, &run.timeframes, pt);
+        feed.extend(series.read().iter().cloned());
+    }
+    // Concatenated in asset order, then stably sorted by time: candles of
+    // one timestamp stay in asset registration order, the same tie-break a
+    // per-minute feed batch delivers.
+    feed.sort_by_key(|c| c.timestamp);
+    session::push_sorted(&mut session, &feed);
+    session
+        .finish()
+        .into_iter()
+        .map(|(asset, pt)| {
+            eprintln!("  {asset} done (streaming): {} trades", pt.opportunities_taken);
+            pt
+        })
+        .collect()
+}
+
+/// Load every asset's candles (and ticks, in tick mode) for a resolved
+/// run: the same sources, window, and roll adjustment whether the candles
+/// are then replayed batch or pushed through a streaming session. Assets
+/// with no candles in range are skipped with a note.
+#[allow(clippy::type_complexity)]
+pub fn load_run_data(
+    run: &ResolvedReplay<'_>,
+) -> (
+    Vec<(String, Vec<Candle>)>,
+    HashMap<String, Vec<models::Tick>>,
+) {
+    let dir_refs: Vec<&Path> = run.data_dirs.iter().map(|p| p.as_path()).collect();
+    let mut asset_candles: Vec<(String, Vec<Candle>)> = Vec::new();
+    let mut asset_ticks: HashMap<String, Vec<models::Tick>> = HashMap::new();
+    for asset in &run.assets {
+        let mut candles = data::load_asset_candles_with_sources(
+            asset,
+            &dir_refs,
+            run.load_start,
+            run.window_end,
+            &run.sources,
+        );
+        if candles.is_empty() {
+            eprintln!("  {asset}: no candles in range, skipping");
+            continue;
+        }
+        if run.roll_adjust {
+            let n = data::roll_adjust(&mut candles, 600);
+            eprintln!(
+                "  {asset}: {} candles ({n} roll splices adjusted)",
+                candles.len()
+            );
+        } else {
+            eprintln!("  {asset}: {} candles", candles.len());
+        }
+        if run.tick_mode {
+            let ticks = data::load_asset_ticks(
+                asset,
+                &dir_refs,
+                run.load_start,
+                run.window_end,
+                &run.sources,
+            );
+            if ticks.is_empty() {
+                eprintln!(
+                    "  {asset}: tick fill mode requested but no tick file found — \
+                     this asset falls back to bar-resolution fills"
+                );
+            } else {
+                eprintln!("  {asset}: {} ticks", ticks.len());
+                asset_ticks.insert(asset.clone(), ticks);
+            }
+        }
+        asset_candles.push((asset.clone(), candles));
+    }
+    (asset_candles, asset_ticks)
 }
 
 /// Build the data-source map from any `[[source]]` overrides in the config.
