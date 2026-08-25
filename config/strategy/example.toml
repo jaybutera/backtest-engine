@@ -13,7 +13,7 @@
 # registers several factories needs it (or --factory on the command line).
 factory = "macross"
 
-assets = ["EXAMPLE"]
+assets = ["ES"]
 
 # Flat per-contract fee specs, if the data is futures. Declaring any
 # [[contract]] switches the fee schedule to "futures" (or "futures_full" when

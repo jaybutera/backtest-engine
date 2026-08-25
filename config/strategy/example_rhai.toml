@@ -1,7 +1,7 @@
 # The bundled example strategy, as a Rhai script. Runs the same numbers as
 # config/strategy/example.toml through scripts/rhai/macross.rhai.
 factory = "rhai"
-assets = ["EXAMPLE"]
+assets = ["ES"]
 
 [strategy]
 script = "../../scripts/rhai/macross.rhai"

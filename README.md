@@ -3,12 +3,13 @@
 A backtest harness for intraday trading strategies, with a web UI for reading
 the results. Written in Rust; the visualizer is Python.
 
-The engine does not come with a strategy. It comes with the machinery around
-one: parquet candle loading, timeframe aggregation, a fill simulator you can
-swap between optimistic and pessimistic models, a fee schedule, R-multiple
-accounting, and a warmup-jitter ensemble runner. You supply the signal logic
-behind a small trait; the harness handles everything downstream of "I want to
-enter here, with this stop and this target."
+The engine is the machinery around a strategy: parquet candle loading,
+timeframe aggregation, a fill simulator you can swap between optimistic and
+pessimistic models, a fee schedule, R-multiple accounting, and a warmup-jitter
+ensemble runner. You supply the signal logic behind a small trait; the harness
+handles everything downstream of "I want to enter here, with this stop and
+this target." One real strategy ships with it as the demo, with the script that fetches
+the futures bars it runs on and the results it produced on them.
 
 ## Why the fill model gets its own axis
 
@@ -56,17 +57,97 @@ distribution, and the spread is often wide enough to flip a result's sign.
 ## Quick start
 
     cargo build --release
-    scripts/backtest.sh --from 2024-01-01 --to 2024-12-31
+    scripts/backtest.sh
 
-That runs the bundled example strategy over whatever candle data you have in
-`data/`, and writes `data/backtest_trades.json`. Then:
+That runs the demo strategy over `data/ES_1m.parquet`, prints the trade
+table, and writes `data/backtest_trades.json`. The bars come from Databento
+with your own key (see The demo); with no key, `uv run scripts/synth-data.py`
+writes a synthetic file and `scripts/backtest.sh -a SYNTH` runs on that.
+Then:
 
     uv run viz serve
 
 and open the printed URL to page through trades on a chart, with the equity
-curve and each trade's entry, stop, target and fill marked.
+curve and each trade's entry, stop, target and fill marked. `--from` and
+`--to` restrict the report window; `BT_STRATEGY` and `BT_FILL` pick another
+preset or lens.
+
+## The demo
+
+The demo strategy is `scripts/rhai/rsi_atr.rhai`: an RSI-ATR pullback from
+the private system this engine was extracted from, with the parameters each
+leg ran with. It aggregates the 1-minute stream into working-timeframe
+windows. At the first candle of a new window it buys when the last closed bar
+is above its EMA, RSI 14 has just re-crossed the buy level from below, and
+that bar closed up and above the previous bar's high; sells are the mirror.
+The stop sits one ATR(14) from the signal close, the target at 2.5 R, one
+position at a time. Entries are market-on-open orders;
+`config/fill/market_on_open.toml` races them against the rest of the bar and
+books a gapped exit at the open. Three legs ship as presets:
+
+| Preset | Contract | Window | EMA | RSI levels | Cooldown |
+|---|---|---|---|---|---|
+| `rsi_atr_es.toml` | E-mini S&P 500, $50/pt, $4.30 round turn | 30 min | 200 | 40 / 60 | 8 h after 2 losses |
+| `rsi_atr_nq.toml` | E-mini Nasdaq-100, $20/pt, $4.30 round turn | 15 min | 200 | 40 / 60 | none |
+| `rsi_atr_gc.toml` | COMEX gold, $100/pt, $5.30 round turn | 30 min | 100 | 35 / 65 | none |
+
+### The data
+
+The bars are continuous front-month 1-minute series from Databento's
+`GLBX.MDP3` dataset (CME Globex), schema `ohlcv-1m`, requested with parent
+symbology (`ES.FUT`, `NQ.FUT`, `GC.FUT`) and stitched unadjusted at a
+volume-based daily roll; `roll_adjust = true` in each preset removes the roll
+steps at load. Databento licenses the bars to the account that downloads
+them, so the repo ships the fetch script and not the files:
+
+    export DATABENTO_API_KEY=...
+    uv run scripts/fetch-databento.py        # ES and NQ from 2019-08-01, GC from 2010-06-06
+
+The script quotes the cost before it downloads anything. Quoted by
+Databento's `metadata.get_cost` on 2026-08-24 at the dataset's
+`ohlcv-1m` rate of $70 per GB: ES $14.52, NQ $13.17, GC $56.90 from
+2010-06-06 (or $28.73 from 2019-08-01), for the full ranges through that
+day. ES and NQ start where the reference files start, GC on the dataset's
+first day; every window runs to the day you fetch, and there is no chosen
+end date.
+
+### The results
+
+Output of the presets above on bars through 2026-08-23, fees included,
+with the commands that produce them:
+
+    scripts/backtest.sh --from 2019-09-01 --warmup-days 60
+    BT_STRATEGY=config/strategy/rsi_atr_nq.toml scripts/backtest.sh --from 2019-09-01 --warmup-days 60
+    BT_STRATEGY=config/strategy/rsi_atr_gc.toml scripts/backtest.sh --from 2010-07-01 --warmup-days 60
+
+| Leg | Report window | Candles | Trades | Win rate | Gross, R | Fees, R | Net, R | Deepest drawdown, R |
+|---|---|---|---|---|---|---|---|---|
+| ES | 2019-09-01 to 2026-08-23 | 2,492,102 | 867 | 29.9% | +36.8 | 10.1 | +26.7 | -34.9 |
+| NQ | 2019-09-01 to 2026-08-23 | 2,492,071 | 1,920 | 30.2% | +105.6 | 20.5 | +85.1 | -56.1 |
+| GC | 2010-07-01 to 2026-08-23 | 5,649,974 | 349 | 35.8% | +90.6 | 6.7 | +83.9 | -22.4 |
+
+The drawdown is the deepest fall of the cumulative net R curve from its
+running peak. The `--from` dates sit a month after the first bar so the
+indicators are seeded before the report starts; `--warmup-days` loads the
+bars before it. Refetching extends the window and the numbers move with it.
+The parameters were not fitted to these windows: they are the ones the legs
+ran with, and `scripts/sweep.py` will show you what a fit looks like. Every
+leg's win rate is around a third, which is what a 2.5 R target buys; the
+result lives in the payoff, not the hit rate, and the ensemble section is how
+to find out how much of it survives a shifted start.
+
+The demo exists to show the harness working on a real strategy. It is not a
+recommendation of the strategy.
 
 ## Supplying data
+
+Nothing in `data/` is tracked. `scripts/fetch-databento.py` fills it for the
+demo, and `--start`, `--end` and other root symbols (`SI`, `CL`, ...) fetch
+what you want from the same dataset; `--dbn` converts a batch download you
+already have. With no key, `uv run scripts/synth-data.py` writes a random-walk
+file shaped like an equity session and `scripts/backtest.sh -a SYNTH` runs on
+it. It carries no information, which is what makes it a control: a strategy
+that earns on it is fitting noise.
 
 The engine reads parquet, one file per asset per interval, named
 `data/<ASSET>_1m.parquet`. It needs five columns and resolves their names
@@ -88,8 +169,8 @@ lens resolves entries, stops and targets against real millisecond prints
 instead of guessing intrabar order. Without it, tick mode degrades to the OHLC
 model and says so.
 
-No market data ships with this repo. Most of it is licensed per-user and none
-of it is mine to redistribute.
+No market data ships with this repo. It is licensed per-user by the vendor
+and none of it can be redistributed; the fetch script is the substitute.
 
 ## Writing a strategy
 
@@ -106,9 +187,10 @@ and whatever metadata you want carried through to the report. Everything after
 that — whether the order fills, at what price, what it costs in fees, how the
 position is managed, what it earns in R — belongs to the harness.
 
-`src/example_strategy.rs` is a deliberately naive implementation included so
-the engine runs end to end out of the box. It is a demonstration of the
-interface. It is not an edge, and it is commented as such.
+`src/example_strategy.rs` is a deliberately naive moving-average crossover
+included as a demonstration of the interface and as a control for engine
+changes (`config/strategy/example.toml` runs it on the ES bars). It
+is not an edge, and it is commented as such.
 
 ### Plugging it in
 
@@ -382,17 +464,18 @@ rather than rescaling the trade.
     src/driver.rs   the replay driver: CLI, config, threads, report
     src/strategy.rs the trait, the factory seam, and the types crossing them
     src/rhai_strategy.rs  the Rhai factory and the script-facing API
-    scripts/rhai/   example scripts
+    scripts/rhai/   the demo strategy (rsi_atr.rhai) and the example scripts
     viz/            web UI (Python)
     config/fill/    fill lenses
     config/strategy/ strategy presets
-    scripts/        backtest and ensemble runners
+    scripts/        backtest and ensemble runners, the Databento fetcher,
+                    the synthetic generator, the parameter sweep
 
 ## Provenance
 
-This was extracted from a private trading system. The signal logic, its tuned
-parameters, and the research behind them stayed behind; what is here is the
-harness they ran on. Extraction was mechanical, so if you find a stray
+This was extracted from a private trading system. Most of the signal logic
+and the research behind it stayed behind; what is here is the harness it ran
+on, plus the one strategy released as the demo. Extraction was mechanical, so if you find a stray
 reference to something that is not in this repo, it is an oversight — please
 open an issue. `scripts/check-leaks.sh` runs in CI to keep that from
 happening.

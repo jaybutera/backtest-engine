@@ -1,8 +1,8 @@
 # The scanner demonstration: a swept level, the first gap after it, entered
-# on the retrace. Runs scripts/rhai/sweep_fvg.rhai on the EXAMPLE asset with
+# on the retrace. Runs scripts/rhai/sweep_fvg.rhai on the ES asset with
 # 5m and 15m bars added (pass --timeframe 5m --timeframe 15m).
 factory = "rhai"
-assets = ["EXAMPLE"]
+assets = ["ES"]
 
 [strategy]
 script = "../../scripts/rhai/sweep_fvg.rhai"

@@ -9,8 +9,8 @@
 # untouched, so per-run flags (--warmup-days, --dataset, …) ride along.
 #
 # Environment:
-#   BT_STRATEGY  strategy preset      (default: config/strategy/example.toml)
-#   BT_FILL      fill lens preset     (default: config/fill/market_hybrid.toml)
+#   BT_STRATEGY  strategy preset      (default: config/strategy/rsi_atr_es.toml)
+#   BT_FILL      fill lens preset     (default: config/fill/market_on_open.toml)
 #   BT_JSON      report path          (default: data/backtest_trades.json;
 #                                      set empty to skip writing one)
 #   BT_BIN       binary to run        (default: target/release/backtest)
@@ -22,8 +22,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
-STRATEGY="${BT_STRATEGY:-config/strategy/example.toml}"
-FILL="${BT_FILL:-config/fill/market_hybrid.toml}"
+STRATEGY="${BT_STRATEGY:-config/strategy/rsi_atr_es.toml}"
+FILL="${BT_FILL:-config/fill/market_on_open.toml}"
 
 DATE_ARGS=()
 EXTRA=()
