@@ -51,7 +51,9 @@ report "personal path"       '/home/(casper|ec2-user)'
 report "remote host"         '(ssh|scp|rsync)[[:space:]]+[a-z]+@'
 
 # ── Broker / venue integrations that do not belong in a backtest engine ────
-report "venue integration"   '\b(hyperliquid|tradovate|tradier|databento|dukascopy)\b'
+# The data vendor is not on this list: the demo's bring-your-own-key fetch
+# script (scripts/fetch-databento.py) and the README name it on purpose.
+report "venue integration"   '\b(hyperliquid|tradovate|tradier|dukascopy)\b'
 
 # ── Research output: campaign names, presets, and measured results ─────────
 report "campaign name"       '\b(rlp-?[0-9]+|kgold|daybias|nobias|kirsten|mimic|jury|smt_|reclaim_)'
