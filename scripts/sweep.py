@@ -1,16 +1,19 @@
 #!/usr/bin/env -S uv run --script
 """Run a strategy preset over a grid of [script] parameters and rank the results.
 
-    uv run scripts/sweep.py config/strategy/rsi_atr_es.toml \
+    uv run scripts/sweep.py config/strategy/rsi_atr.toml \
         --set tf_secs=900,1800,3600 --set ema_period=100,200 --set rr=2.0,2.5,3.0 \
-        --from 2019-09-01 --warmup-days 60 -- --data-dir data
+        --from 2019-09-01 -- -a ES --warmup-days 60
 
 Every combination gets its own temporary preset (the base file with the
-named `[script]` keys replaced), is run through the engine one at a time
-under `nice`, and is scored from the JSON sidecar: trades, win rate, gross
-and net R, fees, and the deepest drawdown of the cumulative net R curve.
-Arguments after `--` go to the engine untouched (`-a`, `--data-dir`,
-`--warmup-days`, ...). `--csv` writes every row for a longer look.
+named `[script]` keys replaced, in the shared table and in every
+`[script.per_asset.*]` block that sets them, so a swept key holds for every
+asset), is run through the engine one at a time under `nice`, and is scored
+from the JSON sidecar: trades, win rate, gross and net R, fees, and the
+deepest drawdown of the cumulative net R curve. Arguments after `--` go to
+the engine untouched (`-a`, `--data-dir`, `--warmup-days`, ...); a
+multi-asset preset is usually swept one leg at a time with `-a`. `--csv`
+writes every row for a longer look.
 
 This is an in-sample search. A grid's best cell is the most flattered
 number in the table, not the expected result; the ensemble runner and a
@@ -40,12 +43,13 @@ def parse_set(spec: str) -> tuple[str, list[str]]:
 
 
 def rewrite(base: str, base_dir: Path, values: dict[str, str]) -> str:
-    """Replace `key = ...` lines inside the [script] table; make the script path absolute."""
+    """Replace `key = ...` lines inside [script] and [script.per_asset.*]; make the script path absolute."""
     out, in_script, seen = [], False, set()
     for line in base.splitlines():
         m = re.match(r"\s*\[(.+)\]\s*$", line)
         if m:
-            in_script = m.group(1).strip() == "script"
+            table = m.group(1).strip()
+            in_script = table == "script" or table.startswith("script.")
         km = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
         if km and km.group(1) == "script" and not in_script:
             rel = km.group(2).strip().strip('"')

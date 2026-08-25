@@ -23,11 +23,19 @@
 // the same association order as the batch binary (parity is bit-equality,
 // not closeness).
 //
-// Nothing here is trading advice. The parameters in config/strategy/rsi_atr_*
+// Nothing here is trading advice. The parameters in config/strategy/rsi_atr.toml
 // are the ones that were traded; run the ensemble before believing a number.
 
 fn init(cfg) {
     let s = cfg.script;
+    // The preset lists every leg in one file: [script] carries the shared
+    // keys and [script.per_asset.<ASSET>] the ones this asset changes. The
+    // engine builds one instance per asset, so merge this asset's block over
+    // the shared keys. A preset without the table runs on [script] alone.
+    if "per_asset" in s && cfg.asset in s.per_asset {
+        let o = s.per_asset[cfg.asset];
+        for k in o.keys() { s[k] = o[k]; }
+    }
     let tf = s.tf_secs;
     let ema_p = s.ema_period;
     let rsi_p = s.rsi_period;

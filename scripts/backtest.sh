@@ -9,7 +9,7 @@
 # untouched, so per-run flags (--warmup-days, --dataset, …) ride along.
 #
 # Environment:
-#   BT_STRATEGY  strategy preset      (default: config/strategy/rsi_atr_es.toml)
+#   BT_STRATEGY  strategy preset      (default: config/strategy/rsi_atr.toml)
 #   BT_FILL      fill lens preset     (default: config/fill/market_on_open.toml)
 #   BT_JSON      report path          (default: data/backtest_trades.json;
 #                                      set empty to skip writing one)
@@ -22,7 +22,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
-STRATEGY="${BT_STRATEGY:-config/strategy/rsi_atr_es.toml}"
+STRATEGY="${BT_STRATEGY:-config/strategy/rsi_atr.toml}"
 FILL="${BT_FILL:-config/fill/market_on_open.toml}"
 
 DATE_ARGS=()

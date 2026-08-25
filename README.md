@@ -59,11 +59,12 @@ distribution, and the spread is often wide enough to flip a result's sign.
     cargo build --release
     scripts/backtest.sh
 
-That runs the demo strategy over `data/ES_1m.parquet`, prints the trade
-table, and writes `data/backtest_trades.json`. The bars come from Databento
-with your own key (see The demo); with no key, `uv run scripts/synth-data.py`
-writes a synthetic file and `scripts/backtest.sh -a SYNTH` runs on that.
-Then:
+That runs the demo strategy, `config/strategy/rsi_atr.toml`, on every
+contract it lists (`data/ES_1m.parquet`, `NQ`, `GC`), prints the trade table
+with a per-contract breakdown, and writes `data/backtest_trades.json`. `-a ES`
+restricts it to one leg. The bars come from Databento with your own key (see
+The demo); with no key, `uv run scripts/synth-data.py` writes a synthetic
+file and `scripts/backtest.sh -a SYNTH` runs on that. Then:
 
     uv run viz serve
 
@@ -83,20 +84,28 @@ that bar closed up and above the previous bar's high; sells are the mirror.
 The stop sits one ATR(14) from the signal close, the target at 2.5 R, one
 position at a time. Entries are market-on-open orders;
 `config/fill/market_on_open.toml` races them against the rest of the bar and
-books a gapped exit at the open. Three legs ship as presets:
+books a gapped exit at the open. The preset, `config/strategy/rsi_atr.toml`,
+lists the three contracts the strategy ran on, each with the parameters it
+ran with:
 
-| Preset | Contract | Window | EMA | RSI levels | Cooldown |
+| Asset | Contract | Window | EMA | RSI levels | Cooldown |
 |---|---|---|---|---|---|
-| `rsi_atr_es.toml` | E-mini S&P 500, $50/pt, $4.30 round turn | 30 min | 200 | 40 / 60 | 8 h after 2 losses |
-| `rsi_atr_nq.toml` | E-mini Nasdaq-100, $20/pt, $4.30 round turn | 15 min | 200 | 40 / 60 | none |
-| `rsi_atr_gc.toml` | COMEX gold, $100/pt, $5.30 round turn | 30 min | 100 | 35 / 65 | none |
+| `ES` | E-mini S&P 500, $50/pt, $4.30 round turn | 30 min | 200 | 40 / 60 | 8 h after 2 losses |
+| `NQ` | E-mini Nasdaq-100, $20/pt, $4.30 round turn | 15 min | 200 | 40 / 60 | none |
+| `GC` | COMEX gold, $100/pt, $5.30 round turn | 30 min | 100 | 35 / 65 | none |
+
+The shared keys sit in the preset's `[script]` table and each leg's changes
+in `[script.per_asset.<ASSET>]`; the engine builds one script instance per
+asset, and the script's `init()` merges its asset's block over the shared
+keys. The legs run on their own threads and the report merges their ledgers,
+with a per-asset table; `-a ES` runs one leg on its own.
 
 ### The data
 
 The bars are continuous front-month 1-minute series from Databento's
 `GLBX.MDP3` dataset (CME Globex), schema `ohlcv-1m`, requested with parent
 symbology (`ES.FUT`, `NQ.FUT`, `GC.FUT`) and stitched unadjusted at a
-volume-based daily roll; `roll_adjust = true` in each preset removes the roll
+volume-based daily roll; `roll_adjust = true` in the preset removes the roll
 steps at load. Databento licenses the bars to the account that downloads
 them, so the repo ships the fetch script and not the files:
 
@@ -113,12 +122,12 @@ end date.
 
 ### The results
 
-Output of the presets above on bars through 2026-08-23, fees included,
-with the commands that produce them:
+Output of the preset above, one leg at a time, on bars through 2026-08-23,
+fees included, with the commands that produce them:
 
-    scripts/backtest.sh --from 2019-09-01 --warmup-days 60
-    BT_STRATEGY=config/strategy/rsi_atr_nq.toml scripts/backtest.sh --from 2019-09-01 --warmup-days 60
-    BT_STRATEGY=config/strategy/rsi_atr_gc.toml scripts/backtest.sh --from 2010-07-01 --warmup-days 60
+    scripts/backtest.sh -a ES --from 2019-09-01 --warmup-days 60
+    scripts/backtest.sh -a NQ --from 2019-09-01 --warmup-days 60
+    scripts/backtest.sh -a GC --from 2010-07-01 --warmup-days 60
 
 | Leg | Report window | Candles | Trades | Win rate | Gross, R | Fees, R | Net, R | Deepest drawdown, R |
 |---|---|---|---|---|---|---|---|---|
@@ -129,7 +138,10 @@ with the commands that produce them:
 The drawdown is the deepest fall of the cumulative net R curve from its
 running peak. The `--from` dates sit a month after the first bar so the
 indicators are seeded before the report starts; `--warmup-days` loads the
-bars before it. Refetching extends the window and the numbers move with it.
+bars before it. The no-argument quick-start run covers the full range of
+every file instead, so it also counts the trades from that first month
+(ES 877, NQ 1,940, GC 350) and reports the three legs merged. Refetching
+extends the window and the numbers move with it.
 The parameters were not fitted to these windows: they are the ones the legs
 ran with, and `scripts/sweep.py` will show you what a fit looks like. Every
 leg's win rate is around a third, which is what a 2.5 R target buys; the
