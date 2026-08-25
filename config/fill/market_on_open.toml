@@ -1,0 +1,14 @@
+# Fill lens for a strategy that books its own market orders at the open
+# (`book.market_entry(#{..., at: "open"})`): the entry fills at the bar's
+# open and is raced against the rest of that bar, stop first. Exits resolve
+# on the 1m stream: a bar that opens through the stop or the target exits at
+# the open (where a resting order really fills when price jumps over it),
+# and inside an ambiguous bar the stop is assumed to have hit first.
+#
+# Optimistic about: nothing at the entry beyond the open print itself.
+# Pessimistic about: every bar that touches both stop and target is a loss.
+# No resting limits are used, so the entry-fill knobs do not apply.
+[fill]
+entry_fill_mode = "limit"
+intrabar_stop_first = true
+exit_gap_at_open = true

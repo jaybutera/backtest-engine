@@ -1,0 +1,40 @@
+# RSI-ATR pullback, COMEX gold leg, with the parameters it ran with:
+# 30-minute windows, EMA 100, RSI 14 re-crossing 35 / 65, stop one ATR(14)
+# from the signal close, target 2.5 R, no cooldown. See
+# scripts/rhai/rsi_atr.rhai for the rules.
+#
+# Data: data/GC_1m.parquet, the continuous front-month series that
+# scripts/fetch-databento.py writes (GLBX.MDP3, GC.FUT, ohlcv-1m, stitched
+# unadjusted at a volume-based daily roll). roll_adjust removes the roll gaps
+# at load. Fees are the full-size contract: $100 a point, $5.30 round turn.
+#
+#   BT_STRATEGY=config/strategy/rsi_atr_gc.toml scripts/backtest.sh --from 2010-07-01 --warmup-days 60
+factory = "rhai"
+assets = ["GC"]
+roll_adjust = true
+
+[[contract]]
+asset = "GC"
+point_value = 100.0
+round_turn = 5.30
+schedule = "futures_full"
+
+[strategy]
+script = "../../scripts/rhai/rsi_atr.rhai"
+script_history = 8
+min_score = 0.0
+rr = 2.5            # the script sets its own geometry; the engine knob is required
+max_hold = 4000000000   # no hold timeout: exits are the stop and the target
+fees = true
+
+[script]
+tf_secs = 1800
+ema_period = 100
+rsi_period = 14
+rsi_buy = 35.0
+rsi_sell = 65.0
+atr_period = 14
+sl_atr_mult = 1.0
+rr = 2.5
+cooldown_losses = 0
+cooldown_hours = 0.0

@@ -1,0 +1,40 @@
+# RSI-ATR pullback, E-mini Nasdaq-100 leg, with the parameters it ran with:
+# 15-minute windows, EMA 200, RSI 14 re-crossing 40 / 60, stop one ATR(14)
+# from the signal close, target 2.5 R, no cooldown. See
+# scripts/rhai/rsi_atr.rhai for the rules.
+#
+# Data: data/NQ_1m.parquet, the continuous front-month series that
+# scripts/fetch-databento.py writes (GLBX.MDP3, NQ.FUT, ohlcv-1m, stitched
+# unadjusted at a volume-based daily roll). roll_adjust removes the roll gaps
+# at load. Fees are the full-size contract: $20 a point, $4.30 round turn.
+#
+#   BT_STRATEGY=config/strategy/rsi_atr_nq.toml scripts/backtest.sh --from 2019-09-01 --warmup-days 60
+factory = "rhai"
+assets = ["NQ"]
+roll_adjust = true
+
+[[contract]]
+asset = "NQ"
+point_value = 20.0
+round_turn = 4.30
+schedule = "futures_full"
+
+[strategy]
+script = "../../scripts/rhai/rsi_atr.rhai"
+script_history = 8
+min_score = 0.0
+rr = 2.5            # the script sets its own geometry; the engine knob is required
+max_hold = 4000000000   # no hold timeout: exits are the stop and the target
+fees = true
+
+[script]
+tf_secs = 900
+ema_period = 200
+rsi_period = 14
+rsi_buy = 40.0
+rsi_sell = 60.0
+atr_period = 14
+sl_atr_mult = 1.0
+rr = 2.5
+cooldown_losses = 0
+cooldown_hours = 0.0
