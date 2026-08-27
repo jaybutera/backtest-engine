@@ -2013,3 +2013,134 @@ mod window_tests {
         assert_eq!(w.first_pivot(true, 2, 3, 11), Some((4, 7.0)));
     }
 }
+
+/// A script's take-profit must survive the trip to the fill simulator whether
+/// or not the script also defines `admit`.
+///
+/// The two admission paths used to disagree: a script with its own `admit`
+/// could read `o.target` and hand it back through `take(...)`, while a script
+/// without one fell through to `default_admit`, which projected the take-profit
+/// from the `rr` knob and dropped the target on the floor. Nothing warned; the
+/// run just tested a different strategy than the one that was written.
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+    use crate::models::asset_id;
+    use crate::paper::PaperTrader;
+    use crate::pipeline::Pipeline;
+    use crate::timeframe::TimeframeBuilder;
+    use tempfile::TempDir;
+
+    /// The script emits one long on its first candle: entry 100, stop 98, and
+    /// a target of 107 that no reward:risk multiple would produce (the run's
+    /// `rr` of 2.0 would project 104).
+    const EMIT: &str = r#"
+        fn on_candle(c) {
+            if this.fired { return (); }
+            this.fired = true;
+            let o = opp("test_long", "1m", "bull", c.ts);
+            o.score = 5.0;
+            o.entry = 100.0;
+            o.stop = 98.0;
+            o.target = 107.0;
+            [o]
+        }
+    "#;
+
+    const INIT: &str = r#"
+        fn init(cfg) {
+            #{ fired: false }
+        }
+    "#;
+
+    /// `admit` reads the target the script stamped and passes it through.
+    const ADMIT: &str = r#"
+        fn admit(o, ctx) {
+            take(o.entry, o.stop, o.target)
+        }
+    "#;
+
+    fn candle(asset: u16, min: i64, o: f64, h: f64, l: f64, c: f64) -> Candle {
+        Candle {
+            asset,
+            timeframe: crate::models::base_tf_id(),
+            timestamp: chrono::DateTime::from_timestamp(min * 60, 0)
+                .unwrap()
+                .naive_utc(),
+            open: o,
+            high: h,
+            low: l,
+            close: c,
+            volume: 1.0,
+            complete: true,
+        }
+    }
+
+    /// Build a strategy from `body`, run it over two bars, and return the tp of
+    /// the single trade it opened.
+    fn tp_of_the_only_trade(name: &str, body: &str) -> f64 {
+        let _ = crate::params::register_knobs(RHAI_KNOBS);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("s.rhai");
+        std::fs::write(&path, body).unwrap();
+
+        let aid = asset_id(name);
+        let s = RhaiStrategy::new(
+            &path,
+            name,
+            &crate::params::Params::new(),
+            None,
+            &[],
+            50,
+            HashMap::new(),
+            &toml::value::Table::new(),
+        )
+        .unwrap();
+
+        let mut p: Pipeline<RhaiStrategy> = Pipeline::new();
+        // rr_target 2.0: a derived tp would land at 104, the script's at 107.
+        p.insert_asset(
+            aid,
+            s,
+            TimeframeBuilder::new(&[]),
+            PaperTrader::new(0.0, 2.0, 300),
+        );
+
+        // Bar 1 emits and rests the entry; bar 2 trades down through 100 and
+        // fills it.
+        p.process_candle(&candle(aid, 0, 101.0, 101.5, 100.8, 101.0));
+        p.process_candle(&candle(aid, 1, 101.0, 101.2, 99.5, 100.5));
+
+        let trades = &p.traders[&aid].trades;
+        assert_eq!(trades.len(), 1, "expected exactly one trade");
+        trades[0].tp
+    }
+
+    #[test]
+    fn a_script_target_survives_without_an_admit_function() {
+        let tp = tp_of_the_only_trade("RHAI_TGT_NOADMIT", &format!("{INIT}{EMIT}"));
+        assert!(
+            (tp - 107.0).abs() < 1e-9,
+            "the script asked for 107; got {tp} (an rr-derived tp is 104)"
+        );
+    }
+
+    #[test]
+    fn the_two_admission_paths_agree_on_the_target() {
+        let without = tp_of_the_only_trade("RHAI_TGT_A", &format!("{INIT}{EMIT}"));
+        let with = tp_of_the_only_trade("RHAI_TGT_B", &format!("{INIT}{EMIT}{ADMIT}"));
+        assert_eq!(with, without, "defining admit must not change the target");
+    }
+
+    /// A script that never mentions `o.target` still gets the take-profit the
+    /// run's reward:risk knob projects: entry 100, stop 98, rr 2 gives 104.
+    #[test]
+    fn an_untouched_target_still_comes_from_the_rr_knob() {
+        let body = format!("{INIT}{}", EMIT.replace("o.target = 107.0;", ""));
+        let tp = tp_of_the_only_trade("RHAI_TGT_RR", &body);
+        assert!(
+            (tp - 104.0).abs() < 1e-9,
+            "expected the rr-derived 104, got {tp}"
+        );
+    }
+}
