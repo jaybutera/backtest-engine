@@ -574,12 +574,14 @@ pub trait StrategyFactory: Send + Sync {
 /// 2. Take the entry and stop from the opportunity's own geometry (see
 ///    [`Opportunity::entry_stop`]); reject if it carries none, or if the two
 ///    are equal.
-/// 3. Project the take-profit `ctx.rr_target` risk-multiples beyond the entry,
-///    in the trade's direction.
+/// 3. Take the take-profit from [`Opportunity::target`] when the strategy set
+///    one, otherwise project it `ctx.rr_target` risk-multiples beyond the
+///    entry, in the trade's direction.
 ///
 /// The result is checked for coherence before it is returned, so a strategy
-/// that stamps a nonsensical entry/stop pair gets an `InvalidGeometry` skip
-/// rather than a trade the fill simulator cannot account for.
+/// that stamps a nonsensical entry/stop pair, or a target on the wrong side of
+/// the entry, gets an `InvalidGeometry` skip rather than a trade the fill
+/// simulator cannot account for.
 pub fn default_admit(opp: &Opportunity, ctx: &AdmitContext<'_>) -> Decision {
     if opp.score < ctx.min_score {
         return Decision::Skip(SkipReason::BelowMinScore);
@@ -591,9 +593,14 @@ pub fn default_admit(opp: &Opportunity, ctx: &AdmitContext<'_>) -> Decision {
     if !risk.is_finite() || risk <= 0.0 {
         return Decision::Skip(SkipReason::NonPositiveRisk);
     }
-    let tp = match opp.direction {
-        Direction::Bull => entry + ctx.rr_target * risk,
-        Direction::Bear => entry - ctx.rr_target * risk,
+    // An explicit target wins: a strategy that named a price meant that price,
+    // not one derived from the run's reward:risk knob.
+    let tp = match opp.target {
+        Some(t) => t,
+        None => match opp.direction {
+            Direction::Bull => entry + ctx.rr_target * risk,
+            Direction::Bear => entry - ctx.rr_target * risk,
+        },
     };
     let take = TakeParams { entry, stop, tp };
     if !take.is_valid(opp.direction) {
@@ -667,6 +674,28 @@ mod tests {
             Decision::Take(t) => assert!((t.tp - 95.0).abs() < 1e-12),
             Decision::Skip(r) => panic!("expected a take, got {}", r.as_str()),
         }
+    }
+
+    /// An explicit target overrides the projection. A strategy that names a
+    /// price (a swing high, the far side of a gap) meant that price, and the
+    /// run's `rr` knob does not get to overwrite it.
+    #[test]
+    fn default_admit_prefers_an_explicit_target_over_the_rr_projection() {
+        let ctx = AdmitContext::new(0.0, 2.0);
+        let mut o = opp(Direction::Bull, 10.0, 100.0, 98.0);
+        o.target = Some(107.0); // rr 2 would have projected 104
+        match default_admit(&o, &ctx) {
+            Decision::Take(t) => assert!((t.tp - 107.0).abs() < 1e-12),
+            Decision::Skip(r) => panic!("expected a take, got {}", r.as_str()),
+        }
+        // A target on the wrong side of the entry is incoherent, not a silent
+        // fallback to the projection.
+        let mut bad = opp(Direction::Bull, 10.0, 100.0, 98.0);
+        bad.target = Some(99.0);
+        assert!(matches!(
+            default_admit(&bad, &ctx),
+            Decision::Skip(SkipReason::InvalidGeometry)
+        ));
     }
 
     #[test]
