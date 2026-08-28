@@ -191,6 +191,9 @@ pub fn merge_traders(
         merged.tick_resolved_bars += pt.tick_resolved_bars;
         merged.tick_fallback_bars += pt.tick_fallback_bars;
         merged.tick_walked += pt.tick_walked;
+        merged.exec_reanchored += pt.exec_reanchored;
+        merged.exec_dropped_no_bar += pt.exec_dropped_no_bar;
+        merged.exec_dropped_marketable += pt.exec_dropped_marketable;
         for (reason, n) in pt.skips {
             *merged.skips.entry(reason).or_insert(0) += n;
         }

@@ -58,6 +58,53 @@ impl TickStore {
     }
 }
 
+/// One asset's execution-venue 1m candles, indexed by bar-open minute.
+///
+/// Split-feed runs carry one of these per asset. Lookup is by exact minute:
+/// the execution venue either printed a bar for the minute a decision filled
+/// or it did not (holiday, maintenance halt, a session the venue is closed
+/// for while the 24/7 decision feed keeps trading). There is deliberately no
+/// nearest-bar tolerance — a trade the venue could not have taken must drop
+/// out of the book, not fill at a price from some other minute.
+#[derive(Debug, Clone, Default)]
+pub struct ExecSeries {
+    by_minute: HashMap<i64, Candle>,
+}
+
+impl ExecSeries {
+    pub fn new(candles: &[Candle]) -> Self {
+        let mut by_minute = HashMap::with_capacity(candles.len());
+        for c in candles {
+            by_minute.insert(c.timestamp.and_utc().timestamp(), c.clone());
+        }
+        Self { by_minute }
+    }
+
+    pub fn at(&self, ts: NaiveDateTime) -> Option<&Candle> {
+        self.by_minute.get(&ts.and_utc().timestamp())
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_minute.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_minute.is_empty()
+    }
+}
+
+/// Why a split-feed trade never reached the execution venue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecDropReason {
+    /// The execution venue printed no bar for the fill minute.
+    NoExecBar,
+    /// The re-anchored bracket came out marketable (stop or target already
+    /// through the fill). The live mirror flattens and refuses these rather
+    /// than sending a bracket that would fire instantly.
+    BracketMarketable,
+}
+
+
 /// The fill simulator and trade ledger: everything that happens to an order
 /// after a strategy decides to place it.
 ///
@@ -146,6 +193,25 @@ pub struct PaperTrader {
     /// existing resting-limit population (`decide()` → `pending`); only the fill
     /// timing/price is taken from ticks. See `update_prices_tick`.
     pub tick_fill: bool,
+    /// SPLIT-FEED execution book: minute-indexed execution-venue candles per
+    /// asset. Empty = single-feed (the ordinary case), and every code path
+    /// below behaves exactly as before.
+    ///
+    /// When present the run models the live Tradovate mirror: the strategy
+    /// decides on the decision feed (HL), and at the moment a decision fills
+    /// the trade is re-anchored onto the execution feed (CME) — a market
+    /// order at the execution venue's price, with the stop/target carried
+    /// across as DELTAS from the decision entry, which is exactly what
+    /// cancels the HL↔CME basis. See `reanchor_to_exec`.
+    pub exec_book: HashMap<u16, ExecSeries>,
+    /// Tick size per asset for the execution contract, used to round the
+    /// re-anchored bracket the way the venue does. Absent = no rounding.
+    pub exec_tick: HashMap<u16, f64>,
+    /// Split-feed bookkeeping: trades re-anchored onto the execution venue,
+    /// and those the venue could not have taken.
+    pub exec_reanchored: usize,
+    pub exec_dropped_no_bar: usize,
+    pub exec_dropped_marketable: usize,
     /// Per-asset tick stream + monotonic cursor. `Some` only when `tick_fill` is
     /// on AND a tick file existed for this asset; `None` → tick mode silently
     /// degrades to the OHLC path for every bar.
@@ -827,6 +893,12 @@ impl PaperTrader {
             hybrid_fill: false,
             // Tick fill model OFF by default → OHLC behavior unchanged.
             tick_fill: false,
+            // Split-feed OFF by default → single-feed behavior unchanged.
+            exec_book: HashMap::new(),
+            exec_tick: HashMap::new(),
+            exec_reanchored: 0,
+            exec_dropped_no_bar: 0,
+            exec_dropped_marketable: 0,
             tick_store: None,
             tick_fallback_bars: 0,
             tick_resolved_bars: 0,
@@ -2219,6 +2291,56 @@ impl PaperTrader {
     /// Book a filled entry limit: record the fill price + entry-fee side, push to
     /// `trades`/`open_trades`, count it taken, and start its race NEXT candle
     /// (hold_counts starts at 0; this candle isn't raced). Shared by both models.
+    /// Re-anchor a decision-feed trade onto the execution venue, the way
+    /// `tv_mirror.rs` does it live: market in at the execution venue, read the
+    /// fill back, then attach the bracket at `fill + (stop − entry)` /
+    /// `fill + (tp − entry)`. Carrying the legs as DELTAS rather than absolute
+    /// levels is what cancels the basis between the two feeds — the live
+    /// mirror's F1 pattern, and the reason it can trade CME off an HL signal
+    /// without a CME market-data feed.
+    ///
+    /// Returns `Err` when the venue could not have taken the trade at all, so
+    /// the caller drops it instead of booking a fill that never existed.
+    fn reanchor_to_exec(
+        &self,
+        trade: &PaperTrade,
+        filled_at: NaiveDateTime,
+    ) -> Result<(f64, f64, f64), ExecDropReason> {
+        let series = self
+            .exec_book
+            .get(&trade.asset)
+            .expect("reanchor_to_exec called for an asset with no exec series");
+        let bar = series.at(filled_at).ok_or(ExecDropReason::NoExecBar)?;
+
+        // The mirror sends a MARKET order the moment the paper book fills and
+        // reads its own fill back. The execution bar's open is the price that
+        // minute starts at, which is the closest a 1m book can stand to "the
+        // next print after the decision" without inventing intrabar detail.
+        let exec_fill = bar.open;
+        let tick = self.exec_tick.get(&trade.asset).copied().unwrap_or(0.0);
+        let round = |px: f64| {
+            if tick > 0.0 {
+                (px / tick).round() * tick
+            } else {
+                px
+            }
+        };
+        let stop = round(exec_fill + (trade.stop - trade.entry));
+        let tp = round(exec_fill + (trade.tp - trade.entry));
+
+        // The live mirror refuses a bracket whose legs are already through the
+        // fill and flattens instead — never send an order that fires on
+        // arrival. Same rule here, so the book cannot book a free win.
+        let ok = match trade.direction {
+            Direction::Bull => stop < exec_fill && tp > exec_fill,
+            Direction::Bear => stop > exec_fill && tp < exec_fill,
+        };
+        if !ok {
+            return Err(ExecDropReason::BracketMarketable);
+        }
+        Ok((exec_fill, stop, tp))
+    }
+
     fn book_fill(
         &mut self,
         mut trade: PaperTrade,
@@ -2226,6 +2348,47 @@ impl PaperTrader {
         entry_side: EntryFeeSide,
         filled_at: NaiveDateTime,
     ) {
+        // SPLIT-FEED: the decision came from the decision feed; the money is
+        // made or lost on the execution venue. Rewrite the trade into
+        // execution-venue price terms HERE, at the single funnel every fill
+        // mode passes through, so every downstream consumer — exits, R math,
+        // fees, the ledger — sees one consistent set of prices and needs no
+        // split-feed awareness of its own.
+        if !self.exec_book.is_empty() {
+            match self.reanchor_to_exec(&trade, filled_at) {
+                Ok((exec_fill, stop, tp)) => {
+                    // `entry` becomes the execution fill: R is measured in
+                    // execution-venue points, which is what the account
+                    // actually risks. R_planned = |entry − stop| stays the
+                    // divisor everywhere downstream, unchanged.
+                    trade.entry = exec_fill;
+                    trade.stop = stop;
+                    trade.tp = tp;
+                    self.exec_reanchored += 1;
+                }
+                Err(reason) => {
+                    match reason {
+                        ExecDropReason::NoExecBar => self.exec_dropped_no_bar += 1,
+                        ExecDropReason::BracketMarketable => self.exec_dropped_marketable += 1,
+                    }
+                    self.end_resting(&trade.opportunity_id, filled_at);
+                    self.emit(BookEvent::EntryCancelled {
+                        opportunity_id: trade.opportunity_id.clone(),
+                        asset: trade.asset,
+                        reason: CancelReason::Deadline,
+                        at: filled_at,
+                    });
+                    return;
+                }
+            }
+        }
+        let fill_px = if self.exec_book.is_empty() {
+            fill_px
+        } else {
+            // Market entry at the venue: the fill IS the entry, no resting
+            // limit and so no maker fill to preserve.
+            trade.entry
+        };
         trade.fill = fill_px;
         trade.filled_at = Some(filled_at);
         self.emit(BookEvent::EntryFilled {
@@ -2789,6 +2952,13 @@ impl PaperTrader {
             self.opportunities_seen
         );
         println!("\x1b[1mTrades taken:\x1b[0m {}", self.opportunities_taken);
+        if self.exec_reanchored + self.exec_dropped_no_bar + self.exec_dropped_marketable > 0 {
+            println!(
+                "\x1b[1mSplit feed:\x1b[0m {} re-anchored onto the execution venue, \
+                 {} dropped (no venue bar), {} dropped (bracket marketable)",
+                self.exec_reanchored, self.exec_dropped_no_bar, self.exec_dropped_marketable
+            );
+        }
         println!();
 
         let decided = self.wins() + self.losses();
@@ -4930,5 +5100,184 @@ mod fill_model_tests {
         pt.update_prices(&candle(1, 100.5, 100.8, 99.8, 100.2));
         assert_eq!(pt.trades.len(), 1, "fill stands with the watchdog off");
         assert_eq!(pt.hybrid_counters.abandon_setup_invalidated, 0);
+    }
+}
+
+#[cfg(test)]
+mod split_feed_tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn ts(min: i64) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 8, 21)
+            .unwrap()
+            .and_hms_opt(13, 29, 0)
+            .unwrap()
+            + chrono::Duration::minutes(min)
+    }
+
+    fn exec_candle(min: i64, o: f64) -> Candle {
+        Candle {
+            asset: 0,
+            timeframe: 0,
+            open: o,
+            high: o + 5.0,
+            low: o - 5.0,
+            close: o,
+            volume: 0.0,
+            timestamp: ts(min),
+            complete: true,
+        }
+    }
+
+    fn trader_with_exec(candles: &[Candle], tick: f64) -> PaperTrader {
+        let mut pt = PaperTrader::new(0.0, 2.0, 100);
+        pt.exec_book.insert(0, ExecSeries::new(candles));
+        pt.exec_tick.insert(0, tick);
+        pt
+    }
+
+    fn trade(entry: f64, stop: f64, tp: f64, direction: Direction) -> PaperTrade {
+        PaperTrade {
+            opportunity_id: "t1".into(),
+            signal_type: 0,
+            asset: 0,
+            timeframe: 0,
+            direction,
+            entry,
+            stop,
+            tp,
+            fill: entry,
+            score: 10.0,
+            opened_at: ts(0),
+            filled_at: None,
+            closed_at: None,
+            result: TradeResult::Inconclusive,
+            r_pnl: 0.0,
+            fee_r: 0.0,
+        }
+    }
+
+    /// The re-anchor reproduces a real `tv_mirror.jsonl` record.
+    ///
+    /// From the live idx-tv journal, 2026-08-21 (xyz:SP500 → ESU6): the paper
+    /// book entered long at 7670.9 with stop 7663.9, and the mirror's own CME
+    /// fill came back at 7691.0 — a basis of 20.1. It then journaled
+    /// `sl: 7684.0`, i.e. 7691.0 + (7663.9 − 7670.9), the stop carried across
+    /// as a DELTA. Feed the same numbers in and the same bracket must come out.
+    #[test]
+    fn reanchor_reproduces_live_mirror_bracket() {
+        let pt = trader_with_exec(&[exec_candle(0, 7691.0)], 0.25);
+        let t = trade(7670.9, 7663.9, 7690.15, Direction::Bull);
+
+        let (fill, stop, tp) = pt.reanchor_to_exec(&t, ts(0)).expect("venue had a bar");
+
+        assert_eq!(fill, 7691.0, "market entry fills at the venue bar's open");
+        assert_eq!(stop, 7684.0, "stop carried as a delta, matching journaled sl");
+        // tp delta 19.25 → 7710.25, the journal's `tp_anchored`.
+        assert_eq!(tp, 7710.25, "target carried as a delta, matching tp_anchored");
+        // The basis moved both legs together, so risk is preserved exactly.
+        assert!(
+            ((fill - stop) - (t.entry - t.stop)).abs() < 1e-9,
+            "carrying deltas preserves the risk unit across the basis"
+        );
+    }
+
+    /// A silver record from the same journal, on a contract whose tick is
+    /// 0.005 — the rounding path, and a much smaller basis.
+    #[test]
+    fn reanchor_rounds_to_the_execution_contract_tick() {
+        let pt = trader_with_exec(&[exec_candle(0, 69.155)], 0.005);
+        let t = trade(69.126, 68.869, 69.83275, Direction::Bull);
+
+        let (fill, stop, tp) = pt.reanchor_to_exec(&t, ts(0)).unwrap();
+
+        assert_eq!(fill, 69.155);
+        // 69.155 + (68.869 − 69.126) = 68.898 → rounds to the 0.005 grid.
+        assert_eq!(stop, 68.9, "journaled sl for this trade");
+        // Every level sits on the venue's tick grid.
+        for px in [stop, tp] {
+            assert!(
+                ((px / 0.005).round() * 0.005 - px).abs() < 1e-9,
+                "{px} is off the 0.005 tick grid"
+            );
+        }
+    }
+
+    /// Shorts carry the same way, with the legs on the opposite sides.
+    #[test]
+    fn reanchor_handles_shorts() {
+        let pt = trader_with_exec(&[exec_candle(0, 100.0)], 0.0);
+        let t = trade(90.0, 95.0, 80.0, Direction::Bear);
+
+        let (fill, stop, tp) = pt.reanchor_to_exec(&t, ts(0)).unwrap();
+
+        assert_eq!(fill, 100.0);
+        assert_eq!(stop, 105.0, "stop above the fill for a short");
+        assert_eq!(tp, 90.0, "target below the fill for a short");
+    }
+
+    /// A minute the execution venue never printed is not tradeable. The 24/7
+    /// decision feed has bars through CME's maintenance break and weekend;
+    /// those decisions must leave the book rather than fill at some other
+    /// minute's price.
+    #[test]
+    fn no_execution_bar_drops_the_trade() {
+        let pt = trader_with_exec(&[exec_candle(0, 100.0)], 0.0);
+        let t = trade(90.0, 85.0, 100.0, Direction::Bull);
+
+        // minute 5 has no execution bar
+        assert_eq!(
+            pt.reanchor_to_exec(&t, ts(5)),
+            Err(ExecDropReason::NoExecBar)
+        );
+    }
+
+    /// When the basis is wider than the stop distance, the carried bracket
+    /// lands through the fill. The live mirror refuses to send such an order
+    /// and flattens; the book must drop the trade, never book a free win.
+    #[test]
+    fn marketable_bracket_is_refused() {
+        // Decision entry 100 stop 99 (1 point of risk), but the venue fills
+        // at 100 while the target is only 0.5 away — carried tp lands under
+        // the fill for a long, i.e. instantly marketable.
+        let pt = trader_with_exec(&[exec_candle(0, 100.0)], 0.0);
+        let mut t = trade(100.0, 99.0, 100.5, Direction::Bull);
+        t.tp = 99.5; // target below entry for a long: invalid geometry
+        assert_eq!(
+            pt.reanchor_to_exec(&t, ts(0)),
+            Err(ExecDropReason::BracketMarketable)
+        );
+    }
+
+    /// Single-feed runs are untouched: no exec book means book_fill behaves
+    /// exactly as it always did.
+    #[test]
+    fn empty_exec_book_leaves_prices_alone() {
+        let mut pt = PaperTrader::new(0.0, 2.0, 100);
+        let t = trade(90.0, 85.0, 100.0, Direction::Bull);
+        pt.book_fill(t, 90.0, EntryFeeSide::Maker, ts(0));
+
+        let booked = &pt.trades[0];
+        assert_eq!(booked.entry, 90.0);
+        assert_eq!(booked.stop, 85.0);
+        assert_eq!(booked.tp, 100.0);
+        assert_eq!(pt.exec_reanchored, 0);
+    }
+
+    /// End to end through book_fill: the booked trade carries execution-venue
+    /// prices, and R is measured in venue points.
+    #[test]
+    fn book_fill_rewrites_the_trade_into_venue_prices() {
+        let mut pt = trader_with_exec(&[exec_candle(0, 7691.0)], 0.25);
+        let t = trade(7670.9, 7663.9, 7690.15, Direction::Bull);
+        pt.book_fill(t, 7670.9, EntryFeeSide::Maker, ts(0));
+
+        assert_eq!(pt.exec_reanchored, 1);
+        let booked = &pt.trades[0];
+        assert_eq!(booked.entry, 7691.0, "entry is the venue fill");
+        assert_eq!(booked.fill, 7691.0, "fill follows the venue, not the feed");
+        assert_eq!(booked.stop, 7684.0);
+        assert_eq!(booked.tp, 7710.25);
     }
 }

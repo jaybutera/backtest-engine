@@ -70,6 +70,14 @@ struct StrategyFile {
     /// keep the default behavior, backed by `{asset}_{interval}.parquet`.
     #[serde(default)]
     source: Vec<SourceEntry>,
+    /// Optional EXECUTION feed overrides (`[[exec_source]]` tables), same shape
+    /// as `[[source]]`. Declaring any of these turns the run into a SPLIT-FEED
+    /// replay: the strategy decides on the `[[source]]` series (the feed the
+    /// live trader watches) while fills, stops and targets resolve on these
+    /// series (the venue it actually trades). Absent = single-feed, the
+    /// ordinary case, and nothing about the run changes.
+    #[serde(default)]
+    exec_source: Vec<SourceEntry>,
     /// The raw `[strategy]` table. Validated by `Params::from_table`, not serde.
     #[serde(default)]
     strategy: toml::value::Table,
@@ -413,6 +421,10 @@ pub struct ResolvedStrategy {
     /// Config-driven data-source overrides, one per asset that declares a
     /// `[[source]]`. Empty when none are declared (loader uses defaults).
     pub sources: Vec<AssetSource>,
+    /// Execution-feed overrides (`[[exec_source]]`). Empty = single-feed. When
+    /// non-empty the run is split-feed: decisions come from `sources`, fills
+    /// and exits from these. See `driver::run_replay`.
+    pub exec_sources: Vec<AssetSource>,
     /// The validated knob bag — the single carrier for everything a
     /// `[strategy]` table can set. Handed verbatim to whatever consumes the
     /// preset, so there is no second place a knob has to be wired up.
@@ -566,6 +578,9 @@ fn merge(into: &mut StrategyFile, child: StrategyFile) {
     if !child.source.is_empty() {
         into.source = child.source;
     }
+    if !child.exec_source.is_empty() {
+        into.exec_source = child.exec_source;
+    }
     // `[strategy]` keys: child's keys win, per key. This is the whole of what
     // the old 70-line `take!(field);` wall did — the generic form needs no
     // per-knob line, so adding a knob costs nothing here.
@@ -697,6 +712,16 @@ pub fn load_strategy(path: &Path, context: Context) -> Result<ResolvedStrategy, 
             offset: e.offset,
         })
         .collect();
+    let exec_sources: Vec<AssetSource> = acc
+        .exec_source
+        .into_iter()
+        .map(|e| AssetSource {
+            asset: e.asset,
+            files: e.files,
+            scale: e.scale,
+            offset: e.offset,
+        })
+        .collect();
 
     let contracts: Vec<ContractSpecEntry> = acc
         .contract
@@ -747,6 +772,15 @@ pub fn load_strategy(path: &Path, context: Context) -> Result<ResolvedStrategy, 
     // a config that prices its assets per contract does not also have to say
     // so twice. A mixed declaration (some full-size, some micro) picks the
     // full-size schedule only if every contract is full-size.
+    // Which feed prices the run: the venue actually traded. Under split-feed
+    // the decision series is a different instrument class (HL perps) from the
+    // one that fills, so the execution sources are what the fee model must
+    // follow — otherwise a CME-executing run would be charged perp bps.
+    let fee_basis: &[AssetSource] = if exec_sources.is_empty() {
+        &sources
+    } else {
+        &exec_sources
+    };
     if !params.is_set("fee_schedule") {
         let inferred = if !contracts.is_empty() {
             if contracts.iter().all(|c| c.schedule == "futures_full") {
@@ -754,9 +788,9 @@ pub fn load_strategy(path: &Path, context: Context) -> Result<ResolvedStrategy, 
             } else {
                 "futures"
             }
-        } else if sources_use_futures(&sources) {
+        } else if sources_use_futures(fee_basis) {
             "futures"
-        } else if sources_use_futures_full(&sources) {
+        } else if sources_use_futures_full(fee_basis) {
             "futures_full"
         } else {
             "perp"
@@ -771,6 +805,7 @@ pub fn load_strategy(path: &Path, context: Context) -> Result<ResolvedStrategy, 
         contracts,
         roll_adjust: acc.roll_adjust.unwrap_or(false),
         sources,
+        exec_sources,
         params,
         script: acc.script,
     })

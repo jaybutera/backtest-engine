@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::models::{self, Candle};
-use crate::paper::{PaperTrader, TickStore};
+use crate::paper::{self, PaperTrader, TickStore};
 use crate::session::{self, Session};
 use crate::strategy::{BuildContext, MarketData, SharedSeries, Strategy, StrategyFactory};
 use crate::{data, fees, params, strategy_config};
@@ -226,6 +226,10 @@ pub struct ResolvedReplay<'f> {
     pub fill: strategy_config::ResolvedFill,
     pub assets: Vec<String>,
     pub sources: data::SourceMap,
+    /// Split-feed execution sources (`[[exec_source]]`). Empty = single-feed.
+    pub exec_sources: data::SourceMap,
+    /// True when the config declared any `[[exec_source]]`.
+    pub split_feed: bool,
     pub data_dirs: Vec<PathBuf>,
     pub window_start: Option<NaiveDateTime>,
     pub window_end: Option<NaiveDateTime>,
@@ -358,6 +362,8 @@ pub fn resolve<'f>(
     let dir_refs: Vec<&Path> = data_dirs.iter().map(|p| p.as_path()).collect();
 
     let sources = build_source_map(&resolved);
+    let exec_sources = build_exec_source_map(&resolved);
+    let split_feed = !exec_sources.is_empty();
     let mut assets: Vec<String> = if args.asset.is_empty() {
         let mut found: Vec<String> = data::discover_parquet_files(&dir_refs)
             .into_iter()
@@ -408,6 +414,8 @@ pub fn resolve<'f>(
         fill,
         assets,
         sources,
+        exec_sources,
+        split_feed,
         data_dirs,
         window_start,
         window_end,
@@ -436,6 +444,50 @@ fn run_replay(args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
 
     let total_candles: usize = asset_candles.iter().map(|(_, c)| c.len()).sum();
 
+    // ── Split-feed execution book ──────────────────────────────────────────
+    // Loaded over the SAME window as the decision feed so a trade filling at
+    // the very end of the run still finds its execution bar. Missing assets
+    // are a hard error: silently replaying an asset on its decision feed
+    // while its siblings execute on the venue would mix two price worlds in
+    // one book and there would be no sign of it in the output.
+    if run.split_feed && run.tick_mode {
+        eprintln!(
+            "error: tick fill mode cannot be combined with a split feed — the \
+             execution venue is replayed from 1m bars, so there are no \
+             execution-side ticks to resolve fills against."
+        );
+        std::process::exit(1);
+    }
+    let exec_book: HashMap<String, paper::ExecSeries> = if run.split_feed {
+        let dir_refs: Vec<&Path> = run.data_dirs.iter().map(|p| p.as_path()).collect();
+        let mut book = HashMap::new();
+        for asset in &run.assets {
+            if run.exec_sources.sources_for(asset).is_empty() {
+                continue;
+            }
+            let candles = data::load_asset_candles_with_sources(
+                asset,
+                &dir_refs,
+                run.load_start,
+                run.window_end,
+                &run.exec_sources,
+            );
+            if candles.is_empty() {
+                eprintln!(
+                    "error: split-feed run has no execution candles for {asset} \
+                     — check its [[exec_source]] stems and the data dirs."
+                );
+                std::process::exit(1);
+            }
+            eprintln!("  {asset}: {} execution candles", candles.len());
+            book.insert(asset.clone(), paper::ExecSeries::new(&candles));
+        }
+        book
+    } else {
+        HashMap::new()
+    };
+    let exec_book = &exec_book;
+
     // Every series, shared with every strategy for cross-asset reads. The
     // per-asset loops below iterate their own handle under a read guard —
     // nothing writes after this point.
@@ -457,7 +509,7 @@ fn run_replay(args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
     // thread runs a single-asset Session — the identical loop body a
     // streaming driver runs over a live feed.
     let traders: Vec<PaperTrader> = if streaming {
-        run_streaming(run, asset_series, &mut asset_ticks)
+        run_streaming(run, asset_series, &mut asset_ticks, exec_book)
     } else {
         std::thread::scope(|scope| {
         let handles: Vec<_> = asset_series
@@ -468,6 +520,13 @@ fn run_replay(args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
                     let mut pt = run.build_trader();
                     if run.tick_mode && !ticks.is_empty() {
                         pt.tick_store = Some(TickStore::new(ticks));
+                    }
+                    if let Some(ex) = exec_book.get(&asset_str) {
+                        pt.exec_book
+                            .insert(models::asset_id(&asset_str), ex.clone());
+                        if let Some(tick) = exec_tick_for(run, &asset_str) {
+                            pt.exec_tick.insert(models::asset_id(&asset_str), tick);
+                        }
                     }
                     let strategy = run.build_strategy(&asset_str, market);
 
@@ -562,6 +621,7 @@ fn run_streaming(
     run: &ResolvedReplay<'_>,
     asset_series: Vec<(String, SharedSeries)>,
     asset_ticks: &mut HashMap<String, Vec<models::Tick>>,
+    exec_book: &HashMap<String, paper::ExecSeries>,
 ) -> Vec<PaperTrader> {
     let mut market = MarketData::new();
     for (a, _) in &asset_series {
@@ -574,6 +634,12 @@ fn run_streaming(
         let mut pt = run.build_trader();
         if run.tick_mode && !ticks.is_empty() {
             pt.tick_store = Some(TickStore::new(ticks));
+        }
+        if let Some(ex) = exec_book.get(asset_str) {
+            pt.exec_book.insert(models::asset_id(asset_str), ex.clone());
+            if let Some(tick) = exec_tick_for(run, asset_str) {
+                pt.exec_tick.insert(models::asset_id(asset_str), tick);
+            }
         }
         let strategy = run.build_strategy(asset_str, &market);
         session.add_asset(asset_str, strategy, &run.timeframes, pt);
@@ -652,11 +718,55 @@ pub fn load_run_data(
     (asset_candles, asset_ticks)
 }
 
+/// Execution-contract tick size for an asset, derived LITERALLY from its
+/// first `[[exec_source]]` stem — the same rule the live mirror uses to pick
+/// a contract (`tv_mirror.rs`, `Product::from_root`): the stem names the
+/// product, so `ES` rounds to the full-size E-mini tick and `MES` to the
+/// micro's. Both classes of a product share a tick size; what differs is the
+/// dollar multiplier, which the fee/contract tables already carry.
+///
+/// Unknown stems return None and the bracket is left unrounded rather than
+/// rounded to a guess.
+fn exec_tick_for(run: &ResolvedReplay<'_>, asset: &str) -> Option<f64> {
+    let stem = run
+        .exec_sources
+        .sources_for(asset)
+        .first()
+        .map(|s| s.stem.clone())?;
+    let root = stem.trim_start_matches('M');
+    Some(match root {
+        // index futures quote in quarter points
+        "ES" | "NQ" => 0.25,
+        // COMEX metals
+        "GC" => 0.1,
+        "SI" | "SIL" => 0.005,
+        // NYMEX crude
+        "CL" => 0.01,
+        _ => return None,
+    })
+}
+
 /// Build the data-source map from any `[[source]]` overrides in the config.
 fn build_source_map(resolved: &Option<strategy_config::ResolvedStrategy>) -> data::SourceMap {
+    source_map_from(resolved.as_ref().map(|r| r.sources.as_slice()).unwrap_or(&[]))
+}
+
+/// Build the execution-feed map from any `[[exec_source]]` overrides.
+fn build_exec_source_map(
+    resolved: &Option<strategy_config::ResolvedStrategy>,
+) -> data::SourceMap {
+    source_map_from(
+        resolved
+            .as_ref()
+            .map(|r| r.exec_sources.as_slice())
+            .unwrap_or(&[]),
+    )
+}
+
+fn source_map_from(entries: &[strategy_config::AssetSource]) -> data::SourceMap {
     let mut map = data::SourceMap::new();
-    if let Some(r) = resolved {
-        for s in &r.sources {
+    {
+        for s in entries {
             let sources: Vec<data::DataSource> = s
                 .files
                 .iter()
