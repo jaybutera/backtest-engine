@@ -402,7 +402,7 @@ struct SourceInfo {
     draw_sig: Option<f64>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Sources {
     infos: Vec<SourceInfo>,
     by_name: HashMap<String, u16>,
@@ -621,7 +621,7 @@ pub struct BarEvents {
 
 // ─── Session state ──────────────────────────────────────────────────────────
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SessionState {
     current_date: Option<chrono::NaiveDate>,
     current_week: Option<u32>,
@@ -638,6 +638,7 @@ struct SessionState {
     open_mark_date: Vec<Option<chrono::NaiveDate>>,
 }
 
+#[derive(Clone)]
 struct EqState {
     count: i64,
     highs: VecDeque<f64>,
@@ -649,6 +650,7 @@ struct EqState {
 // ─── The scanner ────────────────────────────────────────────────────────────
 
 /// All services, stepped once per candle. See the module docs.
+#[derive(Clone)]
 pub struct Scanner {
     cfg: ScannerCfg,
     base_tf: u16,
@@ -2268,6 +2270,44 @@ impl Scanner {
         }
     }
 
+    /// Discard every derived detector state and re-derive it by replaying
+    /// `tape` — the trailing window of raw candles, in ARRIVAL order — into a
+    /// fresh scanner on the same config.
+    ///
+    /// Age horizons bound how OLD a surviving object may be; they do not make
+    /// the surviving SET a function of recent data alone. A level born 80 days
+    /// ago that accumulated six touches and absorbed two cluster neighbours
+    /// sits inside a 90-day age bound and is still unreconstructible by a run
+    /// that only saw the last 30 days. That is why two warmup depths take
+    /// different trades. Re-deriving from raw candles closes the gap: after a
+    /// rebuild the state is a pure function of (trailing K bars, config), so
+    /// any two runs whose tapes agree hold identical state.
+    ///
+    /// Doing it through a real `Scanner` rather than a bespoke re-derivation is
+    /// deliberate — it is correct by construction and cannot drift from the
+    /// live pipeline, because it IS the live pipeline.
+    ///
+    /// Arrival order matters and a timestamp sort would be wrong: an HTF
+    /// composite carries its PERIOD-START stamp, so sorting would feed a 4h bar
+    /// before the 1m bars it was built from and the replay would not reproduce
+    /// the live interleave.
+    ///
+    /// `wake` / `wake_book` are strategy-set arming bits, not bar-derived
+    /// state, so they are carried across rather than re-derived — a fresh
+    /// scanner starts with them empty, which would silently mute every
+    /// `on_bar(wake)` hook the script had registered.
+    pub fn rebuild_from(&mut self, tape: &[Candle]) {
+        let mut fresh = Scanner::new(self.cfg.clone());
+        for c in tape {
+            let ev = fresh.process(c);
+            fresh.rebuild_draw(c, &ev);
+            fresh.after_hooks(c, ev.atr);
+        }
+        fresh.wake = std::mem::take(&mut self.wake);
+        fresh.wake_book = self.wake_book;
+        *self = fresh;
+    }
+
     pub fn candle_count(&self) -> i64 {
         self.candle_count
     }
@@ -2496,6 +2536,162 @@ mod tests {
         sc.candle_count = 1000;
         sc.after_hooks(&candle(180, 1.0, 1.0, 1.0, 1.0), 1.0);
         assert!(sc.levels.is_empty(), "pruned on the cadence");
+    }
+
+    /// `cfg()` decays a level in two bars, which is right for the decay tests
+    /// and useless for an invariance test: nothing survives long enough to
+    /// carry a warmup difference. This is the same config with the deployed
+    /// preset's horizons (500-candle decay, maintenance on the real cadence).
+    fn cfg_long() -> ScannerCfg {
+        let mut c = cfg();
+        c.levels.decay_candles = 500.0;
+        c.levels.decay_every = 10;
+        c.levels.prune_every = 50;
+        c.levels.cluster_atr_tolerance = 0.3;
+        c.primitives.atr_period = 14;
+        c.primitives.swing_lookback = 5;
+        if let Some(d) = c.draw.as_mut() {
+            d.every = 15;
+        }
+        c
+    }
+
+    /// A synthetic tape with structure: a drifting sine with a widening range,
+    /// so swings, gaps, levels and sweeps all actually fire.
+    fn tape(from_min: i64, to_min: i64) -> Vec<Candle> {
+        let mut out = Vec::new();
+        for i in from_min..to_min {
+            let t = i as f64;
+            // Irrational-ratio periods, so the series never repeats: a
+            // periodic fixture would leave the deep prefix indistinguishable
+            // from the shallow one and the control test would have no teeth.
+            let mid = 100.0
+                + (t / 37.0).sin() * 5.0
+                + (t / 311.7).sin() * 12.0
+                + (t / 1013.3).sin() * 25.0;
+            let w = 0.15 + ((t / 53.0).cos() * 0.1).abs();
+            let o = mid + (t / 7.0).sin() * w;
+            let c = mid + (t / 11.0).cos() * w;
+            out.push(candle(i * 60, o, o.max(c) + w, o.min(c) - w, c));
+        }
+        out
+    }
+
+    /// Everything a rebuild is meant to make reproducible, as a comparable
+    /// string: the level registry, the gap store and the draw map.
+    fn fingerprint(sc: &Scanner) -> String {
+        let mut s = String::new();
+        let mut levels: Vec<&Level> = sc.levels.iter().filter(|l| l.status == Status::Active).collect();
+        levels.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap().then(a.ts.cmp(&b.ts)));
+        for l in levels {
+            s.push_str(&format!(
+                "L {:.6} {} {} {} {} {:.6}\n",
+                l.price,
+                l.side.as_str(),
+                sc.source_name(l.source),
+                l.tf,
+                l.touch,
+                l.sig
+            ));
+        }
+        // The whole gap store, not just the active index: a script asks
+        // `fvgs_since` / `fvg_status` about gaps by id, so a store that holds
+        // 420 gaps in one run and 186 in the other is two different books.
+        for f in &sc.fvgs {
+            s.push_str(&format!(
+                "F {} {:?} {} {:.6} {:.6} {:?}\n",
+                f.ts, f.dir, f.tf, f.near, f.far, f.status
+            ));
+        }
+        for g in &sc.signals {
+            s.push_str(&format!("S {:?} {} {} {:.6}\n", g.kind, g.tf, g.ts, g.level));
+        }
+        if let Some(d) = &sc.draw_map {
+            for t in &d.targets {
+                s.push_str(&format!("D {:.6} {:?} {:.6}\n", t.price, t.dir, t.draw_score));
+            }
+        }
+        s
+    }
+
+    /// The property the rebuild exists for: two scanners that start at
+    /// different times, and so warm up to different depths, hold IDENTICAL
+    /// derived state once both have rebuilt past the same horizon.
+    ///
+    /// Age horizons alone do not give this. A level born outside the shallow
+    /// run's window that accumulated touches and absorbed cluster neighbours
+    /// survives its age bound in the deep run and is unreconstructible by the
+    /// shallow one, so the two disagree about which levels exist at all — and
+    /// a level that exists in one book and not the other is a trade taken in
+    /// one book and not the other.
+    #[test]
+    fn rebuild_makes_state_warmup_invariant() {
+        let window = &tape(0, 60 * 24 * 40);
+        let deep = &tape(-60 * 24 * 40, 0);
+
+        let mut shallow = Scanner::new(cfg_long());
+        shallow.rebuild_from(window);
+
+        let mut warm = Scanner::new(cfg_long());
+        for c in deep {
+            let ev = warm.process(c);
+            warm.rebuild_draw(c, &ev);
+            warm.after_hooks(c, ev.atr);
+        }
+        // Twice the history at the moment of the rebuild, same trailing window.
+        warm.rebuild_from(window);
+
+        assert_eq!(
+            fingerprint(&warm),
+            fingerprint(&shallow),
+            "a rebuild from the same trailing window must erase the warmup difference"
+        );
+        assert!(
+            !fingerprint(&shallow).is_empty(),
+            "the fixture must actually build state, or the comparison is vacuous"
+        );
+    }
+
+    /// The control: without the rebuild the same two runs DISAGREE, so the
+    /// test above is not passing on an empty or trivially equal state.
+    #[test]
+    fn without_rebuild_state_is_not_warmup_invariant() {
+        let window = &tape(0, 60 * 24 * 40);
+        let deep = &tape(-60 * 24 * 40, 0);
+
+        let step = |sc: &mut Scanner, cs: &[Candle]| {
+            for c in cs {
+                let ev = sc.process(c);
+                sc.rebuild_draw(c, &ev);
+                sc.after_hooks(c, ev.atr);
+            }
+        };
+        let mut shallow = Scanner::new(cfg_long());
+        step(&mut shallow, window);
+        let mut warm = Scanner::new(cfg_long());
+        step(&mut warm, deep);
+        step(&mut warm, window);
+
+        assert_ne!(
+            fingerprint(&warm),
+            fingerprint(&shallow),
+            "control: warmup depth must still move the state without a rebuild"
+        );
+    }
+
+    /// The rebuild is a swap, and `wake` / `wake_book` are strategy-set arming
+    /// bits rather than bar-derived state. A fresh scanner starts with them
+    /// clear, which would silently park every timeframe the script had armed.
+    #[test]
+    fn rebuild_carries_the_wake_bits_across() {
+        let mut sc = Scanner::new(cfg_long());
+        sc.wake.insert(tf_id("1m"));
+        sc.wake.insert(tf_id("1h"));
+        sc.wake_book = true;
+        sc.rebuild_from(&tape(0, 500));
+        assert!(sc.wake.contains(&tf_id("1m")));
+        assert!(sc.wake.contains(&tf_id("1h")));
+        assert!(sc.wake_book);
     }
 
     #[test]

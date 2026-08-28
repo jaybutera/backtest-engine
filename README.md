@@ -54,6 +54,35 @@ several warmup offsets and reports the median and spread:
 Use it for any number you plan to believe. A single run is a sample from a
 distribution, and the spread is often wide enough to flip a result's sign.
 
+### Or make the start date stop mattering
+
+The ensemble measures the spread. A strategy using the native scanner can
+remove it instead, with two knobs under `[strategy]`:
+
+    rebuild_from_scratch_days = 35     # trailing window a rebuild replays
+    rebuild_interval_hours    = 168    # how often it fires
+
+The engine keeps a trailing tape of the raw candles it fed the script, and on
+that cadence it discards the scanner's derived state and re-derives it by
+replaying the tape into a fresh one. From the first rebuild on, the state is a
+pure function of (trailing window, config), so two runs warmed up past
+`days + interval` hold identical state and take identical trades.
+
+Why age limits alone do not do this: they bound how OLD a surviving level or
+gap may be, not what the surviving SET is. A level born 80 days ago that
+accumulated touches and absorbed cluster neighbours sits inside a 90-day age
+bound and is still unreconstructible by a run that started 30 days ago.
+
+Both knobs default to off and a knob-off run replays byte-identically, so
+turning them on is the only thing that changes a result.
+
+Two caveats. A rebuild renumbers native ids, so a script holding one across
+bars (an FVG id it is waiting on, say) should define `on_rebuild(ts)` and drop
+what it holds; `wake` and `wake_book` are carried across for you. And the
+scanner is not the only place a strategy accumulates — if the script itself
+keeps an unbounded window, bounding that is its own job, and the run's warmup
+has to clear whichever horizon is longer.
+
 ## Quick start
 
     cargo build --release

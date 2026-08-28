@@ -90,6 +90,42 @@
 //! sub-object is written as a method and called on it
 //! (`this.registry.add(lvl)` with `fn add(lvl) { this.levels.push(lvl) }`).
 //!
+//! # Warmup invariance: rebuilding the scanner from scratch
+//!
+//! A backtest's start date is an arbitrary choice, and for a strategy that
+//! accumulates detector state it is load-bearing: two runs that differ only in
+//! when they started take different trades, forever, and no single run is
+//! citable. Age horizons do not fix this. They bound how OLD a surviving
+//! level or gap may be; they do not make the surviving SET a function of
+//! recent data. A level born 80 days ago that accumulated touches and absorbed
+//! cluster neighbours sits inside a 90-day age bound and is still
+//! unreconstructible by a run that started 30 days ago.
+//!
+//! `rebuild_from_scratch_days` under `[strategy]` closes that gap. The engine
+//! keeps a trailing tape of the raw candles it fed the script, and every
+//! `rebuild_interval_hours` it discards the native scanner's derived state and
+//! re-derives it by replaying that tape into a fresh [`Scanner`]
+//! ([`Scanner::rebuild_from`]). From the first rebuild on, the state is a pure
+//! function of (trailing window, config), so two runs warmed past
+//! `days + interval` hold identical state and take identical trades.
+//!
+//! Both knobs default to off, and a knob-off run replays byte-identically.
+//!
+//! The cadence runs on wall-clock buckets and on base bars only. Wall-clock so
+//! the rebuild's own phase is warmup-invariant — a cadence counted in bars
+//! would leave two runs a half-interval out of step. Base bars only because an
+//! HTF composite carries its PERIOD-START timestamp, so the bar stream is not
+//! monotonic across timeframes and bucketing on every candle fires several
+//! rebuilds on one boundary, from several different tapes.
+//!
+//! A script that holds native ids across bars should define `on_rebuild(ts)`.
+//! Native ids are positional — a gap's id is its index in the store — so a
+//! rebuilt scanner renumbers them and a carried id silently points at a
+//! different gap. `wake` / `wake_book` are carried across the swap by the
+//! engine, so no timeframe is parked by a rebuild.
+//!
+//! Set `BACKTEST_REBUILD_TRACE=1` to print each rebuild with its tape size.
+//!
 //! # Script shape: at window boundaries
 //!
 //! A strategy that decides once per bar of its own timeframe puts one or
@@ -173,6 +209,18 @@ pub static RHAI_KNOBS: &[Knob] = &[
         U32,
         Value::U32(500),
         "Completed bars of history kept per timeframe for the script's `hist()` calls."
+    ),
+    knob!(
+        "rebuild_from_scratch_days",
+        F64,
+        Value::F64(0.0),
+        "Trailing window of raw candles, in days, that a periodic rebuild replays into a fresh native scanner. Makes detector state a pure function of (trailing window, config), so two warmup depths converge. 0 = off."
+    ),
+    knob!(
+        "rebuild_interval_hours",
+        F64,
+        Value::F64(168.0),
+        "Cadence of the rebuild, in hours, on wall-clock buckets so its phase is warmup-invariant. Ignored when `rebuild_from_scratch_days` is 0."
     ),
 ];
 
@@ -597,8 +645,27 @@ pub struct RhaiStrategy {
     has_on_bar: bool,
     has_emit: bool,
     has_on_day: bool,
+    /// Whether the script defines `on_rebuild(ts)`, called after the native
+    /// scanner is rebuilt so the script can drop native ids it was holding.
+    has_on_rebuild: bool,
     /// The native scanner the script put in its state under `scan`, if any.
     scan: Option<ScanHandle>,
+    /// Trailing raw-candle tape the periodic rebuild replays, in ARRIVAL
+    /// order (the order `on_candle` saw them: a 1m bar, then the HTF
+    /// composites that bar completed). Empty and never appended to when the
+    /// rebuild is off, so knob-off runs pay nothing for it.
+    tape: RefCell<VecDeque<Candle>>,
+    /// Trailing window the rebuild replays, in seconds. 0 = rebuild off.
+    rebuild_window_secs: i64,
+    /// Cadence of the rebuild, in seconds.
+    rebuild_interval_secs: i64,
+    /// Wall-clock bucket of the last rebuild. `None` until the first candle;
+    /// the first bucket turn is consumed to seed it, so no run ever rebuilds
+    /// from a partial tape.
+    rebuild_bucket: Cell<i64>,
+    /// Timestamp of the first candle this strategy ever saw. The rebuild is
+    /// held off until a full window has accrued.
+    first_ts: Cell<i64>,
     /// Native window aggregators found in the state (top-level values), in
     /// key order. Stepped on every base candle before the script runs.
     windows: Vec<WinHandle>,
@@ -720,6 +787,7 @@ impl RhaiStrategy {
         let has_emit = has_fn("emit");
         let has_on_day = has_fn("on_day");
         let has_on_candle = has_fn("on_candle");
+        let has_on_rebuild = has_fn("on_rebuild");
         if !has_on_candle && !has_on_bar && !has_bar_close {
             return Err(
                 "script defines none of `on_candle(c)`, `on_bar(c, atr, sweeps, breaks)` \
@@ -779,6 +847,22 @@ impl RhaiStrategy {
             return Err("script defines `on_bar` but its state has no `scan` scanner".into());
         }
 
+        // Rebuild-from-scratch horizons. The window is floored at 32 days so a
+        // rebuilt session tracker's MONTH accumulator (pmh/pml are the high and
+        // low since the last month roll) always sees a full calendar month;
+        // rebuilding it from a shorter tape would emit wrong pmh/pml levels at
+        // the next period boundary. The rebuild only ever runs with a scanner
+        // to rebuild, so the knob is inert for scripts without one.
+        let rebuild_days = params.get_f64("rebuild_from_scratch_days");
+        let (rebuild_window_secs, rebuild_interval_secs) = if rebuild_days > 0.0 && scan.is_some() {
+            (
+                (rebuild_days.max(32.0) * 86_400.0) as i64,
+                (params.get_f64("rebuild_interval_hours").max(1.0) * 3_600.0) as i64,
+            )
+        } else {
+            (0, 0)
+        };
+
         Ok(Self {
             engine,
             ast,
@@ -795,7 +879,13 @@ impl RhaiStrategy {
             has_on_bar,
             has_emit,
             has_on_day,
+            has_on_rebuild,
             scan,
+            tape: RefCell::new(VecDeque::new()),
+            rebuild_window_secs,
+            rebuild_interval_secs,
+            rebuild_bucket: Cell::new(i64::MIN),
+            first_ts: Cell::new(i64::MIN),
             windows,
             rolled: Cell::new(false),
             asset: asset.to_string(),
@@ -875,6 +965,93 @@ impl RhaiStrategy {
         opps
     }
 
+    /// Append a candle to the trailing replay tape and drop what has aged out
+    /// of the rebuild window. No-op, and no allocation, when the rebuild is off.
+    fn tape_push(&self, candle: &Candle, ts: i64) {
+        if self.rebuild_window_secs == 0 {
+            return;
+        }
+        // Seeded from a base bar for the same reason the rebuild bucket is:
+        // an HTF composite's period-start stamp can predate the base bar it
+        // arrived with, and the age-of-run test below must not read a stamp
+        // from before the run began.
+        if self.first_ts.get() == i64::MIN && candle.timeframe == crate::models::base_tf_id() {
+            self.first_ts.set(ts);
+        }
+        let mut tape = self.tape.borrow_mut();
+        tape.push_back(candle.clone());
+        let cutoff = ts - self.rebuild_window_secs;
+        while tape.front().is_some_and(|c| ndt_secs(c.timestamp) < cutoff) {
+            tape.pop_front();
+        }
+    }
+
+    /// Rebuild the native scanner from the trailing tape when a wall-clock
+    /// bucket turns.
+    ///
+    /// Anchoring the cadence to wall-clock buckets rather than a bar counter is
+    /// what makes the rebuild's own phase warmup-invariant: two runs that
+    /// started on different days still rebuild on the same instants, so they
+    /// cannot end up a half-interval out of step with each other.
+    ///
+    /// The first bucket turn is consumed to seed the bucket, and the rebuild is
+    /// held off until a full window has accrued, so no run ever trades real
+    /// warmup state for a partial rebuild.
+    ///
+    /// It runs last in the bar, after the script's hooks and the scanner's own
+    /// maintenance, so it never alters the bar it fires on.
+    fn maybe_rebuild(&self, scan: &ScanHandle, candle: &Candle) {
+        if self.rebuild_window_secs == 0 {
+            return;
+        }
+        // Base bars only. An HTF composite carries its PERIOD-START stamp, so
+        // the bar stream is not monotonic across timeframes: a 4h bar stamped
+        // 23:55 arrives after the 1m bar stamped 00:00 and would turn the
+        // bucket backwards, firing a second and third rebuild on the same
+        // boundary. Only the base timeframe advances monotonically.
+        if candle.timeframe != crate::models::base_tf_id() {
+            return;
+        }
+        let ts = ndt_secs(candle.timestamp);
+        let bucket = ts.div_euclid(self.rebuild_interval_secs);
+        let prev = self.rebuild_bucket.get();
+        if bucket <= prev {
+            return;
+        }
+        self.rebuild_bucket.set(bucket);
+        if prev == i64::MIN || ts - self.first_ts.get() < self.rebuild_window_secs {
+            return;
+        }
+        // `make_contiguous` rather than `as_slices().0`: a VecDeque that has
+        // wrapped would otherwise hand the replay only its first segment, and
+        // silently rebuild from a truncated tape.
+        let mut tape = self.tape.borrow_mut();
+        let window = tape.make_contiguous();
+        if std::env::var_os("BACKTEST_REBUILD_TRACE").is_some() {
+            eprintln!(
+                "rebuild {} at {} bucket {} tape {} bars (first {})",
+                self.asset,
+                secs_to_ndt(ts),
+                bucket,
+                window.len(),
+                window.first().map(|c| c.timestamp.to_string()).unwrap_or_default()
+            );
+        }
+        scan.0.borrow_mut().rebuild_from(window);
+        drop(tape);
+        // The script holds native ids across bars — a developing track keeps
+        // the `fvg_id` it is waiting on and asks `fvg_status(id)` for it on
+        // later bars. Native ids are positional (an FVG's id is its index in
+        // the store), so a rebuilt scanner renumbers them and a carried id
+        // would silently point at a different gap. Give the script the chance
+        // to drop what it holds.
+        if self.has_on_rebuild {
+            if let Err(e) = self.call("on_rebuild", (ts,)) {
+                self.fail("on_rebuild", e);
+            }
+        }
+    }
+
     /// One bar through the native scanner and the script's event hooks.
     /// Returns what `emit` (or `on_bar`, for scripts without `emit`) produced.
     fn drive_scanner(&self, candle: &Candle, scan: &ScanHandle) -> Dynamic {
@@ -929,6 +1106,8 @@ impl RhaiStrategy {
             }
         }
         scan.0.borrow_mut().after_hooks(candle, ev.atr);
+        // Last in the bar: the rebuild never alters the bar it fires on.
+        self.maybe_rebuild(scan, candle);
         Dynamic::from_array(out)
     }
 }
@@ -956,6 +1135,7 @@ impl Strategy for RhaiStrategy {
             }
             self.rolled.set(rolled);
         }
+        self.tape_push(candle, ts);
         let out: Dynamic = match self.scan.clone() {
             Some(scan) => self.drive_scanner(candle, &scan),
             // A script of only `on_bar_close` (market orders, no limit
@@ -2011,6 +2191,133 @@ mod window_tests {
         assert_eq!((lh, ph), (7.0, 5.0));
         assert_eq!((ll, pl), (-7.0, -5.0));
         assert_eq!(w.first_pivot(true, 2, 3, 11), Some((4, 7.0)));
+    }
+}
+
+/// The rebuild cadence: how often, and on which bars, the native scanner is
+/// re-derived from the trailing raw-candle window.
+///
+/// The property under test is that the cadence is a function of wall-clock
+/// time alone. If it were a function of the bar stream, two runs that started
+/// on different days would rebuild on different instants and could sit a
+/// half-interval out of step with each other forever — which is the failure
+/// the rebuild exists to remove, reintroduced one level up.
+#[cfg(test)]
+mod rebuild_tests {
+    use super::*;
+    use crate::models::asset_id;
+    use tempfile::TempDir;
+
+    /// A script with a scanner (so the rebuild has something to rebuild) that
+    /// counts the `on_rebuild` calls it receives into its own state.
+    const SCRIPT: &str = r#"
+        fn init(cfg) {
+            #{ scan: scanner(#{
+                   primitives: #{ atr_period: 14, swing_lookback: 5, fvg_min_gap_pct: 0.0,
+                                  structure_min_displacement_atr: 0.0, signals_cap: 2000 },
+                   significance: #{ base: #{ swing_high: 1.0, swing_low: 1.0 }, default_score: 1.0 },
+                   levels: #{ cluster_atr_tolerance: 0.3, decay_candles: 500.0,
+                              sig_decay_mult: 5.0, sig_decay_min_sig: 2.0, refresh_atr: 0.5,
+                              decay_every: 10, prune_every: 50 },
+                   sweep: #{ noise_atr: 1.25, max_multi_candle: 3, min_level_sig: 1.0 },
+                   fvg: #{ cap: 500, cap_overshoot: 50 },
+               }),
+               rebuilds: 0 }
+        }
+        fn on_bar(c, atr, sweeps, breaks) { [] }
+        fn on_rebuild(ts) { this.rebuilds += 1; }
+    "#;
+
+    fn bar(asset: u16, tf: u16, min: i64) -> Candle {
+        let t = min as f64;
+        let mid = 100.0 + (t / 37.0).sin() * 5.0;
+        Candle {
+            asset,
+            timeframe: tf,
+            timestamp: chrono::DateTime::from_timestamp(min * 60, 0).unwrap().naive_utc(),
+            open: mid,
+            high: mid + 0.5,
+            low: mid - 0.5,
+            close: mid,
+            volume: 1.0,
+            complete: true,
+        }
+    }
+
+    /// Run `days` of 1m bars starting `start_day` days in, optionally
+    /// interleaving an HTF composite stamped at its PERIOD START, and return
+    /// how many rebuilds fired.
+    fn rebuilds(name: &str, start_day: i64, days: i64, htf: bool) -> i64 {
+        let _ = crate::params::register_knobs(RHAI_KNOBS);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("s.rhai");
+        std::fs::write(&path, SCRIPT).unwrap();
+
+        let mut params = crate::params::Params::new();
+        params.set("rebuild_from_scratch_days", crate::params::Value::F64(32.0));
+        params.set("rebuild_interval_hours", crate::params::Value::F64(168.0));
+
+        let aid = asset_id(name);
+        let mut s = RhaiStrategy::new(
+            &path,
+            name,
+            &params,
+            None,
+            &[],
+            50,
+            HashMap::new(),
+            &toml::value::Table::new(),
+        )
+        .unwrap();
+
+        let base = crate::models::base_tf_id();
+        let h4 = crate::models::tf_id("4h");
+        let from = start_day * 1440;
+        for m in from..(from + days * 1440) {
+            s.on_candle(&bar(aid, base, m));
+            // A 4h composite completes on the 240-minute boundary but carries
+            // the timestamp of the period it STARTED, four hours back.
+            if htf && m % 240 == 0 && m >= 240 {
+                s.on_candle(&bar(aid, h4, m - 240));
+            }
+        }
+        let st = s.state.borrow();
+        let n = st.read_lock::<Map>().unwrap()["rebuilds"].clone().cast::<i64>();
+        n
+    }
+
+    /// One rebuild per weekly bucket, no matter how many timeframes the bar
+    /// stream carries.
+    ///
+    /// The bug this pins: an HTF composite carries its PERIOD-START stamp, so
+    /// the bar stream is not monotonic across timeframes. Bucketing on every
+    /// candle let the 4h bar stamped 23:55 turn the bucket backwards after the
+    /// 1m bar stamped 00:00 had already turned it forwards, and the boundary
+    /// fired three rebuilds instead of one. Three rebuilds from three
+    /// different tapes leave three different states, and the runs that saw a
+    /// different mix of them diverged — the exact property the rebuild is for.
+    #[test]
+    fn the_rebuild_fires_once_per_bucket_across_timeframes() {
+        let without = rebuilds("RHAI_RB_1TF", 0, 70, false);
+        let with = rebuilds("RHAI_RB_2TF", 0, 70, true);
+        assert_eq!(
+            with, without,
+            "adding a higher timeframe to the stream must not change the rebuild count"
+        );
+        assert!(without >= 4, "70 days at a weekly cadence should rebuild several times, got {without}");
+    }
+
+    /// The cadence is anchored to wall-clock buckets, not to the run's own
+    /// start, so two runs that begin on different days still rebuild on the
+    /// same instants and cannot drift out of step.
+    #[test]
+    fn the_rebuild_cadence_is_anchored_to_wall_clock_not_to_the_run_start() {
+        // Both runs cover the same 70 days of wall clock; one simply began
+        // earlier and so is deeper warmed at every instant.
+        let early = rebuilds("RHAI_RB_EARLY", 0, 105, true);
+        let late = rebuilds("RHAI_RB_LATE", 35, 70, true);
+        // The later run has 35 fewer days, i.e. exactly 5 fewer weekly buckets.
+        assert_eq!(early - late, 5, "early {early} late {late}");
     }
 }
 
