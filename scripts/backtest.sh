@@ -13,10 +13,18 @@
 #   BT_FILL      fill lens preset     (default: config/fill/market_on_open.toml)
 #   BT_JSON      report path          (default: data/backtest_trades.json;
 #                                      set empty to skip writing one)
-#   BT_BIN       binary to run        (default: target/release/backtest)
+#   BT_BIN       binary to run        (default: target/release/backtest, built
+#                                      on demand when absent)
 #
 # The three preset axes are independent by design: the same strategy graded
 # through a pessimistic fill lens is one env var, not a fork.
+#
+# target/ is disposable: `cargo clean`, a disk sweep or a fresh clone all leave
+# the default binary missing, and this script is run by tools (the trade-viz
+# "run backtest" button) whose only channel for "go build it yourself" is a red
+# error in someone else's UI. So a missing DEFAULT binary is built here rather
+# than reported. An explicit BT_BIN is never built: naming a binary means you
+# want that one, and silently compiling something else would hide the typo.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,10 +43,34 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-BIN="${BT_BIN:-target/release/backtest}"
-if [[ ! -x "$BIN" ]]; then
-  echo "binary missing: $BIN — run: cargo build --release (or set BT_BIN)" >&2
-  exit 1
+BIN="${BT_BIN:-}"
+if [[ -n "$BIN" ]]; then
+  [[ -x "$BIN" ]] || { echo "BT_BIN is not an executable: $BIN" >&2; exit 1; }
+else
+  BIN="target/release/backtest"
+  if [[ ! -x "$BIN" ]]; then
+    command -v cargo >/dev/null 2>&1 || {
+      echo "binary missing: $BIN, and no cargo to build it — install Rust, or point BT_BIN at a built engine" >&2
+      exit 1
+    }
+    # nice + a bounded job count so a build kicked off by a web request does
+    # not take the machine away from whatever else is running; the flock keeps
+    # two concurrent runs from fighting over the same target/ dir. flock is
+    # util-linux and absent on macOS, so it is a wrapper when present and
+    # skipped when not — cargo's own target lock still serializes the builds,
+    # it just makes the loser wait silently instead of saying why.
+    echo "binary missing: $BIN — building it (cargo build --release)" >&2
+    LOCK=()
+    if command -v flock >/dev/null 2>&1; then
+      mkdir -p "$HOME/.cache"
+      LOCK=(flock "$HOME/.cache/backtest-engine-build.lock")
+    fi
+    "${LOCK[@]+${LOCK[@]}}" nice -n 19 cargo build --release --jobs 4 --bin backtest >&2 || {
+      echo "build failed — fix the build, or point BT_BIN at a working engine" >&2
+      exit 1
+    }
+    [[ -x "$BIN" ]] || { echo "build reported success but $BIN is still missing" >&2; exit 1; }
+  fi
 fi
 
 if [[ ${#DATE_ARGS[@]} -eq 0 ]]; then
