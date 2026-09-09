@@ -2,11 +2,15 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Exhibit</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <link rel="stylesheet" href="/theme.css">
 <style>
+  /* dvh tracks the viewport as mobile browser chrome collapses; the % line
+     stays first as the fallback for engines that don't know dvh. */
   html, body { height: 100%; }
+  body { height: 100dvh; }
   body { display: flex; flex-direction: column; }
   .x-meta {
     padding: 8px 12px; border-bottom: 1px solid var(--line);
@@ -30,6 +34,22 @@
   .x-help code { color: var(--shu); }
   .x-help h2 { font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
   .empty { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--dim); }
+
+  /* ══ Phone ═════════════════════════════════════════════════════════════
+     Same breakpoint as theme.css. An exhibit is a chart plus a strip of
+     provenance chips; on a phone the chips wrap onto as many lines as they
+     need and the chart keeps the rest of the viewport. The uid chip is a
+     single long token, so it is the one thing allowed to break mid-word —
+     without that it alone would make the page pan sideways. */
+  @media (max-width: 860px) {
+    .x-meta { padding: 8px 12px; font-size: 10px; }
+    .x-chip { white-space: normal; overflow-wrap: anywhere; }
+    .x-leg { white-space: normal; }
+    #chart { min-height: 300px; }
+    .x-foot { padding: 8px 12px; line-height: 1.5; overflow-wrap: anywhere; }
+    .x-help { padding: 16px 12px; }
+    .x-help code { overflow-wrap: anywhere; }
+  }
 </style>
 </head>
 <body>
@@ -268,7 +288,18 @@ async function main() {
     borderUpColor: "#37d67a", borderDownColor: "#ff5d52",
     wickUpColor: "#37d67a", wickDownColor: "#ff5d52",
   });
-  window.addEventListener("resize", () => chart.resize(container.clientWidth, container.clientHeight));
+  // Observe the BOX, not the window: on a phone the container changes size for
+  // reasons a resize event never fires for — the URL bar collapsing as you
+  // scroll, an orientation change that lands mid-frame.
+  const refit = () => {
+    if (!container.clientWidth || !container.clientHeight) return;
+    chart.resize(container.clientWidth, container.clientHeight);
+  };
+  if (window.ResizeObserver) {
+    new ResizeObserver(refit).observe(container);
+  } else {
+    window.addEventListener("resize", refit);
+  }
   candleSeries.setData(data.candles);
 
   const many = groups.length > 1;

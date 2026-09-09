@@ -28,6 +28,14 @@ the pages render empty with a hint rather than erroring.
 the query string, so a link to one trade renders from the URL alone and stays
 readable after the run that produced it has been overwritten.
 
+Every page works on a phone. One breakpoint at 860px (in `theme.css`, shared by
+all of them) switches to the narrow layout: controls grow to 44px targets, the
+label/field grids collapse to one column and trade rows stack. On the dashboard
+the 500px sidebar and the chart become two panes with a tab bar between them,
+and the backtest config folds behind its section header so the trade list is
+above the fold. Hover styling is gated on `hover: hover` rather than on width,
+since on a touchscreen `:hover` sticks to whatever was tapped last.
+
 ## The report contract
 
 `scripts/backtest.sh` passes `--json-sidecar` to the binary, which writes

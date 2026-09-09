@@ -2,12 +2,15 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Equity Curve</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <link rel="stylesheet" href="/theme.css">
 <style>
   /* Page-specific layout on top of the shared 端末 TERMINAL theme (theme.css). */
-  .app { display: flex; flex-direction: column; height: 100vh; }
+  /* dvh tracks the viewport as mobile browser chrome collapses; the vh line
+     stays first as the fallback for engines that don't know dvh. */
+  .app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
   /* Live/Backtest toggle sits on the left as its own row under the header
      (matching the dashboard), not stretched full-width: segments hug content. */
   /* Controls row on this page uses inline labels (top-bar layout, not a grid). */
@@ -28,8 +31,12 @@
     color: var(--shu); font: inherit; font-size: 10px; font-weight: 700;
     letter-spacing: .14em; text-transform: uppercase; padding: 0 12px; cursor: pointer;
   }
-  .run-inline:hover { background: var(--shu); color: #fff; border-color: var(--shu); }
+  @media (hover: hover) {
+    .run-inline:hover { background: var(--shu); color: #fff; border-color: var(--shu); }
+  }
   .run-inline:disabled { opacity: .55; cursor: default; }
+  /* Progress caption beside the Run button while a run is in flight. */
+  #bt-status { overflow-wrap: anywhere; }
   .summary {
     display: flex; gap: 16px; flex-wrap: wrap; align-items: center;
     padding: 6px 12px;
@@ -47,6 +54,27 @@
   }
   .legend code { color: var(--ink); }
   .legend b { color: var(--ink); font-weight: 600; }
+
+  /* ══ Phone ═════════════════════════════════════════════════════════════
+     Same breakpoint as theme.css. This page is already a vertical stack, so
+     the work is in the two control rows: their inline labels wrap to one
+     field per line and the controls grow to a thumb-sized target, leaving the
+     chart the rest of the viewport. */
+  @media (max-width: 860px) {
+    .ctlrow {
+      gap: 8px 12px; padding: 10px 12px;
+      /* One control per line at 390px, two once there is room for them. */
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      align-items: center;
+    }
+    .ctlrow label { flex-wrap: wrap; gap: 4px 6px; min-width: 0; min-height: 44px; }
+    .ctlrow input[type=date], .ctlrow select { width: 100%; min-width: 0; }
+    .ctlrow #bt-status, .ctlrow #bt-freshness { grid-column: 1 / -1; }
+    .run-inline { height: 44px; width: 100%; }
+    .summary { gap: 6px 12px; padding: 8px 12px; font-size: 10px; }
+    #chart { min-height: 260px; }
+    .legend { padding: 8px 12px; line-height: 1.6; }
+  }
 </style>
 </head>
 <body>
@@ -238,9 +266,18 @@ function ensureChart() {
     rightPriceScale: { borderColor: "#3a3a38" },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
   });
-  window.addEventListener("resize", () => {
+  // Observe the BOX, not the window: on a phone the container changes size
+  // for reasons a resize event never fires for — the URL bar collapsing as you
+  // scroll, an orientation change that lands mid-frame.
+  const refit = () => {
+    if (!container.clientWidth || !container.clientHeight) return;
     chart.resize(container.clientWidth, container.clientHeight);
-  });
+  };
+  if (window.ResizeObserver) {
+    new ResizeObserver(refit).observe(container);
+  } else {
+    window.addEventListener("resize", refit);
+  }
 }
 
 function clearSeries() {
