@@ -26,3 +26,8 @@ ensemble_runs/
 .claude/
 # A data symlink (the data/ rule above covers a directory, not a link)
 /data
+
+# Private strategy presets, cloned from a separate private repo (see README
+# "Private strategies"). The demo presets beside it are committed; everything
+# under this directory is not, and must never be.
+/config/strategy/private/

@@ -288,16 +288,33 @@ def _read_strategy_assets_sources(name: str) -> dict:
     return {"assets": assets, "sources": _sources_from({"source": raw})}
 
 
-def _list_presets(directory: Path) -> list[str]:
-    """Preset filenames in `directory`, underscore-prefixed files excluded.
+def _list_presets(directory: Path, skip_dirs: frozenset[str] = frozenset()) -> list[str]:
+    """Preset names under `directory`, underscore-prefixed files excluded.
 
     The underscore prefix marks a file that is machinery rather than a choice
     — the composed session preset, a label registry — so it never appears in
     a picker.
+
+    The walk is recursive and names are returned relative to `directory`, so a
+    preset organised into a subdirectory (`private/momentum/breakout.toml`) is
+    selectable as one sitting at the top. Every consumer joins the name back
+    onto `directory`, and a nested preset's relative `base` resolves against
+    its own parent, so a name with a path in it needs no special handling
+    downstream. A directory whose name starts with "_" is skipped whole, and
+    so is `.git` — a strategy tree pulled in as its own checkout carries one,
+    and walking it would be pointless work.
     """
     if not directory.exists():
         return []
-    return sorted(p.name for p in directory.glob("*.toml") if not p.name.startswith("_"))
+    out: list[str] = []
+    for p in directory.rglob("*.toml"):
+        rel = p.relative_to(directory)
+        if any(part.startswith("_") or part == ".git" for part in rel.parts):
+            continue
+        if skip_dirs and rel.parts[:-1] and rel.parts[-2] in skip_dirs:
+            continue
+        out.append(rel.as_posix())
+    return sorted(out)
 
 
 def _list_datasets() -> list[str]:
@@ -308,8 +325,15 @@ def _list_fills() -> list[str]:
     return _list_presets(FILL_DIR)
 
 
+# A private strategy tree is a whole config repo: it carries its own fill
+# lenses and dataset presets in sibling directories beside the strategies.
+# Those are the other two axes of a run, not strategies, so a directory with
+# one of these names is not walked for the strategy picker.
+NON_STRATEGY_DIRS = frozenset({"fill", "datasets", "tools"})
+
+
 def _list_strategies() -> list[str]:
-    return _list_presets(STRATEGY_DIR)
+    return _list_presets(STRATEGY_DIR, skip_dirs=NON_STRATEGY_DIRS)
 
 
 def _preset_description(path: Path, cap: int = 200) -> str:
@@ -1499,7 +1523,7 @@ class BacktestVizServer:
         dataset_sources = _read_dataset_sources(dataset)
         strat = request.query.get("strategy") or ""
         assets: list[str] = []
-        if strat and Path(strat).name == strat and (STRATEGY_DIR / strat).is_file():
+        if strat and strat in _list_strategies():
             info = _read_strategy_assets_sources(strat)
             assets = list(info["assets"])
             # An own-sources strategy runs standalone, so with a source-free

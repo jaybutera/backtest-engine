@@ -8,6 +8,14 @@
 #
 # A hit is not automatically a leak: check the context. If a pattern matches
 # something legitimate, narrow the pattern rather than deleting the check.
+#
+# `config/strategy/private/` is skipped. That directory is a checkout of a
+# separate private strategy repo, gitignored here and never committed to this
+# one, so it is by definition full of the material these patterns look for.
+# Scanning it would fail this check on every machine that has the strategies
+# pulled, which is the opposite of what the check is for: the job is to keep
+# private material out of THIS repo's history, and the gitignore is what
+# enforces that.
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -29,7 +37,7 @@ report() {
         --include='*.html' --include='*.css' --include='*.sh' \
         --include='*.md' --include='*.json' --include='*.yml' \
         --exclude-dir=target --exclude-dir=.git --exclude-dir=.venv \
-        --exclude-dir=__pycache__ --exclude-dir=data \
+        --exclude-dir=__pycache__ --exclude-dir=data --exclude-dir=private \
         --exclude='check-leaks.sh' \
         . 2>/dev/null | grep -v "$EXEMPT")
     if [ -n "$hits" ]; then

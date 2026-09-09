@@ -509,8 +509,36 @@ rather than rescaling the trade.
     viz/            web UI (Python)
     config/fill/    fill lenses
     config/strategy/ strategy presets
+    config/strategy/private/  optional: a private preset tree, gitignored
     scripts/        backtest and ensemble runners, the Databento fetcher,
                     the synthetic generator, the parameter sweep
+
+## Private strategies
+
+The presets committed here are demos. Real strategies generally cannot live in
+a public repo, so the visualizer and the runners also read
+`config/strategy/private/`, which is gitignored and never committed. Point it
+at a private repo of your own:
+
+    git clone <your-private-strategy-repo> config/strategy/private
+
+The strategy picker walks that tree recursively, so presets keep whatever
+directory structure the private repo gives them and are named by their
+relative path. Sibling `fill/`, `datasets/` and `tools/` directories in such a
+repo are left off the strategy axis; underscore-prefixed files stay hidden as
+they do anywhere else. Nothing about the layout is required: with no private
+checkout the directory simply does not exist and only the demos are listed.
+
+Keeping it a separate checkout rather than a submodule is deliberate. A
+submodule entry would put a private URL in this repo's history and make
+`git clone --recurse-submodules` fail for anyone without access to it; an
+ignored directory costs a clone step and asks nothing of people who only want
+the engine. `scripts/check-leaks.sh` skips the directory for the same reason,
+so a working copy with private strategies pulled still passes the check.
+
+To update it later, pull inside that directory:
+
+    git -C config/strategy/private pull
 
 ## Provenance
 
