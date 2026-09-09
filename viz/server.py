@@ -32,9 +32,11 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import time
 import tomllib
 import uuid
+from collections.abc import Coroutine
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -95,6 +97,20 @@ EXHIBIT_HTML_PATH = Path(__file__).parent / "exhibit.html"
 THEME_CSS_PATH = Path(__file__).parent / "theme.css"
 
 logger = logging.getLogger(__name__)
+
+
+def _as_number(value: object, default: float) -> float:
+    """A number from an untrusted record, or `default`.
+
+    The run-state record round-trips through a JSON file on disk, so nothing
+    in it is guaranteed to still be the type that was written. A malformed
+    field must degrade the same way a malformed `.meta.json` does — ignored —
+    rather than turning a status poll into a 500. bool is excluded on purpose:
+    `True` is an int in Python and a nonsense timestamp everywhere else.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return float(value)
 
 
 def _backtest_uid(meta: dict) -> str:
@@ -918,8 +934,19 @@ class BacktestVizServer:
             logger.warning("could not persist backtest run state", exc_info=True)
             tmp.unlink(missing_ok=True)
 
+    #: Every status the record is allowed to carry. A file holding anything
+    #: else is not a record this code wrote, so it is ignored outright.
+    RUN_STATUSES = frozenset({"running", "done", "error", "interrupted"})
+
     def _read_run_state(self) -> dict | None:
-        """The persisted run record, or None when there is none to read."""
+        """The persisted run record, or None when there is none to trust.
+
+        A hand-edited, truncated or half-written file must be ignored the same
+        way a malformed `.meta.json` is: the pages then simply report `idle`.
+        Only the shape is checked here — individual numeric fields are coerced
+        at the point of use, since a record can be valid and still carry one
+        field this version did not write.
+        """
         path = self._run_state_path()
         if not path.exists():
             return None
@@ -927,20 +954,45 @@ class BacktestVizServer:
             with path.open() as f:
                 run = json.load(f)
         except (OSError, ValueError):
+            logger.warning("ignoring unreadable backtest run state at %s", path)
             return None
-        return run if isinstance(run, dict) else None
+        if not isinstance(run, dict) or run.get("status") not in self.RUN_STATUSES:
+            logger.warning("ignoring malformed backtest run state at %s", path)
+            return None
+        return run
 
     @staticmethod
-    def _pid_alive(pid: int | None) -> bool:
+    def _pid_alive(pid: object) -> bool:
         """Whether `pid` still names a live process.
 
         Signal 0 does no work beyond the existence-and-permission check, which
         is exactly the question. A recycled pid is theoretically possible; in
         practice the window is a server restart, and being wrong here costs a
         status label, not a run.
+
+        Takes `object` because the pid arrives from the on-disk record: a
+        non-integer there means "no pid we can check", not a crash.
         """
-        if not pid:
+        pid = int(_as_number(pid, 0))
+        if pid <= 0:
             return False
+        # A zombie answers signal 0: it has exited, but nobody has reaped it,
+        # so its pid still resolves. That happens whenever the process that
+        # forked the server is still around to hold the entry — a supervisor,
+        # an autoreloader — and it would leave a finished orphan looking like
+        # it was running forever, with every launch answering 409. /proc is the
+        # only way to tell an exited process from a live one; where there is no
+        # /proc, fall through to the signal, which answers the question minus
+        # this one case.
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                # "<pid> (comm) <state> …", and comm may itself contain spaces
+                # and parentheses — so the state is the field after the LAST
+                # closing paren, not the third whitespace-separated one.
+                state = f.read().rpartition(b")")[2].split()[0]
+            return state != b"Z"
+        except (OSError, IndexError):
+            pass
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -950,6 +1002,47 @@ class BacktestVizServer:
         except OSError:
             return False
         return True
+
+    def _run_log_path(self) -> Path:
+        """Where a run's stderr goes.
+
+        A FILE, never a pipe. A pipe's only reader is this process, so once the
+        server is gone the read end closes — and the engine logs progress to
+        stderr for the whole run, so the orphan would die on its next line
+        (Rust ignores SIGPIPE, so the write panics rather than being dropped).
+        A file has no reader to lose.
+
+        Truncated at the start of each run, so it holds one run's output and
+        nothing older. That is a tighter bound than the pipe it replaces, which
+        buffered a whole run's stderr in this process's memory.
+        """
+        return self.backtest_path.with_name(self.backtest_path.stem + ".run.log")
+
+    def _run_log_tail(self, limit: int = 800) -> str:
+        """The end of the run log — what the stderr pipe used to hand back."""
+        try:
+            with self._run_log_path().open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - limit))
+                return f.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    @staticmethod
+    async def _await_exit(proc: subprocess.Popen) -> int:
+        """Wait for a child to exit without owning it.
+
+        Deliberately NOT `communicate()` on an asyncio child process. When the
+        loop shuts down, asyncio finalizes that child's transport, and
+        `BaseSubprocessTransport.close()` SIGKILLs a process that is still
+        running — `start_new_session` is no defense, because the kill comes
+        from us rather than from the terminal. Polling a plain `Popen` has no
+        such finalizer: cancelling this coroutine just stops the polling and
+        leaves the run alone, which is the whole point of the durable record.
+        """
+        while proc.poll() is None:
+            await asyncio.sleep(0.25)
+        return proc.returncode
 
     def _segment_temp_paths(self, total: int) -> list[Path]:
         """The per-segment sidecars a stitched run writes before merging."""
@@ -982,34 +1075,109 @@ class BacktestVizServer:
             finished_at=time.time(),
             pid=None,
         )
-        self._clear_segment_temps(run.get("segments_total") or 1)
+        self._clear_segment_temps(int(_as_number(run.get("segments_total"), 1)) or 1)
         self._save_run_state()
+
+    def _sidecar_written_since(self, started_at: object) -> int | None:
+        """The sidecar's mtime if this run wrote it, else None.
+
+        There is no exit code to read for a process we did not fork, so
+        "did it produce a result?" is answered by the sidecar on disk: it
+        counts only if it was written after the run began. The second of slack
+        absorbs the mtime being whole seconds against a float `started_at`.
+
+        A `started_at` that is not a usable timestamp answers None as well.
+        Without it there is nothing to compare the mtime against, and assuming
+        the sidecar is this run's would relabel the PREVIOUS run's result with
+        this run's axes — the exact failure the comparison exists to prevent.
+        """
+        started = _as_number(started_at, 0.0)
+        if started <= 0:
+            return None
+        try:
+            mtime = int(self.backtest_path.stat().st_mtime)
+        except OSError:
+            return None
+        return mtime if mtime >= started - 1 else None
+
+    def _settle_orphan_run(self, run: dict, gone_note: str) -> None:
+        """Decide how a run this process did not launch actually ended.
+
+        Shared by both orphan paths — the one that finds the process already
+        gone at startup, and the one that watches an adopted process exit —
+        because the question is identical and only the wording differs. Keeping
+        it in one place is what stops the startup path from calling a finished
+        run "interrupted": a single-segment run that completed between the old
+        server dying and this one starting is a real result on disk, and
+        reporting it as interrupted would also leave the sidecar labeled with
+        the PREVIOUS run's axes and uid.
+        """
+        total = int(_as_number(run.get("segments_total"), 1)) or 1
+        if total > 1:
+            # A stitched run is orchestrated BY the server: the segments after
+            # the interrupted one were never launched and the merge never ran,
+            # so the sidecar on disk is still the PREVIOUS result however
+            # cleanly the surviving segment exited. Calling that "done" would
+            # relabel an old result as this run's.
+            done = int(_as_number(run.get("segments_done"), 0))
+            self._interrupt_run(
+                run,
+                f"the server restarted during segment {min(done + 1, total)}/{total}; "
+                "the remaining segments never ran — re-run to get the full range",
+            )
+            return
+        mtime = self._sidecar_written_since(run.get("started_at"))
+        if mtime is None:
+            self._interrupt_run(run, gone_note)
+            return
+        run.update(
+            status="done",
+            # The sidecar's mtime IS when the run finished, and it is the only
+            # honest answer available: this process was not watching.
+            finished_at=float(mtime),
+            pid=None,
+            segments_done=total,
+            generated_at=mtime,
+            error=None,
+        )
+        self._save_run_state()
+        # The process that launched this run died before it could label the
+        # result, so the axes are written here instead — otherwise the run's
+        # sidecar keeps the last one's uid in the UI.
+        self._write_backtest_meta(run)
+        logger.info("orphaned backtest run %s completed; result adopted",
+                    run.get("run_id"))
 
     async def adopt_orphan_run(self) -> None:
         """Reconcile a run that was in flight when this process last stopped.
 
         Called once at startup. The persisted record says a run was running;
-        whether it still is depends on its subprocess, which was started in its
-        own session precisely so a signal to the server would not reach it:
+        whether it still is depends on its subprocess, which was started
+        detached precisely so that stopping the server would not stop it:
 
-          * process alive   → ADOPT: hold the backtest lock and watch the pid,
-            so the page shows live progress and a second run is refused until
-            it exits. We are no longer its parent, so the outcome is read off
-            the sidecar rather than an exit code.
-          * process gone    → INTERRUPTED: say so, and sweep the temporaries.
+          * process alive → ADOPT: hold the backtest lock and watch the pid, so
+            the page shows live progress and a second run is refused until it
+            exits.
+          * process gone  → SETTLE: it may still have finished. Ask the sidecar
+            before calling it interrupted.
         """
         run = self._bt_run
         if not run or run.get("status") != "running":
             return
         if not self._pid_alive(run.get("pid")):
-            logger.warning("previous backtest run did not survive the restart")
-            self._interrupt_run(run, "the server stopped while this run was in flight")
+            logger.info("previous backtest run %s is no longer running; settling it",
+                        run.get("run_id"))
+            self._settle_orphan_run(
+                run, "the server stopped while this run was in flight",
+            )
             return
         run["adopted"] = True
         self._save_run_state()
         logger.info("adopted backtest run %s (pid %s) still in flight",
                     run.get("run_id"), run.get("pid"))
-        self._adopt_task = asyncio.create_task(self._watch_adopted_run())
+        self._adopt_task = asyncio.create_task(
+            self._guarded_run_driver(self._watch_adopted_run(), "adopted-run watcher"),
+        )
 
     async def _watch_adopted_run(self) -> None:
         """Hold the lock until an adopted (non-child) run's process exits.
@@ -1025,44 +1193,9 @@ class BacktestVizServer:
                 return
             while self._pid_alive(run.get("pid")):
                 await asyncio.sleep(1.0)
-            # A stitched run is orchestrated BY the server: the segments after
-            # this one were never launched and the merge never ran, so the
-            # sidecar on disk is still the PREVIOUS result however cleanly the
-            # surviving segment exited. Reporting "done" here would relabel an
-            # old result as this run's.
-            total = run.get("segments_total") or 1
-            if total > 1:
-                self._interrupt_run(
-                    run,
-                    f"the server restarted during segment "
-                    f"{min(run.get('segments_done', 0) + 1, total)}/{total}; "
-                    "the remaining segments never ran — re-run to get the full range",
-                )
-                return
-            # No exit code to read for a process we did not fork, so the
-            # question "did it produce a result?" is answered by the sidecar:
-            # it counts only if it was written after the run began.
-            started = run.get("started_at") or 0
-            try:
-                mtime = int(self.backtest_path.stat().st_mtime)
-            except OSError:
-                mtime = None
-            if mtime is None or mtime < started - 1:
-                self._interrupt_run(run, "the adopted run exited without writing a sidecar")
-                return
-            run.update(
-                status="done",
-                finished_at=time.time(),
-                pid=None,
-                segments_done=total,
-                generated_at=mtime,
-                error=None,
+            self._settle_orphan_run(
+                run, "the adopted run exited without writing a sidecar",
             )
-            self._save_run_state()
-            # The process that launched this run died before it could label the
-            # result, so the axes are written here instead — otherwise an
-            # adopted run's sidecar shows up unlabeled in the UI.
-            self._write_backtest_meta(run)
 
     # ── Pages ────────────────────────────────────────────────────────────────
 
@@ -1570,8 +1703,9 @@ class BacktestVizServer:
             "dataset_override": conflict if (conflict and override) else None,
         }
         self._save_run_state()
-        self._run_task = asyncio.create_task(self._guarded_backtest_task(
-            env, bool(sources), warmup_days, segments,
+        self._run_task = asyncio.create_task(self._guarded_run_driver(
+            self._run_backtest_task(env, bool(sources), warmup_days, segments),
+            "backtest task",
         ))
         return web.json_response({
             "started": True,
@@ -1586,32 +1720,35 @@ class BacktestVizServer:
             "segments": len(segments),
         })
 
-    async def _guarded_backtest_task(self, *args: object) -> None:
-        """Run `_run_backtest_task`, guaranteeing a terminal status.
+    async def _guarded_run_driver(self, driver: Coroutine, what: str) -> None:
+        """Run a coroutine that drives a run, guaranteeing a terminal status.
 
         `/api/backtest/status` treats `status == "running"` as "a run is in
         flight" — the record rather than the lock, because the record is what a
         reconnecting page and a restarted server both have to trust. That only
-        holds if EVERY exit path writes a terminal status, so an escaping
-        exception becomes one here instead of leaving pages polling forever.
+        holds if EVERY exit path writes a terminal status. An escaping
+        exception becomes one here instead of leaving pages polling a run that
+        nothing is driving, and every launch answering 409 until a restart.
 
         Cancellation is the one exception, and the important one: it means the
-        SERVER is going away, not the run. The subprocess has its own session
-        and keeps working, so the record has to stay "running" for the next
-        process to adopt — writing a terminal status here would report a
-        failure that never happened and abandon a run still on its way to a
-        result.
+        SERVER is going away, not the run. The subprocess is detached and keeps
+        working, so the record has to stay "running" for the next process to
+        adopt — writing a terminal status here would report a failure that
+        never happened and abandon a run still on its way to a result.
+
+        Both background drivers go through this: the task running our own
+        subprocess, and the watcher holding the lock for an adopted one.
         """
         cancelled = False
         try:
-            await self._run_backtest_task(*args)  # type: ignore[arg-type]
+            await driver
         except asyncio.CancelledError:
             cancelled = True
             logger.info("server stopping; backtest %s left in flight",
                         (self._bt_run or {}).get("run_id"))
             raise
         except Exception:
-            logger.exception("backtest task crashed")
+            logger.exception("%s crashed", what)
         finally:
             run = self._bt_run
             if not cancelled and run is not None and run.get("status") == "running":
@@ -1619,7 +1756,7 @@ class BacktestVizServer:
                     status="error",
                     finished_at=time.time(),
                     pid=None,
-                    error=run.get("error") or "run task exited without reporting an outcome",
+                    error=run.get("error") or f"{what} exited without reporting an outcome",
                 )
                 self._save_run_state()
 
@@ -1643,6 +1780,12 @@ class BacktestVizServer:
         reconnects after the fact still learns how it ended.
         """
         async with self._backtest_lock:
+            # Start this run's log empty, so a failure tail can never quote the
+            # previous run's stderr and the file stays bounded by one run.
+            try:
+                self._run_log_path().write_bytes(b"")
+            except OSError:
+                logger.warning("could not open the run log", exc_info=True)
             stitched = len(segments) > 1
             seg_docs: list[dict] = []
             seg_paths: list[Path] = []
@@ -1665,19 +1808,27 @@ class BacktestVizServer:
                     argv = [str(BACKTEST_SCRIPT), "--from", seg_from, "--to", seg_to]
                     if warmup_days > 0:
                         argv += ["--warmup-days", str(warmup_days)]
+                    # A plain Popen, not an asyncio child: see `_await_exit`
+                    # for why owning the process would let a Ctrl-C kill it.
+                    # stderr goes to a file for the matching reason in
+                    # `_run_log_path` — a pipe dies with the server and takes
+                    # the orphan with it on its next log line. The file object
+                    # is closed immediately; the child holds its own dup of the
+                    # descriptor and keeps writing long after we are gone.
                     try:
-                        proc = await asyncio.create_subprocess_exec(
-                            *argv,
-                            stdout=asyncio.subprocess.DEVNULL,
-                            stderr=asyncio.subprocess.PIPE,
-                            env=seg_env,
-                            cwd=str(REPO_ROOT),
-                            # Its own session, so a Ctrl-C or SIGTERM aimed at
-                            # the server's process group does not also kill a
-                            # backtest that may be many minutes in. The pid is
-                            # recorded so a restarted server can find it again.
-                            start_new_session=True,
-                        )
+                        with self._run_log_path().open("ab") as errf:
+                            proc = subprocess.Popen(  # noqa: S603
+                                argv,
+                                stdout=subprocess.DEVNULL,
+                                stderr=errf,
+                                env=seg_env,
+                                cwd=str(REPO_ROOT),
+                                # Its own session, so a Ctrl-C or SIGTERM aimed
+                                # at the server's process group does not also
+                                # reach a backtest many minutes in. The pid is
+                                # recorded so a restarted server finds it again.
+                                start_new_session=True,
+                            )
                     except Exception as e:
                         logger.exception("backtest launch failed")
                         if self._bt_run is not None:
@@ -1690,14 +1841,14 @@ class BacktestVizServer:
                     if self._bt_run is not None:
                         self._bt_run["pid"] = proc.pid
                         self._save_run_state()
-                    _, stderr = await proc.communicate()
-                    if proc.returncode != 0:
-                        tail = stderr.decode("utf-8", errors="replace")[-800:]
+                    rc = await self._await_exit(proc)
+                    if rc != 0:
+                        tail = self._run_log_tail()
                         note = (
                             f" (segment {i + 1}/{len(segments)} {seg_from}..{seg_to})"
                             if stitched else ""
                         )
-                        run_error = f"backtest failed (rc={proc.returncode}){note}: {tail}"
+                        run_error = f"backtest failed (rc={rc}){note}: {tail}"
                         break
                     if stitched:
                         try:
@@ -1752,7 +1903,10 @@ class BacktestVizServer:
 
         Best-effort: an unlabeled result still renders.
         """
-        segments = run.get("segments_total") or 1
+        # Coerced, like every other read of the record: this is reached from
+        # the orphan path, where the record came off disk rather than from the
+        # launch that built it.
+        segments = int(_as_number(run.get("segments_total"), 1)) or 1
         meta = {
             "strategy": run.get("strategy"),
             "fill": run.get("fill"),
@@ -1823,6 +1977,11 @@ class BacktestVizServer:
         exists = self.backtest_path.exists()
         run = self._bt_run or {}
         status = run.get("status") or "idle"
+        # Every number below comes out of the on-disk record through
+        # `_as_number`. `_read_run_state` rejects a record with the wrong
+        # SHAPE, but a valid record can still carry a field this version did
+        # not write, and a status poll must degrade to "no figure" rather than
+        # to a 500.
         # The RECORD, not the lock, decides whether a run is in flight: it is
         # seeded before the subprocess is spawned (so a poll racing the launch
         # still says "running") and it is all a restarted server has to go on.
@@ -1834,7 +1993,8 @@ class BacktestVizServer:
         # it is history and the sidecar speaks for itself.
         finished_at = run.get("finished_at")
         fresh = running or (
-            finished_at is not None and now - finished_at < RUN_RESULT_TTL_SECONDS
+            finished_at is not None
+            and now - _as_number(finished_at, 0.0) < RUN_RESULT_TTL_SECONDS
         )
         out: dict = {
             "exists": exists,
@@ -1859,8 +2019,8 @@ class BacktestVizServer:
                 "warmup_days": run.get("warmup_days"),
             }
             if running:
-                eta = run.get("eta_seconds") or 1.0
-                elapsed = max(0.0, now - (run.get("started_at") or now))
+                eta = _as_number(run.get("eta_seconds"), 0.0) or 1.0
+                elapsed = max(0.0, now - _as_number(run.get("started_at"), now))
                 raw = elapsed / eta
                 progress = raw if raw < 0.9 else 0.9 + 0.09 * (1 - 1 / (1 + (raw - 0.9)))
                 out.update({
@@ -1871,9 +2031,10 @@ class BacktestVizServer:
                 })
                 # Stitched long run: which segment the subprocess is on, so the
                 # bar can say "year 3/5".
-                if (run.get("segments_total") or 1) > 1:
-                    out["segments_total"] = run["segments_total"]
-                    out["segments_done"] = run.get("segments_done", 0)
+                total = int(_as_number(run.get("segments_total"), 1))
+                if total > 1:
+                    out["segments_total"] = total
+                    out["segments_done"] = int(_as_number(run.get("segments_done"), 0))
             else:
                 out.update({"progress": 1.0, "error": run.get("error"), **axes})
         # Always surface the persisted axes of the last completed run — this

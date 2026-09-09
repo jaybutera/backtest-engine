@@ -209,18 +209,40 @@ State lives in two places, and the second is what makes it durable:
 
 `.run.json` describes the RUN — progress, pid, outcome — from the moment it is
 launched. `.meta.json` beside it describes the RESULT and is written only on
-success. Neither is committed; `data/` is ignored.
+success. A third file, `<report-stem>.run.log`, holds the run's stderr, and is
+truncated at the start of each run. None of them is committed; `data/` is
+ignored.
 
-The subprocess is started in its own session, so a Ctrl-C or SIGTERM aimed at
-the server's process group does not reach a backtest that may be many minutes
-in. On startup the server reconciles whatever `.run.json` says was in flight:
+Three things, together, are what let the run outlive the server. Any one of
+them missing kills it:
+
+* **`start_new_session=True`** — so a Ctrl-C or SIGTERM aimed at the server's
+  process group does not reach the child.
+* **a plain `subprocess.Popen`, not an asyncio child** — when the loop shuts
+  down, asyncio finalizes the child's transport, and
+  `BaseSubprocessTransport.close()` **SIGKILLs a child that is still running**.
+  That kill comes from us, so a new session is no defense against it. Exit is
+  awaited by polling `poll()`, which owns nothing and so kills nothing.
+* **stderr to a file, not a pipe** — a pipe's only reader is the server. Once
+  the server is gone the read end closes, and the engine logs progress to
+  stderr for the whole run, so the orphan would panic on its next line (Rust
+  ignores SIGPIPE, so the write raises rather than being dropped). A file has
+  no reader to lose. It is also a tighter memory bound than the pipe it
+  replaced, which buffered a whole run's stderr in the server.
+
+On startup the server reconciles whatever `.run.json` says was in flight:
 
 | Found | Reported as |
 |---|---|
-| pid still alive, single segment | `running`, `adopted: true` — watched to completion, then labeled |
-| pid still alive, stitched run | held until it exits, then `interrupted` — the later segments and the merge were the dead server's job |
-| pid gone | `interrupted` |
-| sidecar never written | `interrupted` |
+| pid alive, single segment | `running`, `adopted: true` — watched to completion, then settled below |
+| pid alive, stitched run | held until it exits, then `interrupted` — the later segments and the merge were the dead server's job |
+| pid gone, sidecar written since the run began | `done` — a run that finished while nothing was watching is still a result, and gets its `.meta.json` written now |
+| pid gone, sidecar older than the run | `interrupted` |
+
+The last two rows are the same decision whichever path reaches them, which is
+why both go through `_settle_orphan_run`: there is no exit code to read for a
+process we did not fork, so "did it produce a result?" is answered by the
+sidecar's mtime against the run's start.
 
 `status` is one of `idle` / `running` / `done` / `error` / `interrupted`.
 `interrupted` exists so half a run is never mistaken for a result, and never
@@ -232,7 +254,9 @@ still gets its outcome on return.
 how it tells "the run I started finished while I was away" from a run started
 on another device — the latter it attaches to and labels as such. Launching
 while a run is in flight returns `409` carrying that run's id, so the second
-page attaches instead of reporting a failure nobody caused.
+page attaches instead of reporting a failure nobody caused. The refused page
+does not adopt that id as its own — a run it did not start is labeled as
+somebody else's for as long as it watches it.
 
 ## API
 
