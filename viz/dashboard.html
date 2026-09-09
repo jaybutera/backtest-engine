@@ -477,6 +477,24 @@ function fmtAgo(epoch) {
   return `${Math.floor(sec / 86400)}d ago`;
 }
 
+// Elapsed/remaining as a short human span. Fed server-side seconds, never a
+// difference of two clocks: a phone whose time is minutes off the server's
+// would otherwise render a run as having started in the future.
+function fmtDur(seconds) {
+  const sec = Math.max(0, Math.round(seconds));
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+  return `${Math.floor(sec / 3600)}h${Math.floor((sec % 3600) / 60)}m`;
+}
+
+// Server-supplied text (a backtest's stderr tail, mostly) reaches the run row
+// through innerHTML, so it goes through here first.
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, c => (
+    {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]
+  ));
+}
+
 function fmtR(r) {
   if (r == null) return "—";
   const sign = r >= 0 ? "+" : "−";
@@ -860,8 +878,33 @@ function showBacktestConfig(on) {
 }
 
 
+// ══ Durable runs ════════════════════════════════════════════════════════
+// A backtest belongs to the SERVER, not to this tab. `/api/backtest/run`
+// returns the moment the subprocess is spawned, and every byte of progress
+// afterwards is read back from `/api/backtest/status` — so navigating away,
+// closing the tab, locking the phone or dropping off wifi cannot interrupt a
+// run, and a page that comes back only has to ask what is going on.
+//
+// The one thing worth keeping locally is WHICH run was ours, so an outcome
+// that landed while we were away reads as "your run finished" rather than
+// appearing from nowhere. That handle is the run_id the launch returned.
+const BT_RUN_KEY = "viz.btRunId";
+
+function rememberRun(id) {
+  try {
+    if (id) localStorage.setItem(BT_RUN_KEY, id);
+    else localStorage.removeItem(BT_RUN_KEY);
+  } catch (e) { /* private mode: we lose the wording, not the run */ }
+}
+function rememberedRun() {
+  try { return localStorage.getItem(BT_RUN_KEY) || ""; } catch (e) { return ""; }
+}
+
 // Handle of the active progress poller, so we never run two at once.
 let btPollTimer = null;
+// The in-flight watch, if any. Doubles as the "already attached" flag, so
+// every entry point (launch, load, foregrounding) can call in freely.
+let btWatch = null;
 
 function showBtProgress(on) {
   document.getElementById("bt-progress").classList.toggle("active", on);
@@ -894,40 +937,130 @@ function setBtProgress(fraction, etaSeconds, elapsedSeconds, segLabel) {
   }
 }
 
-// Poll /api/backtest/status until the run is no longer running, updating the
-// bar each tick. Returns the terminal status object (carries error, if any).
+async function fetchBtStatus() {
+  // no-store: a status poll that a proxy or the bfcache answers from cache
+  // would freeze the bar on a stale frame.
+  const resp = await fetch("/api/backtest/status", {cache: "no-store"});
+  return await resp.json();
+}
+
+function segLabelOf(s) {
+  return (s.segments_total || 1) > 1
+    ? `year ${Math.min((s.segments_done || 0) + 1, s.segments_total)}/${s.segments_total}`
+    : "";
+}
+
+// Poll until the server stops reporting a live run, updating the bar each
+// tick. Resolves with the TERMINAL status object (carries error, if any).
+//
+// A failed poll is deliberately not terminal: a phone that lost signal
+// mid-run has to find the run again when it comes back, not conclude it died.
 function pollBacktest() {
-  return new Promise((resolve) => {
-    let lastStatus = null;
+  if (btWatch) return btWatch;
+  btWatch = new Promise((resolve) => {
     const tick = async () => {
+      let s;
       try {
-        const s = await (await fetch("/api/backtest/status")).json();
-        lastStatus = s;
-        if (s.running) {
-          const segLabel = s.segments_total > 1
-            ? `year ${Math.min(s.segments_done + 1, s.segments_total)}/${s.segments_total}`
-            : "";
-          setBtProgress(s.progress ?? 0, s.eta_seconds, s.elapsed_seconds, segLabel);
-        } else {
-          clearInterval(btPollTimer);
-          btPollTimer = null;
-          setBtProgress(1, s.eta_seconds, s.elapsed_seconds);
-          resolve(s);
-        }
+        s = await fetchBtStatus();
       } catch (e) {
-        // Transient fetch error — keep polling; the run is likely still going.
-        console.warn("status poll failed", e);
+        console.warn("status poll failed", e);  // transient — keep polling
+        return;
       }
+      if (s.running) {
+        setBtProgress(s.progress ?? 0, s.eta_seconds, s.elapsed_seconds, segLabelOf(s));
+        return;
+      }
+      clearInterval(btPollTimer);
+      btPollTimer = null;
+      btWatch = null;
+      setBtProgress(1, s.eta_seconds, s.elapsed_seconds);
+      resolve(s);
     };
-    btPollTimer = setInterval(tick, 500);
-    tick();  // fire immediately so the bar moves without a 500ms gap
+    // 1s, not the old 500ms: the bar's own 0.3s width transition carries the
+    // motion between ticks, and a phone on cellular should not spend two
+    // requests a second on a run that takes minutes.
+    btPollTimer = setInterval(tick, 1000);
+    tick();  // fire immediately so the bar moves without a 1s gap
   });
+  return btWatch;
+}
+
+// Watch a run that is in flight — ours or one this page merely found — and
+// report how it ends. This IS the re-attach: the page joins a run already
+// under way instead of owning it.
+async function attachToRun(s) {
+  const btn = document.getElementById("bt-run-btn");
+  const status = document.getElementById("bt-status");
+  const mine = !!s.run_id && s.run_id === rememberedRun();
+  btn.disabled = true;
+  const since = s.started_at && s.server_time
+    ? ` (${fmtDur(s.server_time - s.started_at)} in)` : "";
+  status.textContent = mine
+    ? `Running…${since}`
+    : `Attached to a run already in progress${since}`;
+  showBtProgress(true);
+  setBtProgress(s.progress ?? 0, s.eta_seconds, s.elapsed_seconds, segLabelOf(s));
+  try {
+    await reportOutcome(await pollBacktest(), mine ? "" : "started elsewhere");
+  } finally {
+    showBtProgress(false);
+    btn.disabled = false;
+  }
+}
+
+// Turn a terminal status into what the run row says, and pull in the result
+// when there is one. `note` is appended to a successful line — it is how a
+// page that was away says so.
+async function reportOutcome(s, note) {
+  const status = document.getElementById("bt-status");
+  if (s.run_id && s.run_id === rememberedRun()) rememberRun("");  // reported; now history
+  if (s.status === "interrupted") {
+    // Half a run is not a result. Say what happened rather than loading a
+    // sidecar that belongs to some earlier run.
+    status.innerHTML =
+      `<span class="stale">Interrupted: ${escapeHtml(s.error || "the run did not finish")}</span>`;
+    return;
+  }
+  if (s.status === "error" || s.error) {
+    const msg = (s.error || "unknown error").slice(0, 200);
+    status.innerHTML = `<span class="stale">Failed: ${escapeHtml(msg)}</span>`;
+    console.error(s.error);
+    return;
+  }
+  // loadTrades rewrites the run row as "Last run: …" via updateBacktestStatus.
+  await loadTrades();
+  if (note) status.insertAdjacentHTML("beforeend", ` <span class="stale">· ${escapeHtml(note)}</span>`);
+}
+
+// Ask the server what is happening and join in. Called at load and every time
+// the page comes back to the foreground: a phone that slept through a run, a
+// tab restored from the back/forward cache, a reload mid-run, or a run started
+// from another device entirely.
+async function resyncBacktest() {
+  if (source !== "backtest") return;
+  if (btWatch) return;  // already attached — the poller owns the row
+  let s;
+  try {
+    s = await fetchBtStatus();
+  } catch (e) {
+    console.warn("backtest resync failed", e);
+    return;
+  }
+  if (s.running) {
+    await attachToRun(s);
+    return;
+  }
+  // Nothing in flight. If the run WE launched ended while this page was gone,
+  // say how it went — otherwise there is nothing to re-attach to and the row
+  // already reads "Last run: …".
+  if (s.run_id && s.run_id === rememberedRun()) {
+    await reportOutcome(s, "finished while you were away");
+  }
 }
 
 async function runBacktest() {
   const btn = document.getElementById("bt-run-btn");
   const status = document.getElementById("bt-status");
-  if (btPollTimer) { clearInterval(btPollTimer); btPollTimer = null; }
   btn.disabled = true;
   status.textContent = "Syncing data…";
   // A long-lived tab keeps whatever bounds were prefilled at load, so a run
@@ -944,8 +1077,6 @@ async function runBacktest() {
   const from = fromEl.value;
   const to = toEl.value;
   status.textContent = "Running…";
-  showBtProgress(true);
-  setBtProgress(0, null, null);
   try {
     const strategy = document.getElementById("bt-strategy").value || undefined;
     const fill = document.getElementById("bt-fill").value || undefined;
@@ -957,27 +1088,34 @@ async function runBacktest() {
     const allow_dataset_override = !!(unlockEl && unlockEl.checked);
     // Warmup depth is the strategy's own [viz] warmup_days annotation — the
     // server resolves it per preset; there is deliberately no knob here.
-    // Kick off the run (returns immediately with an ETA), then poll for progress.
+    // Kick off the run. This returns as soon as the subprocess exists: from
+    // here on the run is the server's, and the page is just an observer.
     const resp = await fetch("/api/backtest/run", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({from, to, strategy, fill, dataset, allow_dataset_override}),
     });
     const data = await resp.json();
+    if (resp.status === 409) {
+      // A run is already in flight — quite possibly this phone's own, launched
+      // in a tab that has since gone away. That is not a failure the user
+      // caused, so attach to it instead of reporting one.
+      if (data.run_id) rememberRun(data.run_id);
+      const live = await fetchBtStatus();
+      if (live.running) { await attachToRun(live); return; }
+    }
     if (!resp.ok) {
-      status.innerHTML = `<span class="stale">Failed: ${data.error || resp.status}</span>`;
+      status.innerHTML = `<span class="stale">Failed: ${escapeHtml(String(data.error || resp.status))}</span>`;
       console.error(data);
-      showBtProgress(false);
       return;
     }
+    // Remember the handle BEFORE watching, so even a tab closed one second
+    // later comes back knowing which run to ask about.
+    rememberRun(data.run_id);
+    showBtProgress(true);
+    setBtProgress(0, data.eta_seconds, 0);
     if (data.eta_seconds) status.textContent = `Running… (~${Math.round(data.eta_seconds)}s)`;
-    const final = await pollBacktest();
-    if (final && final.error) {
-      status.innerHTML = `<span class="stale">Failed: ${final.error.slice(0, 200)}</span>`;
-      console.error(final.error);
-      return;
-    }
-    await loadTrades();
+    await reportOutcome(await pollBacktest(), "");
   } finally {
     showBtProgress(false);
     btn.disabled = false;
@@ -1859,35 +1997,22 @@ phoneWidth.addEventListener("change", syncConfigFold);
 if (phoneWidth.matches && !urlSpec) cfgWrap.classList.add("folded");
 syncConfigFold();
 
+// ── Re-attach on every way back into the page ──
+// A run outlives the tab, so the page has to re-ask whenever it regains the
+// foreground, not only on a cold load: `visibilitychange` covers a phone
+// waking up or a tab being switched back to, and `pageshow` with `persisted`
+// covers iOS Safari restoring the page from the back/forward cache with its
+// timers frozen.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") resyncBacktest();
+});
+window.addEventListener("pageshow", (e) => { if (e.persisted) resyncBacktest(); });
+
 document.getElementById("asset-filter").addEventListener("change", applyFilters);
 document.getElementById("outcome-filter").addEventListener("change", applyFilters);
 document.getElementById("direction-filter").addEventListener("change", applyFilters);
 document.getElementById("refresh-btn").addEventListener("click", () => loadTrades({refresh: true}));
 document.getElementById("bt-run-btn").addEventListener("click", runBacktest);
-
-// If a backtest is already running (started before this page loaded, e.g. a
-// reload mid-run), reattach the progress bar instead of leaving it idle.
-async function reattachBacktest() {
-  if (source !== "backtest") return;
-  try {
-    const s = await (await fetch("/api/backtest/status")).json();
-    if (!s.running) return;
-    const btn = document.getElementById("bt-run-btn");
-    const status = document.getElementById("bt-status");
-    btn.disabled = true;
-    status.textContent = "Running…";
-    showBtProgress(true);
-    setBtProgress(s.progress ?? 0, s.eta_seconds, s.elapsed_seconds);
-    const final = await pollBacktest();
-    if (final && final.error) {
-      status.innerHTML = `<span class="stale">Failed: ${final.error.slice(0, 200)}</span>`;
-    } else {
-      await loadTrades();
-    }
-    showBtProgress(false);
-    btn.disabled = false;
-  } catch (e) { console.warn("reattach failed", e); }
-}
 
 initTraderSelect();
 initSourceToggle();
@@ -1895,8 +2020,9 @@ initSourceToggle();
 // sidecar's axes into those pickers. Sequence them — racing the two leaves
 // adoption looking at an empty picker and silently skipping.
 initBacktestDates();
-initSources().then(loadTrades, loadTrades);
-reattachBacktest();
+// resyncBacktest runs last so it reports a finished run's outcome INTO a row
+// the initial load has already written, rather than racing it.
+initSources().then(loadTrades, loadTrades).then(resyncBacktest, resyncBacktest);
 </script>
 </body>
 </html>

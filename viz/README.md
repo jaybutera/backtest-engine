@@ -194,6 +194,46 @@ state.
 
 The `[viz]` table is read here and ignored by the engine.
 
+### A run belongs to the server, not to the browser
+
+`POST /api/backtest/run` returns as soon as the subprocess is spawned. Nothing
+after that depends on the caller staying connected, so closing the tab, locking
+the phone or dropping off wifi cannot interrupt a run — and a page that comes
+back re-attaches by asking `/api/backtest/status` what is going on.
+
+State lives in two places, and the second is what makes it durable:
+
+* in memory on the server, and
+* mirrored to `<report-stem>.run.json` next to the sidecar, rewritten on every
+  state change (launch, each segment, outcome).
+
+`.run.json` describes the RUN — progress, pid, outcome — from the moment it is
+launched. `.meta.json` beside it describes the RESULT and is written only on
+success. Neither is committed; `data/` is ignored.
+
+The subprocess is started in its own session, so a Ctrl-C or SIGTERM aimed at
+the server's process group does not reach a backtest that may be many minutes
+in. On startup the server reconciles whatever `.run.json` says was in flight:
+
+| Found | Reported as |
+|---|---|
+| pid still alive, single segment | `running`, `adopted: true` — watched to completion, then labeled |
+| pid still alive, stitched run | held until it exits, then `interrupted` — the later segments and the merge were the dead server's job |
+| pid gone | `interrupted` |
+| sidecar never written | `interrupted` |
+
+`status` is one of `idle` / `running` / `done` / `error` / `interrupted`.
+`interrupted` exists so half a run is never mistaken for a result, and never
+silently mistaken for nothing having happened. A finished run stays reportable
+for 24h (`RUN_RESULT_TTL_SECONDS`), so a phone that slept through a long run
+still gets its outcome on return.
+
+`run_id` is the handle. A page stores the id of the run it launched, which is
+how it tells "the run I started finished while I was away" from a run started
+on another device — the latter it attaches to and labels as such. Launching
+while a run is in flight returns `409` carrying that run's id, so the second
+page attaches instead of reporting a failure nobody caused.
+
 ## API
 
 | Endpoint | Returns |
@@ -203,8 +243,8 @@ The `[viz]` table is read here and ignored by the engine.
 | `GET /api/chart` | Candles for one trade's window |
 | `GET /api/sources` | Strategy, fill and dataset presets with descriptions |
 | `GET /api/backtest/range` | Date range the selected axes can cover |
-| `POST /api/backtest/run` | Launch a run; returns immediately with an ETA |
-| `GET /api/backtest/status` | Progress, and the last run's axes |
+| `POST /api/backtest/run` | Launch a run; returns immediately with a `run_id` and an ETA, or `409` naming the run already in flight |
+| `GET /api/backtest/status` | `status`, progress, `run_id`, and the last run's axes — this is the re-attach endpoint |
 
 `/api/traders` is an alias of `/api/runs`, kept because the frontend still asks
 for it by that name.
