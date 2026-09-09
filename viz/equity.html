@@ -498,20 +498,31 @@ function segLabelOf(s) {
 function pollBacktest() {
   if (btWatch) return btWatch;
   btWatch = new Promise((resolve) => {
+    // The interval handle THIS watch owns. Ticks overlap — the interval is 1s
+    // and a fetch has no timeout — so a slow tick can land after its own watch
+    // is over and a NEW run has started. By then `btPollTimer` names the new
+    // run's interval, and letting the stale answer settle would clear the new
+    // run's timer, drop its watch and resolve a promise that is already
+    // settled: the bar freezes and Run stays disabled until a reload. A tick
+    // that is not from the current watch is simply dropped.
+    let timer = null;
+    const current = () => timer !== null && btPollTimer === timer;
     const tick = async () => {
       let s;
       try { s = await fetchBtStatus(); }
       catch (e) { console.warn("status poll failed", e); return; }
+      if (!current()) return;
       if (s.running) {
         setBtProgress(s.progress ?? 0, s.eta_seconds, s.elapsed_seconds, segLabelOf(s));
         return;
       }
-      clearInterval(btPollTimer);
+      clearInterval(timer);
       btPollTimer = null;
       btWatch = null;
       resolve(s);
     };
-    btPollTimer = setInterval(tick, 1000);
+    timer = setInterval(tick, 1000);
+    btPollTimer = timer;
     tick();
   });
   return btWatch;
@@ -525,22 +536,26 @@ const esc = s => String(s ?? "—").replace(/[&<>"']/g, c =>
 // Turn a terminal status into what the control row says, pulling in the result
 // when there is one. `note` is appended on success — it is how a page that was
 // away says so.
-async function reportOutcome(s, note) {
+async function reportOutcome(s, note, {reload = true} = {}) {
   const status = document.getElementById("bt-status");
+  // The note says whose run this was and what to do about it, so it belongs on
+  // a failure too: without it a foreign run's error reads as the user's own.
+  const tail = note ? ` <span class="stale">· ${esc(note)}</span>` : "";
   if (s.run_id && s.run_id === rememberedRun()) rememberRun("");
   if (s.status === "interrupted") {
     // Half a run is not a result: say so rather than charting a sidecar that
     // belongs to some earlier run.
-    status.innerHTML = `<span class="stale">Interrupted: ${esc(s.error || "the run did not finish")}</span>`;
+    status.innerHTML = `<span class="stale">Interrupted: ${esc(s.error || "the run did not finish")}</span>` + tail;
     return;
   }
   if (s.status === "error" || s.error) {
-    status.innerHTML = `<span class="stale">Failed: ${esc((s.error || "unknown error").slice(0, 200))}</span>`;
+    status.innerHTML = `<span class="stale">Failed: ${esc((s.error || "unknown error").slice(0, 200))}</span>` + tail;
     console.error(s.error);
     return;
   }
-  await loadTrades();  // rewrites the row as "Last run: …"
-  if (note) status.insertAdjacentHTML("beforeend", ` <span class="stale">· ${esc(note)}</span>`);
+  // `reload: false` is for the caller that has just loaded the trades itself.
+  if (reload) await loadTrades();  // rewrites the row as "Last run: …"
+  if (tail) status.insertAdjacentHTML("beforeend", tail);
 }
 
 // Watch a run already in flight — ours or one started elsewhere — and report
@@ -563,14 +578,17 @@ async function attachToRun(s) {
 
 // Ask the server what is happening and join in. Called at load and every time
 // the page comes back to the foreground.
-function resyncBacktest() {
+// `justLoaded` says the caller has already loaded the trades, so an outcome
+// that is already terminal needs only its note rather than a second identical
+// round trip.
+function resyncBacktest({justLoaded = false} = {}) {
   return claimRunRow(async () => {
     let s;
     try { s = await fetchBtStatus(); }
     catch (e) { console.warn("backtest resync failed", e); return; }
     if (s.running) { await attachToRun(s); return; }
     if (s.run_id && s.run_id === rememberedRun()) {
-      await reportOutcome(s, "finished while you were away");
+      await reportOutcome(s, "finished while you were away", {reload: !justLoaded});
     }
   });
 }
@@ -602,7 +620,7 @@ async function launchBacktest() {
       if (live.running) { await attachToRun(live); return; }
       // It finished between our POST and this look: nothing failed, nothing is
       // running. Show that run's result and say why ours did not start.
-      await reportOutcome(live, "another run was already in flight — press Run again to launch yours");
+      await reportOutcome(live, "that was another run — press Run again to launch yours");
       return;
     }
     if (!resp.ok) {
@@ -657,8 +675,10 @@ window.addEventListener("pageshow", (e) => { if (e.persisted) resyncBacktest(); 
 
 initBacktestDates();
 // resync runs after the first load so it reports an outcome INTO a row the
-// load has already written, rather than racing it.
-loadTrades().then(resyncBacktest, resyncBacktest);
+// load has already written, rather than racing it — and is told so, so it
+// appends to that row instead of loading the same trades again.
+const bootResync = () => resyncBacktest({justLoaded: true});
+loadTrades().then(bootResync, bootResync);
 </script>
 </body>
 </html>

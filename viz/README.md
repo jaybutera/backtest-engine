@@ -209,9 +209,21 @@ State lives in two places, and the second is what makes it durable:
 
 `.run.json` describes the RUN — progress, pid, outcome — from the moment it is
 launched. `.meta.json` beside it describes the RESULT and is written only on
-success. A third file, `<report-stem>.run.log`, holds the run's stderr, and is
-truncated at the start of each run. None of them is committed; `data/` is
-ignored.
+success. `<report-stem>.run.log` holds the run's stderr, truncated at the start
+of each run. None of them is committed; `data/` is ignored.
+
+A run does not write the report itself. `BT_JSON` points the engine at
+`<report-stem>.run-<run_id>.json`, and that file is moved into place only once
+the run has succeeded — a rename within one directory, so a page reading the
+report gets either the previous result or this one, never the half-written file
+the engine is still filling in. It also makes authorship provable: a sidecar at
+the published path could have been written by anything, `scripts/backtest.sh`
+run by hand while the server was down most of all, and reconciling an orphan by
+asking whether the report is newer than the run would then label a manual run's
+numbers with the dead run's axes and uid. A file only that run's `BT_JSON`
+names cannot be confused for one. The consequence to know about: a run
+orphaned by a server that never comes back leaves its result staged rather than
+published, until a server does come back and settles it.
 
 Three things, together, are what let the run outlive the server. Any one of
 them missing kills it:
@@ -236,13 +248,15 @@ On startup the server reconciles whatever `.run.json` says was in flight:
 |---|---|
 | pid alive, single segment | `running`, `adopted: true` — watched to completion, then settled below |
 | pid alive, stitched run | held until it exits, then `interrupted` — the later segments and the merge were the dead server's job |
-| pid gone, sidecar written since the run began | `done` — a run that finished while nothing was watching is still a result, and gets its `.meta.json` written now |
-| pid gone, sidecar older than the run | `interrupted` |
+| pid gone, staged result present | `done` — a run that finished while nothing was watching is still a result: it is published now, and gets its `.meta.json` |
+| pid gone, nothing staged | `interrupted` |
 
 The last two rows are the same decision whichever path reaches them, which is
 why both go through `_settle_orphan_run`: there is no exit code to read for a
-process we did not fork, so "did it produce a result?" is answered by the
-sidecar's mtime against the run's start.
+process we did not fork, so "did it produce a result?" is answered by whether
+the run's own staged file is there. A record from before staging existed (no
+`staged` marker) falls back to comparing the report's mtime against the run's
+start, which is a guess — that is what staging replaced.
 
 `status` is one of `idle` / `running` / `done` / `error` / `interrupted`.
 `interrupted` exists so half a run is never mistaken for a result, and never
