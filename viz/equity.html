@@ -617,6 +617,9 @@ async function liveRunAfter409(refusal) {
     try {
       s = await fetchBtStatus();
     } catch (e) {
+      // Null means "we never found out", which the caller has to say out loud
+      // rather than leave a stale "Running…" standing.
+      console.warn("status fetch after a 409 failed", e);
       return null;
     }
     if (!refusal.pending || s.running || Date.now() >= deadline) return s;
@@ -649,10 +652,21 @@ async function launchBacktest() {
       // ours.
       const live = await liveRunAfter409(data);
       if (live && live.running) { await attachToRun(live); return; }
+      if (!live) {
+        // The refusal is the last thing we heard from the server. We know our
+        // launch did not start; we do not know what took the slot, and the row
+        // is still showing the "Running…" it was given a moment ago — which is
+        // now the one thing we are sure is false. Say so instead. Whatever is
+        // actually going on gets picked up by the next resync, on the next
+        // foregrounding or reload.
+        status.innerHTML = `<span class="stale">Could not reach the server — `
+          + `your run did not start. Check the connection and press Run again.</span>`;
+        return;
+      }
       // Nothing is running: either that run finished between our POST and this
       // look, or the launch that beat us failed its own validation. Ours did
       // not start either way, and nothing of ours failed.
-      if (live) await reportOutcome(live, "that was another run — press Run again to launch yours");
+      await reportOutcome(live, "that was another run — press Run again to launch yours");
       return;
     }
     if (!resp.ok) {
