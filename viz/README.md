@@ -221,9 +221,16 @@ the published path could have been written by anything, `scripts/backtest.sh`
 run by hand while the server was down most of all, and reconciling an orphan by
 asking whether the report is newer than the run would then label a manual run's
 numbers with the dead run's axes and uid. A file only that run's `BT_JSON`
-names cannot be confused for one. The consequence to know about: a run
-orphaned by a server that never comes back leaves its result staged rather than
-published, until a server does come back and settles it.
+names cannot be confused for one. The staged file is parsed before it is
+published — the engine writes it with a plain `std::fs::write`, so a process
+killed partway through leaves truncated JSON, and its mere existence is all the
+orphan path has to go on. A run that ends any way but `done` takes its staged
+file with it, since the name carries the run id and a leftover would otherwise
+accumulate.
+
+The consequence to know about: a run orphaned by a server that never comes back
+leaves its result staged rather than published, until a server does come back
+and settles it.
 
 Three things, together, are what let the run outlive the server. Any one of
 them missing kills it:
@@ -248,8 +255,8 @@ On startup the server reconciles whatever `.run.json` says was in flight:
 |---|---|
 | pid alive, single segment | `running`, `adopted: true` — watched to completion, then settled below |
 | pid alive, stitched run | held until it exits, then `interrupted` — the later segments and the merge were the dead server's job |
-| pid gone, staged result present | `done` — a run that finished while nothing was watching is still a result: it is published now, and gets its `.meta.json` |
-| pid gone, nothing staged | `interrupted` |
+| pid gone, staged result parses | `done` — a run that finished while nothing was watching is still a result: it is published now, and gets its `.meta.json` |
+| pid gone, nothing staged or it is truncated | `interrupted` |
 
 The last two rows are the same decision whichever path reaches them, which is
 why both go through `_settle_orphan_run`: there is no exit code to read for a
@@ -271,6 +278,14 @@ while a run is in flight returns `409` carrying that run's id, so the second
 page attaches instead of reporting a failure nobody caused. The refused page
 does not adopt that id as its own — a run it did not start is labeled as
 somebody else's for as long as it watches it.
+
+A refusal can also arrive while the launch that beat it is still validating,
+before that launch has seeded a record. The 409 then carries `pending: true`
+and no id, because the record that exists at that moment belongs to the
+PREVIOUS run and naming it would send the page off to attach to an old result.
+The page waits a few seconds for the real run to appear instead, and falls
+through to "press Run again" if the launch that beat it turns out to fail its
+own validation.
 
 ## API
 

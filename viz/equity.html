@@ -393,7 +393,11 @@ async function loadTrades({refresh = false} = {}) {
   }
 }
 
+// `generated_at` of the report the chart currently shows; see resyncBacktest.
+let loadedGeneratedAt = null;
+
 function updateBacktestStatus(exists, generatedAt, freshness) {
+  loadedGeneratedAt = exists ? generatedAt : null;
   const el = document.getElementById("bt-status");
   if (!exists) {
     el.textContent = "No backtest yet — click Run.";
@@ -588,9 +592,36 @@ function resyncBacktest({justLoaded = false} = {}) {
     catch (e) { console.warn("backtest resync failed", e); return; }
     if (s.running) { await attachToRun(s); return; }
     if (s.run_id && s.run_id === rememberedRun()) {
-      await reportOutcome(s, "finished while you were away", {reload: !justLoaded});
+      // `justLoaded` alone is not enough: the run can finish between that load
+      // and this status fetch, leaving the PREVIOUS result on screen under a
+      // "finished while you were away" note. Skip the reload only when what is
+      // charted is the report this outcome is about.
+      const showing = justLoaded && s.generated_at != null
+        && s.generated_at === loadedGeneratedAt;
+      await reportOutcome(s, "finished while you were away", {reload: !showing});
     }
   });
+}
+
+// The status of whatever took the slot from us. A refusal marked `pending`
+// means the launch that beat us is still validating and has not seeded its
+// record yet, so /api/backtest/status would answer with the PREVIOUS run —
+// attaching to that shows an old result under a "that was another run" note,
+// for a run that started a moment later. Wait for the real one to appear. If
+// the launch that beat us turns out to fail validation, nothing ever appears
+// and the timeout falls through to telling the user to press Run again.
+async function liveRunAfter409(refusal) {
+  const deadline = Date.now() + 3000;
+  for (;;) {
+    let s;
+    try {
+      s = await fetchBtStatus();
+    } catch (e) {
+      return null;
+    }
+    if (!refusal.pending || s.running || Date.now() >= deadline) return s;
+    await new Promise(r => setTimeout(r, 200));
+  }
 }
 
 function runBacktest() {
@@ -616,11 +647,12 @@ async function launchBacktest() {
       // rather than reporting a failure the user did not cause — and do NOT
       // remember its id, or a run somebody else started would be labeled as
       // ours.
-      const live = await fetchBtStatus();
-      if (live.running) { await attachToRun(live); return; }
-      // It finished between our POST and this look: nothing failed, nothing is
-      // running. Show that run's result and say why ours did not start.
-      await reportOutcome(live, "that was another run — press Run again to launch yours");
+      const live = await liveRunAfter409(data);
+      if (live && live.running) { await attachToRun(live); return; }
+      // Nothing is running: either that run finished between our POST and this
+      // look, or the launch that beat us failed its own validation. Ours did
+      // not start either way, and nothing of ours failed.
+      if (live) await reportOutcome(live, "that was another run — press Run again to launch yours");
       return;
     }
     if (!resp.ok) {
