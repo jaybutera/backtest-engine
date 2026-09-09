@@ -28,6 +28,14 @@ the pages render empty with a hint rather than erroring.
 the query string, so a link to one trade renders from the URL alone and stays
 readable after the run that produced it has been overwritten.
 
+Every page works on a phone. One breakpoint at 860px (in `theme.css`, shared by
+all of them) switches to the narrow layout: controls grow to 44px targets, the
+label/field grids collapse to one column and trade rows stack. On the dashboard
+the 500px sidebar and the chart become two panes with a tab bar between them,
+and the backtest config folds behind its section header so the trade list is
+above the fold. Hover styling is gated on `hover: hover` rather than on width,
+since on a touchscreen `:hover` sticks to whatever was tapped last.
+
 ## The report contract
 
 `scripts/backtest.sh` passes `--json-sidecar` to the binary, which writes
@@ -186,6 +194,99 @@ state.
 
 The `[viz]` table is read here and ignored by the engine.
 
+### A run belongs to the server, not to the browser
+
+`POST /api/backtest/run` returns as soon as the subprocess is spawned. Nothing
+after that depends on the caller staying connected, so closing the tab, locking
+the phone or dropping off wifi cannot interrupt a run — and a page that comes
+back re-attaches by asking `/api/backtest/status` what is going on.
+
+State lives in two places, and the second is what makes it durable:
+
+* in memory on the server, and
+* mirrored to `<report-stem>.run.json` next to the sidecar, rewritten on every
+  state change (launch, each segment, outcome).
+
+`.run.json` describes the RUN — progress, pid, outcome — from the moment it is
+launched. `.meta.json` beside it describes the RESULT and is written only on
+success. `<report-stem>.run.log` holds the run's stderr, truncated at the start
+of each run. None of them is committed; `data/` is ignored.
+
+A run does not write the report itself. `BT_JSON` points the engine at
+`<report-stem>.run-<run_id>.json`, and that file is moved into place only once
+the run has succeeded — a rename within one directory, so a page reading the
+report gets either the previous result or this one, never the half-written file
+the engine is still filling in. It also makes authorship provable: a sidecar at
+the published path could have been written by anything, `scripts/backtest.sh`
+run by hand while the server was down most of all, and reconciling an orphan by
+asking whether the report is newer than the run would then label a manual run's
+numbers with the dead run's axes and uid. A file only that run's `BT_JSON`
+names cannot be confused for one. The staged file is parsed before it is
+published — the engine writes it with a plain `std::fs::write`, so a process
+killed partway through leaves truncated JSON, and its mere existence is all the
+orphan path has to go on. A run that ends any way but `done` takes its staged
+file with it, since the name carries the run id and a leftover would otherwise
+accumulate.
+
+The consequence to know about: a run orphaned by a server that never comes back
+leaves its result staged rather than published, until a server does come back
+and settles it.
+
+Three things, together, are what let the run outlive the server. Any one of
+them missing kills it:
+
+* **`start_new_session=True`** — so a Ctrl-C or SIGTERM aimed at the server's
+  process group does not reach the child.
+* **a plain `subprocess.Popen`, not an asyncio child** — when the loop shuts
+  down, asyncio finalizes the child's transport, and
+  `BaseSubprocessTransport.close()` **SIGKILLs a child that is still running**.
+  That kill comes from us, so a new session is no defense against it. Exit is
+  awaited by polling `poll()`, which owns nothing and so kills nothing.
+* **stderr to a file, not a pipe** — a pipe's only reader is the server. Once
+  the server is gone the read end closes, and the engine logs progress to
+  stderr for the whole run, so the orphan would panic on its next line (Rust
+  ignores SIGPIPE, so the write raises rather than being dropped). A file has
+  no reader to lose. It is also a tighter memory bound than the pipe it
+  replaced, which buffered a whole run's stderr in the server.
+
+On startup the server reconciles whatever `.run.json` says was in flight:
+
+| Found | Reported as |
+|---|---|
+| pid alive, single segment | `running`, `adopted: true` — watched to completion, then settled below |
+| pid alive, stitched run | held until it exits, then `interrupted` — the later segments and the merge were the dead server's job |
+| pid gone, staged result parses | `done` — a run that finished while nothing was watching is still a result: it is published now, and gets its `.meta.json` |
+| pid gone, nothing staged or it is truncated | `interrupted` |
+
+The last two rows are the same decision whichever path reaches them, which is
+why both go through `_settle_orphan_run`: there is no exit code to read for a
+process we did not fork, so "did it produce a result?" is answered by whether
+the run's own staged file is there. A record from before staging existed (no
+`staged` marker) falls back to comparing the report's mtime against the run's
+start, which is a guess — that is what staging replaced.
+
+`status` is one of `idle` / `running` / `done` / `error` / `interrupted`.
+`interrupted` exists so half a run is never mistaken for a result, and never
+silently mistaken for nothing having happened. A finished run stays reportable
+for 24h (`RUN_RESULT_TTL_SECONDS`), so a phone that slept through a long run
+still gets its outcome on return.
+
+`run_id` is the handle. A page stores the id of the run it launched, which is
+how it tells "the run I started finished while I was away" from a run started
+on another device — the latter it attaches to and labels as such. Launching
+while a run is in flight returns `409` carrying that run's id, so the second
+page attaches instead of reporting a failure nobody caused. The refused page
+does not adopt that id as its own — a run it did not start is labeled as
+somebody else's for as long as it watches it.
+
+A refusal can also arrive while the launch that beat it is still validating,
+before that launch has seeded a record. The 409 then carries `pending: true`
+and no id, because the record that exists at that moment belongs to the
+PREVIOUS run and naming it would send the page off to attach to an old result.
+The page waits a few seconds for the real run to appear instead, and falls
+through to "press Run again" if the launch that beat it turns out to fail its
+own validation.
+
 ## API
 
 | Endpoint | Returns |
@@ -195,8 +296,8 @@ The `[viz]` table is read here and ignored by the engine.
 | `GET /api/chart` | Candles for one trade's window |
 | `GET /api/sources` | Strategy, fill and dataset presets with descriptions |
 | `GET /api/backtest/range` | Date range the selected axes can cover |
-| `POST /api/backtest/run` | Launch a run; returns immediately with an ETA |
-| `GET /api/backtest/status` | Progress, and the last run's axes |
+| `POST /api/backtest/run` | Launch a run; returns immediately with a `run_id` and an ETA, or `409` naming the run already in flight |
+| `GET /api/backtest/status` | `status`, progress, `run_id`, and the last run's axes — this is the re-attach endpoint |
 
 `/api/traders` is an alias of `/api/runs`, kept because the frontend still asks
 for it by that name.

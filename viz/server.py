@@ -6,6 +6,16 @@ thing the server WRITES is a backtest run — `/api/backtest/run` launches
 `scripts/backtest.sh` in the background and `/api/backtest/status` reports its
 progress, so a run can be kicked off and watched from the page.
 
+A run belongs to the SERVER, not to the browser that asked for it. The launch
+POST returns as soon as the subprocess is spawned, and every byte of progress
+lives server-side: an in-memory record mirrored to a small JSON file next to
+the sidecar (`<stem>.run.json`). Closing the tab, locking the phone or losing
+the network therefore cannot interrupt a run — and any page that comes back
+re-attaches by polling `/api/backtest/status`, which reports the live run, or
+the outcome of the last one, whichever applies. The state file also survives a
+server restart, so a run that was in flight is reported as adopted (its process
+outlived us) or interrupted (it did not) rather than silently vanishing.
+
 Three orthogonal axes compose a run, each a directory of TOML presets:
 
   strategy  config/strategy/*.toml  — pure algorithm: gating params + assets
@@ -22,7 +32,11 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
+import time
 import tomllib
+import uuid
+from collections.abc import Coroutine
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -70,6 +84,11 @@ DEFAULT_FILL = "market_hybrid.toml"
 # ETA. Absent or stale is fine — the estimator falls back to a linear guess.
 TIMING_MODEL_PATH = Path("config/backtest_timing.json")
 
+# How long a finished run stays reportable to a page that reconnects. A phone
+# that slept through a 40-minute run should still be told how it went; a run
+# from last week is history, and the sidecar itself is the record.
+RUN_RESULT_TTL_SECONDS = 24 * 3600
+
 HTML_PATH = Path(__file__).parent / "dashboard.html"
 EQUITY_HTML_PATH = Path(__file__).parent / "equity.html"
 EXHIBIT_HTML_PATH = Path(__file__).parent / "exhibit.html"
@@ -78,6 +97,20 @@ EXHIBIT_HTML_PATH = Path(__file__).parent / "exhibit.html"
 THEME_CSS_PATH = Path(__file__).parent / "theme.css"
 
 logger = logging.getLogger(__name__)
+
+
+def _as_number(value: object, default: float) -> float:
+    """A number from an untrusted record, or `default`.
+
+    The run-state record round-trips through a JSON file on disk, so nothing
+    in it is guaranteed to still be the type that was written. A malformed
+    field must degrade the same way a malformed `.meta.json` does — ignored —
+    rather than turning a status poll into a 500. bool is excluded on purpose:
+    `True` is an int in Python and a nonsense timestamp everywhere else.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return float(value)
 
 
 def _backtest_uid(meta: dict) -> str:
@@ -837,8 +870,18 @@ class BacktestVizServer:
         self.backtest_path = backtest_path
         self._backtest_lock = asyncio.Lock()
         # Live run state, polled by /api/backtest/status to drive the progress
-        # bar. Set when a run starts, updated when it finishes or fails.
-        self._bt_run: dict | None = None
+        # bar and to re-attach a page that was away. Set when a run starts,
+        # updated as segments complete, and again when it finishes or fails.
+        # Every mutation is mirrored to `_run_state_path()` by `_save_run_state`
+        # so the record outlives both the browser AND this process.
+        self._bt_run: dict | None = self._read_run_state()
+        # Strong references to the background tasks driving a run. asyncio only
+        # holds weak ones, so a task nobody names can be collected mid-run.
+        self._run_task: asyncio.Task | None = None
+        self._adopt_task: asyncio.Task | None = None
+        # Held from the instant a launch is accepted until it has either seeded
+        # a record or failed. See `_api_backtest_run`.
+        self._launching = False
         self._app = web.Application()
         # Page routes come from the registry (the single source of truth): "/"
         # serves the default run and "/<key>" serves each registry entry. No run
@@ -860,6 +903,390 @@ class BacktestVizServer:
         self._app.router.add_get("/api/backtest/status", self._api_backtest_status)
         self._app.router.add_get("/api/backtest/range", self._api_backtest_range)
         self._app.router.add_get("/api/sources", self._api_sources)
+
+    # ── Durable run state ────────────────────────────────────────────────────
+
+    def _run_state_path(self) -> Path:
+        """Side JSON, next to the sidecar, holding the current/last run record.
+
+        Separate from `.meta.json`: meta describes the RESULT (which axes made
+        the sidecar on disk) and is written only on success, while this file
+        describes the RUN (progress, pid, outcome) and is written from the
+        moment it is launched.
+        """
+        return self.backtest_path.with_name(self.backtest_path.stem + ".run.json")
+
+    def _save_run_state(self) -> None:
+        """Mirror `_bt_run` to disk, atomically. Best-effort by design.
+
+        A failure here must never take down a run that is otherwise fine, so
+        it is logged and swallowed: the in-memory record still drives every
+        status poll for the life of this process.
+        """
+        run = self._bt_run
+        if run is None:
+            return
+        path = self._run_state_path()
+        tmp = path.with_suffix(".json.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tmp.open("w") as f:
+                json.dump(run, f)
+            os.replace(tmp, path)
+        except OSError:
+            logger.warning("could not persist backtest run state", exc_info=True)
+            tmp.unlink(missing_ok=True)
+
+    #: Every status the record is allowed to carry. A file holding anything
+    #: else is not a record this code wrote, so it is ignored outright.
+    RUN_STATUSES = frozenset({"running", "done", "error", "interrupted"})
+
+    def _read_run_state(self) -> dict | None:
+        """The persisted run record, or None when there is none to trust.
+
+        A hand-edited, truncated or half-written file must be ignored the same
+        way a malformed `.meta.json` is: the pages then simply report `idle`.
+        Only the shape is checked here — individual numeric fields are coerced
+        at the point of use, since a record can be valid and still carry one
+        field this version did not write.
+        """
+        path = self._run_state_path()
+        if not path.exists():
+            return None
+        try:
+            with path.open() as f:
+                run = json.load(f)
+        except (OSError, ValueError):
+            logger.warning("ignoring unreadable backtest run state at %s", path)
+            return None
+        if not isinstance(run, dict) or run.get("status") not in self.RUN_STATUSES:
+            logger.warning("ignoring malformed backtest run state at %s", path)
+            return None
+        return run
+
+    @staticmethod
+    def _pid_alive(pid: object) -> bool:
+        """Whether `pid` still names a live process.
+
+        Signal 0 does no work beyond the existence-and-permission check, which
+        is exactly the question. A recycled pid is theoretically possible; in
+        practice the window is a server restart, and being wrong here costs a
+        status label, not a run.
+
+        Takes `object` because the pid arrives from the on-disk record: a
+        non-integer there means "no pid we can check", not a crash.
+        """
+        pid = int(_as_number(pid, 0))
+        if pid <= 0:
+            return False
+        # A zombie answers signal 0: it has exited, but nobody has reaped it,
+        # so its pid still resolves. That happens whenever the process that
+        # forked the server is still around to hold the entry — a supervisor,
+        # an autoreloader — and it would leave a finished orphan looking like
+        # it was running forever, with every launch answering 409. /proc is the
+        # only way to tell an exited process from a live one; where there is no
+        # /proc, fall through to the signal, which answers the question minus
+        # this one case.
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                # "<pid> (comm) <state> …", and comm may itself contain spaces
+                # and parentheses — so the state is the field after the LAST
+                # closing paren, not the third whitespace-separated one.
+                state = f.read().rpartition(b")")[2].split()[0]
+            return state != b"Z"
+        except (OSError, IndexError):
+            pass
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _run_log_path(self) -> Path:
+        """Where a run's stderr goes.
+
+        A FILE, never a pipe. A pipe's only reader is this process, so once the
+        server is gone the read end closes — and the engine logs progress to
+        stderr for the whole run, so the orphan would die on its next line
+        (Rust ignores SIGPIPE, so the write panics rather than being dropped).
+        A file has no reader to lose.
+
+        Truncated at the start of each run, so it holds one run's output and
+        nothing older. That is a tighter bound than the pipe it replaces, which
+        buffered a whole run's stderr in this process's memory.
+        """
+        return self.backtest_path.with_name(self.backtest_path.stem + ".run.log")
+
+    def _run_log_tail(self, limit: int = 800) -> str:
+        """The end of the run log — what the stderr pipe used to hand back."""
+        try:
+            with self._run_log_path().open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - limit))
+                return f.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    @staticmethod
+    async def _await_exit(proc: subprocess.Popen) -> int:
+        """Wait for a child to exit without owning it.
+
+        Deliberately NOT `communicate()` on an asyncio child process. When the
+        loop shuts down, asyncio finalizes that child's transport, and
+        `BaseSubprocessTransport.close()` SIGKILLs a process that is still
+        running — `start_new_session` is no defense, because the kill comes
+        from us rather than from the terminal. Polling a plain `Popen` has no
+        such finalizer: cancelling this coroutine just stops the polling and
+        leaves the run alone, which is the whole point of the durable record.
+        """
+        while proc.poll() is None:
+            await asyncio.sleep(0.25)
+        return proc.returncode
+
+    def _run_result_path(self, run_id: object) -> Path | None:
+        """Where a run writes its sidecar before it is published, or None.
+
+        Every run writes here first and is moved into place only once it has
+        succeeded. That buys two things:
+
+          * **Proof of authorship.** A sidecar at the published path could have
+            been written by anything — most plausibly `scripts/backtest.sh` run
+            by hand while the server was down. Reconciling an orphan by asking
+            whether the published sidecar is newer than the run would then
+            label somebody else's result with the dead run's axes and uid. A
+            file only this run's `BT_JSON` names cannot be confused for one.
+          * **An atomic publish.** A page reading the report sees either the
+            previous result or this one, never the half-written file the engine
+            is still filling in.
+
+        None when the record carries no usable run id, which is how a record
+        written before this existed is recognised.
+        """
+        if not isinstance(run_id, str) or not run_id.isalnum():
+            return None
+        return self.backtest_path.with_name(
+            f"{self.backtest_path.stem}.run-{run_id}.json"
+        )
+
+    def _publish_result(self, src: Path) -> int | None:
+        """Move a finished run's sidecar into place; return its mtime.
+
+        The report is parsed first. The engine writes it with a plain
+        `std::fs::write`, which is not atomic, so a process killed partway
+        through leaves a truncated file behind — and the orphan path's only
+        evidence that a run finished is that this file is there. Publishing
+        that would put a half-written report at the path every page reads and
+        label it `done` with a fresh `.meta.json`. Parsing it once per run is
+        nothing next to the run that produced it.
+
+        `os.replace` within one directory is atomic, which is the point of the
+        move itself: a reader never observes a partial file.
+
+        None if the report is missing or unreadable, or if the move fails —
+        which the callers turn into a run that produced no result.
+        """
+        try:
+            with src.open() as f:
+                json.load(f)
+        except (OSError, ValueError):
+            logger.warning("staged report at %s is missing or not readable JSON", src)
+            return None
+        try:
+            os.replace(src, self.backtest_path)
+            return int(self.backtest_path.stat().st_mtime)
+        except OSError:
+            logger.exception("could not publish the run's sidecar")
+            return None
+
+    def _segment_temp_paths(self, total: int) -> list[Path]:
+        """The per-segment sidecars a stitched run writes before merging."""
+        stem = self.backtest_path.stem
+        return [self.backtest_path.with_name(f"{stem}.seg{i}.json") for i in range(total)]
+
+    def _clear_segment_temps(self, total: int) -> None:
+        """Delete a stitched run's leftover segment sidecars.
+
+        The task that created them normally removes them in its `finally`; a
+        server that was killed mid-stitch never got there, so the next process
+        sweeps them. Leaving them would make the following stitched run read a
+        previous run's segment as its own.
+        """
+        for path in self._segment_temp_paths(max(total, 1)):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("could not remove stale segment sidecar %s", path)
+
+    def _clear_staged_result(self, run: dict) -> None:
+        """Delete what a run staged but never published.
+
+        Reached by every terminal state except `done`. The engine can write the
+        report and still exit non-zero, so a failed run leaves a complete-
+        looking file behind — and because the name carries the run id, a
+        leftover accumulates rather than being overwritten by the next run.
+        """
+        staged = self._run_result_path(run.get("run_id"))
+        if staged is None:
+            return
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("could not remove staged report %s", staged)
+
+    def _interrupt_run(self, run: dict, why: str) -> None:
+        """Close out a run that cannot produce a result, saying why.
+
+        A half-finished run must not be reported as a result, and silence
+        would read as "never ran" — so it gets its own terminal status.
+        """
+        run.update(
+            status="interrupted",
+            error=why,
+            finished_at=time.time(),
+            pid=None,
+        )
+        self._clear_segment_temps(int(_as_number(run.get("segments_total"), 1)) or 1)
+        # Whatever this run staged is not a result, and leaving it would let a
+        # later reconcile publish a half-finished report.
+        self._clear_staged_result(run)
+        self._save_run_state()
+
+    def _legacy_sidecar_written_since(self, started_at: object) -> int | None:
+        """Whether the PUBLISHED sidecar looks like it came from this run.
+
+        Only for a record written before runs staged their output — one with no
+        `staged` marker, whose engine wrote the published path directly. There
+        is no exit code to read for a process we did not fork, so the best such
+        a record can offer is the mtime: the sidecar counts if it was written
+        after the run began. The second of slack absorbs the mtime being whole
+        seconds against a float `started_at`.
+
+        It is a guess, and that is why runs stage their output now: any sidecar
+        newer than the run passes this, including one written by
+        `scripts/backtest.sh` run by hand while the server was down, which
+        would then be labeled with this run's axes and uid. New records go
+        through `_run_result_path` instead, which cannot be fooled.
+
+        A `started_at` that is not a usable timestamp answers None as well:
+        without it there is nothing to compare the mtime against.
+        """
+        started = _as_number(started_at, 0.0)
+        if started <= 0:
+            return None
+        try:
+            mtime = int(self.backtest_path.stat().st_mtime)
+        except OSError:
+            return None
+        return mtime if mtime >= started - 1 else None
+
+    def _settle_orphan_run(self, run: dict, gone_note: str) -> None:
+        """Decide how a run this process did not launch actually ended.
+
+        Shared by both orphan paths — the one that finds the process already
+        gone at startup, and the one that watches an adopted process exit —
+        because the question is identical and only the wording differs. Keeping
+        it in one place is what stops the startup path from calling a finished
+        run "interrupted": a single-segment run that completed between the old
+        server dying and this one starting is a real result on disk, and
+        reporting it as interrupted would also leave the sidecar labeled with
+        the PREVIOUS run's axes and uid.
+        """
+        total = int(_as_number(run.get("segments_total"), 1)) or 1
+        if total > 1:
+            # A stitched run is orchestrated BY the server: the segments after
+            # the interrupted one were never launched and the merge never ran,
+            # so the sidecar on disk is still the PREVIOUS result however
+            # cleanly the surviving segment exited. Calling that "done" would
+            # relabel an old result as this run's.
+            done = int(_as_number(run.get("segments_done"), 0))
+            self._interrupt_run(
+                run,
+                f"the server restarted during segment {min(done + 1, total)}/{total}; "
+                "the remaining segments never ran — re-run to get the full range",
+            )
+            return
+        # Did this run produce a result? A staged run answers with a file only
+        # its own BT_JSON could have created — proof, not inference — and the
+        # answer is published here, since the process that would have done it
+        # is gone. A pre-staging record falls back to the mtime guess.
+        staged = self._run_result_path(run.get("run_id")) if run.get("staged") else None
+        if staged is not None:
+            mtime = self._publish_result(staged)
+        else:
+            mtime = self._legacy_sidecar_written_since(run.get("started_at"))
+        if mtime is None:
+            self._interrupt_run(run, gone_note)
+            return
+        run.update(
+            status="done",
+            # The sidecar's mtime IS when the run finished, and it is the only
+            # honest answer available: this process was not watching.
+            finished_at=float(mtime),
+            pid=None,
+            segments_done=total,
+            generated_at=mtime,
+            error=None,
+        )
+        self._save_run_state()
+        # The process that launched this run died before it could label the
+        # result, so the axes are written here instead — otherwise the run's
+        # sidecar keeps the last one's uid in the UI.
+        self._write_backtest_meta(run)
+        logger.info("orphaned backtest run %s completed; result adopted",
+                    run.get("run_id"))
+
+    async def adopt_orphan_run(self) -> None:
+        """Reconcile a run that was in flight when this process last stopped.
+
+        Called once at startup. The persisted record says a run was running;
+        whether it still is depends on its subprocess, which was started
+        detached precisely so that stopping the server would not stop it:
+
+          * process alive → ADOPT: hold the backtest lock and watch the pid, so
+            the page shows live progress and a second run is refused until it
+            exits.
+          * process gone  → SETTLE: it may still have finished. Ask the sidecar
+            before calling it interrupted.
+        """
+        run = self._bt_run
+        if not run or run.get("status") != "running":
+            return
+        if not self._pid_alive(run.get("pid")):
+            logger.info("previous backtest run %s is no longer running; settling it",
+                        run.get("run_id"))
+            self._settle_orphan_run(
+                run, "the server stopped while this run was in flight",
+            )
+            return
+        run["adopted"] = True
+        self._save_run_state()
+        logger.info("adopted backtest run %s (pid %s) still in flight",
+                    run.get("run_id"), run.get("pid"))
+        self._adopt_task = asyncio.create_task(
+            self._guarded_run_driver(self._watch_adopted_run(), "adopted-run watcher"),
+        )
+
+    async def _watch_adopted_run(self) -> None:
+        """Hold the lock until an adopted (non-child) run's process exits.
+
+        `wait()` is unavailable for a process we did not fork, so this polls.
+        The lock is held throughout, so a fresh run cannot start beside the
+        orphan — the two would write the same sidecar and the same segment
+        temporaries.
+        """
+        async with self._backtest_lock:
+            run = self._bt_run
+            if run is None:
+                return
+            while self._pid_alive(run.get("pid")):
+                await asyncio.sleep(1.0)
+            self._settle_orphan_run(
+                run, "the adopted run ended without leaving a complete result",
+            )
 
     # ── Pages ────────────────────────────────────────────────────────────────
 
@@ -1209,11 +1636,59 @@ class BacktestVizServer:
         dataset (data sources) through the chosen fill lens.
 
         This does NOT wait for the run to finish — it launches a background
-        task and returns `{started, eta_seconds}` so the UI can poll
-        `/api/backtest/status` and animate a progress bar.
+        task and returns `{started, run_id, eta_seconds}` so the UI can poll
+        `/api/backtest/status` and animate a progress bar. Nothing about the
+        run depends on the caller staying connected: the response is the last
+        the run needs from the browser, and `run_id` is the handle a page uses
+        to recognize the run again when it comes back.
         """
-        if self._backtest_lock.locked():
-            return web.json_response({"error": "backtest already running"}, status=409)
+        # Three conditions, because they cover three different windows.
+        # `_launching` spans the validation in `_launch_backtest`, which awaits
+        # — the request body at least — and so can interleave with a second
+        # POST. The record is "running" from the moment a run is accepted
+        # through to its outcome. The lock is held for an adopted run whose
+        # record this process did not write.
+        #
+        # Without the first, two simultaneous launches both pass this check and
+        # both seed `_bt_run`: the second record replaces the first, and the
+        # first task then writes its pid and its outcome into the second run's
+        # record. So the slot is claimed synchronously — before the first await
+        # — and released on every exit path, including the 400s that never
+        # reach a record at all.
+        in_flight = (self._bt_run or {}).get("status") == "running"
+        if self._launching or in_flight or self._backtest_lock.locked():
+            # Identify the run that holds the slot. A second tab (or the same
+            # phone after a reload) uses this to ATTACH to the run in flight
+            # instead of reporting a failure the user did not cause.
+            live = self._bt_run or {}
+            # `pending` says a launch has claimed the slot but has not seeded
+            # its record yet. There is no id to hand back — and the record that
+            # IS there belongs to the PREVIOUS run, so naming it would send the
+            # caller to attach to an old result under a "that was another run"
+            # note. Saying so lets the page wait for the real one instead.
+            pending = self._launching and not in_flight
+            return web.json_response({
+                "error": "backtest already running",
+                "pending": pending,
+                "run_id": None if pending else live.get("run_id"),
+                "started_at": None if pending else live.get("started_at"),
+                "eta_seconds": None if pending else live.get("eta_seconds"),
+                "adopted": bool(live.get("adopted")) and not pending,
+            }, status=409)
+        self._launching = True
+        try:
+            return await self._launch_backtest(request)
+        finally:
+            self._launching = False
+
+    async def _launch_backtest(self, request: web.Request) -> web.Response:
+        """Validate the axes, compose the environment, and start the run.
+
+        Split out of `_api_backtest_run` so the slot claim there is a plain
+        try/finally around a single call: every `return` in here — and there
+        are several, one per way the axes can be wrong — releases it without
+        having to remember to.
+        """
         try:
             payload = await request.json() if request.body_exists else {}
         except Exception:
@@ -1312,19 +1787,31 @@ class BacktestVizServer:
                 status=400,
             )
 
-        # backtest.sh reads these and passes them to the replay binary.
+        run_id = uuid.uuid4().hex[:12]
+        # backtest.sh reads these and passes them to the replay binary. The
+        # report goes to this run's own staging path, never straight to the
+        # published one — see `_run_result_path`.
         env["BT_FILL"] = str(FILL_DIR / fill)
-        env["BT_JSON"] = str(self.backtest_path)
+        env["BT_JSON"] = str(self._run_result_path(run_id))
 
         eta = _estimate_backtest_seconds(base_strategy, dataset, fill)
-        loop = asyncio.get_running_loop()
         self.backtest_path.parent.mkdir(parents=True, exist_ok=True)
         # Seed the run state BEFORE launching, so a status poll racing the
         # spawn still sees "running". The lock is taken inside the task and
         # released when it completes, so `locked()` tracks the real subprocess.
+        #
+        # `started_at` is WALL CLOCK, not the event loop's monotonic clock: the
+        # record is read back by a later process (after a restart) and by the
+        # page, neither of which shares this loop's zero point.
         self._bt_run = {
-            "running": True,
-            "started_at": loop.time(),
+            "run_id": run_id,
+            # Recorded so a LATER process knows this run stages its result
+            # rather than writing it in place. Its absence is what marks a
+            # record written before staging existed.
+            "staged": True,
+            "status": "running",
+            "pid": None,  # filled in by the task once the subprocess exists
+            "started_at": time.time(),
             "eta_seconds": eta,
             "strategy": base_strategy,
             "fill": fill,
@@ -1336,16 +1823,20 @@ class BacktestVizServer:
             "finished_at": None,
             "segments_total": len(segments),
             "segments_done": 0,
+            "adopted": False,
             # Non-null only when the dataset axis was explicitly unlocked for a
             # constrained strategy, so the UI can badge the result as a
             # deliberate mix rather than the preset's published pairing.
             "dataset_override": conflict if (conflict and override) else None,
         }
-        asyncio.create_task(self._run_backtest_task(
-            env, base_strategy, fill, dataset_label, bool(sources), warmup_days, segments,
+        self._save_run_state()
+        self._run_task = asyncio.create_task(self._guarded_run_driver(
+            self._run_backtest_task(env, bool(sources), warmup_days, segments),
+            "backtest task",
         ))
         return web.json_response({
             "started": True,
+            "run_id": run_id,
             "eta_seconds": eta,
             "from": from_str,
             "to": to_str,
@@ -1356,9 +1847,57 @@ class BacktestVizServer:
             "segments": len(segments),
         })
 
+    async def _guarded_run_driver(self, driver: Coroutine, what: str) -> None:
+        """Run a coroutine that drives a run, guaranteeing a terminal status.
+
+        `/api/backtest/status` treats `status == "running"` as "a run is in
+        flight" — the record rather than the lock, because the record is what a
+        reconnecting page and a restarted server both have to trust. That only
+        holds if EVERY exit path writes a terminal status. An escaping
+        exception becomes one here instead of leaving pages polling a run that
+        nothing is driving, and every launch answering 409 until a restart.
+
+        Cancellation is the one exception, and the important one: it means the
+        SERVER is going away, not the run. The subprocess is detached and keeps
+        working, so the record has to stay "running" for the next process to
+        adopt — writing a terminal status here would report a failure that
+        never happened and abandon a run still on its way to a result.
+
+        Both background drivers go through this: the task running our own
+        subprocess, and the watcher holding the lock for an adopted one.
+        """
+        cancelled = False
+        try:
+            await driver
+        except asyncio.CancelledError:
+            cancelled = True
+            logger.info("server stopping; backtest %s left in flight",
+                        (self._bt_run or {}).get("run_id"))
+            raise
+        except Exception:
+            logger.exception("%s crashed", what)
+        finally:
+            run = self._bt_run
+            if not cancelled and run is not None:
+                if run.get("status") == "running":
+                    run.update(
+                        status="error",
+                        finished_at=time.time(),
+                        pid=None,
+                        error=run.get("error") or f"{what} exited without reporting an outcome",
+                    )
+                    self._save_run_state()
+                if run.get("status") != "done":
+                    # One sweep covering every way a run can end without
+                    # publishing: a non-zero exit that still wrote a report, a
+                    # publish that failed, a driver that crashed. Not on
+                    # cancellation — the run is still going and still writing
+                    # to that file, and the next process needs it to settle.
+                    self._clear_staged_result(run)
+
     async def _run_backtest_task(
-        self, env: dict, strategy: str, fill: str, dataset: str,
-        sources_applied: bool, warmup_days: int, segments: list[tuple[str, str]],
+        self, env: dict, sources_applied: bool, warmup_days: int,
+        segments: list[tuple[str, str]],
     ) -> None:
         """Background worker: run backtest.sh to completion, update `_bt_run`.
 
@@ -1370,8 +1909,21 @@ class BacktestVizServer:
         sidecar; the merged document replaces the real sidecar only after every
         segment succeeds, so a mid-stitch failure never leaves a partial run
         posing as the result.
+
+        Every state change is mirrored to the run-state file, so a page that
+        reconnects mid-run picks up the right segment and a page that
+        reconnects after the fact still learns how it ended.
         """
         async with self._backtest_lock:
+            staged = self._run_result_path((self._bt_run or {}).get("run_id"))
+            if staged is None:  # unreachable: the record was just seeded here
+                return
+            # Start this run's log empty, so a failure tail can never quote the
+            # previous run's stderr and the file stays bounded by one run.
+            try:
+                self._run_log_path().write_bytes(b"")
+            except OSError:
+                logger.warning("could not open the run log", exc_info=True)
             stitched = len(segments) > 1
             seg_docs: list[dict] = []
             seg_paths: list[Path] = []
@@ -1380,12 +1932,11 @@ class BacktestVizServer:
                 for i, (seg_from, seg_to) in enumerate(segments):
                     if self._bt_run is not None:
                         self._bt_run["segments_done"] = i
+                        self._save_run_state()
                     seg_env = env
-                    seg_path = self.backtest_path
+                    seg_path = staged
                     if stitched:
-                        seg_path = self.backtest_path.with_name(
-                            self.backtest_path.stem + f".seg{i}.json"
-                        )
+                        seg_path = self._segment_temp_paths(len(segments))[i]
                         seg_paths.append(seg_path)
                         seg_env = dict(env)
                         seg_env["BT_JSON"] = str(seg_path)
@@ -1395,27 +1946,51 @@ class BacktestVizServer:
                     argv = [str(BACKTEST_SCRIPT), "--from", seg_from, "--to", seg_to]
                     if warmup_days > 0:
                         argv += ["--warmup-days", str(warmup_days)]
+                    # A plain Popen, not an asyncio child: see `_await_exit`
+                    # for why owning the process would let a Ctrl-C kill it.
+                    # stderr goes to a file for the matching reason in
+                    # `_run_log_path` — a pipe dies with the server and takes
+                    # the orphan with it on its next log line. The file object
+                    # is closed immediately; the child holds its own dup of the
+                    # descriptor and keeps writing long after we are gone.
                     try:
-                        proc = await asyncio.create_subprocess_exec(
-                            *argv,
-                            stdout=asyncio.subprocess.DEVNULL,
-                            stderr=asyncio.subprocess.PIPE,
-                            env=seg_env,
-                            cwd=str(REPO_ROOT),
-                        )
-                        _, stderr = await proc.communicate()
+                        with self._run_log_path().open("ab") as errf:
+                            proc = subprocess.Popen(  # noqa: S603
+                                argv,
+                                # No stdin: an inherited one leaves the orphan
+                                # holding the server's terminal for the life of
+                                # the run, and the engine reads nothing from it.
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,
+                                stderr=errf,
+                                env=seg_env,
+                                cwd=str(REPO_ROOT),
+                                # Its own session, so a Ctrl-C or SIGTERM aimed
+                                # at the server's process group does not also
+                                # reach a backtest many minutes in. The pid is
+                                # recorded so a restarted server finds it again.
+                                start_new_session=True,
+                            )
                     except Exception as e:
                         logger.exception("backtest launch failed")
                         if self._bt_run is not None:
-                            self._bt_run.update(running=False, error=f"{type(e).__name__}: {e}")
+                            self._bt_run.update(
+                                status="error", finished_at=time.time(),
+                                error=f"{type(e).__name__}: {e}",
+                            )
+                            self._save_run_state()
                         return
-                    if proc.returncode != 0:
-                        tail = stderr.decode("utf-8", errors="replace")[-800:]
+                    if self._bt_run is not None:
+                        self._bt_run["pid"] = proc.pid
+                        self._save_run_state()
+                    rc = await self._await_exit(proc)
+                    if rc != 0:
+                        tail = self._run_log_tail()
                         note = (
                             f" (segment {i + 1}/{len(segments)} {seg_from}..{seg_to})"
                             if stitched else ""
                         )
-                        run_error = f"backtest failed (rc={proc.returncode}){note}: {tail}"
+                        run_error = f"backtest failed (rc={rc}){note}: {tail}"
                         break
                     if stitched:
                         try:
@@ -1429,7 +2004,7 @@ class BacktestVizServer:
                             break
                 if run_error is None and stitched:
                     try:
-                        with self.backtest_path.open("w") as f:
+                        with staged.open("w") as f:
                             json.dump(_merge_backtest_sidecars(seg_docs), f)
                     except (OSError, ValueError) as e:
                         run_error = f"segment merge failed: {type(e).__name__}: {e}"
@@ -1439,45 +2014,67 @@ class BacktestVizServer:
 
             if self._bt_run is None:
                 return
-            loop = asyncio.get_running_loop()
-            self._bt_run["running"] = False
-            self._bt_run["finished_at"] = loop.time()
+            self._bt_run["finished_at"] = time.time()
             self._bt_run["segments_done"] = len(segments)
+            self._bt_run["pid"] = None
             if run_error is not None:
+                self._bt_run["status"] = "error"
                 self._bt_run["error"] = run_error
+                self._save_run_state()
                 return
             self._bt_run["sources_applied"] = sources_applied
-            try:
-                self._bt_run["generated_at"] = int(self.backtest_path.stat().st_mtime)
-            except OSError:
-                self._bt_run["error"] = "backtest wrote no sidecar"
+            # Publish only now, and only from the staging path: until this
+            # point the report on disk is still the previous run's, which is
+            # exactly what a reader should see while this one is in flight.
+            generated = self._publish_result(staged)
+            if generated is None:
+                self._bt_run["status"] = "error"
+                self._bt_run["error"] = "the backtest left no readable report"
+                self._save_run_state()
                 return
-            # Record which axes produced this sidecar in a small side JSON, so
-            # results stay labeled with their strategy × fill × dataset even
-            # after a page reload (the engine's sidecar has no fill slot).
-            try:
-                meta_path = self._backtest_meta_path()
-                meta_path.parent.mkdir(parents=True, exist_ok=True)
-                meta = {
-                    "strategy": strategy,
-                    "fill": fill,
-                    "dataset": dataset,
-                    "from": segments[0][0],
-                    "to": segments[-1][1],
-                    # Recorded for reproducibility; NOT part of the uid.
-                    "warmup_days": warmup_days,
-                    "rewarm_segments": len(segments) if stitched else None,
-                    "generated_at": self._bt_run["generated_at"],
-                    # Non-null when this run deliberately ignored the
-                    # strategy's dataset constraint. Persisted with the axes so
-                    # the badge survives a reload.
-                    "dataset_override": self._bt_run.get("dataset_override"),
-                }
-                meta["uid"] = _backtest_uid(meta)
-                with meta_path.open("w") as f:
-                    json.dump(meta, f)
-            except OSError:
-                logger.exception("failed to write backtest meta sidecar")
+            self._bt_run["status"] = "done"
+            self._bt_run["generated_at"] = generated
+            self._save_run_state()
+            self._write_backtest_meta(self._bt_run)
+
+    def _write_backtest_meta(self, run: dict) -> None:
+        """Record which axes produced the sidecar now on disk.
+
+        A small side JSON, so a result stays labeled with its
+        strategy × fill × dataset after a page reload (the engine's sidecar has
+        no fill slot). Taken from the run RECORD rather than from the task's
+        arguments, so the adopted-run path — whose task belonged to a process
+        that is gone — can label its result the same way.
+
+        Best-effort: an unlabeled result still renders.
+        """
+        # Coerced, like every other read of the record: this is reached from
+        # the orphan path, where the record came off disk rather than from the
+        # launch that built it.
+        segments = int(_as_number(run.get("segments_total"), 1)) or 1
+        meta = {
+            "strategy": run.get("strategy"),
+            "fill": run.get("fill"),
+            "dataset": run.get("dataset"),
+            "from": run.get("from"),
+            "to": run.get("to"),
+            # Recorded for reproducibility; NOT part of the uid.
+            "warmup_days": run.get("warmup_days"),
+            "rewarm_segments": segments if segments > 1 else None,
+            "generated_at": run.get("generated_at"),
+            # Non-null when this run deliberately ignored the strategy's
+            # dataset constraint. Persisted with the axes so the badge survives
+            # a reload.
+            "dataset_override": run.get("dataset_override"),
+        }
+        meta["uid"] = _backtest_uid(meta)
+        try:
+            meta_path = self._backtest_meta_path()
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            with meta_path.open("w") as f:
+                json.dump(meta, f)
+        except OSError:
+            logger.exception("failed to write backtest meta sidecar")
 
     def _backtest_meta_path(self) -> Path:
         """Side JSON, next to the sidecar, recording the last run's axes."""
@@ -1505,20 +2102,60 @@ class BacktestVizServer:
     async def _api_backtest_status(self, request: web.Request) -> web.Response:
         """Progress and outcome of the current or last run.
 
+        This endpoint IS the re-attach mechanism. A page that was closed,
+        backgrounded, reloaded or opened on another device calls it and learns
+        either that a run is still going — with its progress and which segment
+        it is on — or how the last one ended. `run_id` is the handle: a page
+        that launched a run remembers the id and can therefore tell "the run I
+        started finished while I was away" apart from "someone else's run".
+
+        `status` is one of idle / running / done / error / interrupted.
+        `interrupted` is reported only after a restart found a run whose
+        process did not survive; it exists so half a run is never mistaken for
+        a result and never silently mistaken for nothing having happened.
+
         While a run is live, `progress` is time-based (elapsed / eta) and held
         below 1.0 until the subprocess actually exits, so the bar never claims
         done early. Past the estimate it creeps asymptotically toward 0.99,
         which is what an undershooting model looks like from the page.
         """
         exists = self.backtest_path.exists()
-        running = self._backtest_lock.locked()
+        run = self._bt_run or {}
+        status = run.get("status") or "idle"
+        # Every number below comes out of the on-disk record through
+        # `_as_number`. `_read_run_state` rejects a record with the wrong
+        # SHAPE, but a valid record can still carry a field this version did
+        # not write, and a status poll must degrade to "no figure" rather than
+        # to a 500.
+        # The RECORD, not the lock, decides whether a run is in flight: it is
+        # seeded before the subprocess is spawned (so a poll racing the launch
+        # still says "running") and it is all a restarted server has to go on.
+        # `_guarded_run_driver` guarantees it reaches a terminal state.
+        running = status == "running"
+        now = time.time()
+        # A finished run stays reportable for a while, so a phone that slept
+        # through a long run still gets its outcome on return. Past the window
+        # it is history and the sidecar speaks for itself.
+        finished_at = run.get("finished_at")
+        fresh = running or (
+            finished_at is not None
+            and now - _as_number(finished_at, 0.0) < RUN_RESULT_TTL_SECONDS
+        )
         out: dict = {
             "exists": exists,
             "generated_at": int(self.backtest_path.stat().st_mtime) if exists else None,
             "running": running,
+            "status": status if (run and fresh) else "idle",
+            # Wall clock, so a page can render "started 6m ago" without
+            # trusting its own device clock to agree with the server's.
+            "server_time": now,
         }
-        run = self._bt_run
-        if run is not None:
+        if run and fresh:
+            out["run_id"] = run.get("run_id")
+            out["started_at"] = run.get("started_at")
+            out["finished_at"] = finished_at
+            # True when this run outlived the server process that launched it.
+            out["adopted"] = bool(run.get("adopted"))
             out["dataset_override"] = run.get("dataset_override")
             axes = {
                 "strategy": run.get("strategy"),
@@ -1527,8 +2164,8 @@ class BacktestVizServer:
                 "warmup_days": run.get("warmup_days"),
             }
             if running:
-                eta = run.get("eta_seconds") or 1.0
-                elapsed = max(0.0, asyncio.get_running_loop().time() - run["started_at"])
+                eta = _as_number(run.get("eta_seconds"), 0.0) or 1.0
+                elapsed = max(0.0, now - _as_number(run.get("started_at"), now))
                 raw = elapsed / eta
                 progress = raw if raw < 0.9 else 0.9 + 0.09 * (1 - 1 / (1 + (raw - 0.9)))
                 out.update({
@@ -1539,9 +2176,10 @@ class BacktestVizServer:
                 })
                 # Stitched long run: which segment the subprocess is on, so the
                 # bar can say "year 3/5".
-                if (run.get("segments_total") or 1) > 1:
-                    out["segments_total"] = run["segments_total"]
-                    out["segments_done"] = run.get("segments_done", 0)
+                total = int(_as_number(run.get("segments_total"), 1))
+                if total > 1:
+                    out["segments_total"] = total
+                    out["segments_done"] = int(_as_number(run.get("segments_done"), 0))
             else:
                 out.update({"progress": 1.0, "error": run.get("error"), **axes})
         # Always surface the persisted axes of the last completed run — this
@@ -1557,6 +2195,9 @@ class BacktestVizServer:
         runner = web.AppRunner(self._app)
         await runner.setup()
         await web.TCPSite(runner, host, port).start()
+        # Reconcile a run that was in flight when this process last stopped,
+        # before the first status poll can see the stale record.
+        await self.adopt_orphan_run()
         logger.info("backtest viz running at http://%s:%d", host, port)
         return runner
 

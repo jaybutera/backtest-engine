@@ -2,12 +2,15 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Trade Viz</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <link rel="stylesheet" href="/theme.css">
 <style>
   /* Page-specific layout on top of the shared 端末 TERMINAL theme (theme.css). */
-  .app { display: flex; height: 100vh; }
+  /* dvh tracks the viewport as mobile browser chrome collapses; the vh line
+     stays first as the fallback for engines that don't know dvh. */
+  .app { display: flex; height: 100vh; height: 100dvh; }
   .sidebar {
     width: 500px;
     background: var(--panel);
@@ -112,10 +115,79 @@
   tr.st-alert td { background: rgba(210,161,63,.05); font-size: 11px; }
   tr.st-alert.esc td { background: rgba(232,69,47,.08); }
   tr.st-human td { background: rgba(88,166,255,.07); }
+
+  /* ══ Phone: one pane at a time ═════════════════════════════════════════
+     The desktop layout is a 500px sidebar beside a chart. At 390px that is
+     890px of demand for 390px of screen, so below the shared breakpoint the
+     two become stacked panes and #mobile-tabs picks which one is on screen.
+     Each pane fills the viewport minus the tab bar, so neither the list nor
+     the chart ever needs a sideways scroll. */
+  .mobile-tabs { display: none; }
+  @media (max-width: 860px) {
+    .app { flex-direction: column; }
+    .sidebar { width: 100%; border-right: 0; }
+    /* Whichever pane is showing takes the space the other gave up. Both leave
+       room for the fixed tab bar, plus the home-indicator inset on a notched
+       phone. */
+    .app.pane-list .sidebar,
+    .app.pane-chart .chart-area {
+      flex: 1; min-height: 0;
+      padding-bottom: calc(48px + env(safe-area-inset-bottom, 0px));
+    }
+    .app.pane-list .chart-area { display: none; }
+    /* The page header lives INSIDE the sidebar, so hiding the sidebar outright
+       would take the title and the Equity/Refresh nav off the chart pane with
+       it. Keep the header, drop everything below it. */
+    .app.pane-chart .sidebar { flex: 0 0 auto; padding-bottom: 0; }
+    .app.pane-chart .sidebar > *:not(.hdr) { display: none; }
+
+    .mobile-tabs {
+      display: flex;
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
+      background: var(--panel); border-top: 1px solid var(--line-hard);
+      padding-bottom: env(safe-area-inset-bottom, 0px);
+    }
+    .mobile-tabs button {
+      flex: 1; min-height: 48px; border: 0; background: none; color: var(--dim);
+      font: inherit; font-size: 10px; letter-spacing: .16em; text-transform: uppercase;
+      cursor: pointer;
+    }
+    .mobile-tabs button + button { border-left: 1px solid var(--line); }
+    .mobile-tabs button[aria-selected="true"] {
+      background: var(--shu); color: #fff; font-weight: 700;
+    }
+
+    /* At 390px the config grid alone fills the first screen and pushes the
+       trade list below the fold, so on a phone the section header becomes a
+       disclosure and the grid starts closed. The run row, the status line and
+       the progress bar stay outside the fold — on a phone those are what you
+       open the page to look at. */
+    #bt-config-sect { min-height: 44px; cursor: pointer; user-select: none; }
+    #bt-config-sect::before { content: "\25BE"; color: var(--shu); font-size: 11px; }
+    #backtest-config.folded #bt-config-sect::before { content: "\25B8"; }
+    #backtest-config.folded #backtest-controls { display: none; }
+
+    /* The chart header is a single nowrap row on desktop; the meta line is
+       long enough to need every one of these to stay inside 390px. */
+    .chart-header { flex-wrap: wrap; row-gap: 4px; padding: 8px 12px; }
+    .chart-header .meta { flex: 1 1 100%; overflow-wrap: anywhere; line-height: 1.5; }
+    #chart { min-height: 240px; }
+    /* Swatches earn their vertical space on a phone; the marker glossary
+       does not — it is three lines of legend above the chart. */
+    .legend { padding: 6px 12px; gap: 10px; }
+    .legend .legend-verbose { display: none; }
+    /* Trade-story panel (rendered into the chart pane). */
+    .tv-story { padding: 4px 12px 48px; font-size: 12px; }
+    .st-utc, .st-table.opt .st-utc { width: auto; white-space: normal; }
+    .st-n { width: 18px; }
+    .st-chart { max-width: 100%; }
+  }
 </style>
 </head>
 <body>
-<div class="app">
+<!-- `pane-list` is the phone layout's starting pane; setPane() takes over
+     from here. On a desktop viewport the class matches nothing. -->
+<div class="app pane-list">
   <aside class="sidebar">
     <div class="hdr">
       <div class="title">
@@ -134,7 +206,13 @@
       <select id="trader-select"></select>
     </div>
     <div id="backtest-config">
-      <div class="sect"><span class="cjk">設定</span> backtest config</div>
+      <!-- On a phone this header doubles as a disclosure for the config grid
+           below it (see syncConfigFold); at desktop widths it is inert and the
+           grid is always open. -->
+      <div class="sect" id="bt-config-sect" role="button" aria-expanded="true"
+           aria-controls="backtest-controls">
+        <span class="cjk">設定</span> backtest config
+      </div>
       <div class="grid hidden" id="backtest-controls">
         <label for="bt-from">From</label>
         <input type="date" id="bt-from">
@@ -203,10 +281,18 @@
       <span><span class="swatch" style="background: var(--ink)"></span> Exit</span>
       <span><span class="swatch" style="background: var(--loss)"></span> Stop (jsonl)</span>
       <span><span class="swatch" style="background: var(--win)"></span> Target (jsonl)</span>
-      <span>▲ Long entry · ▼ Short entry · ● Exit · small dot = exact fill (bar × price)</span>
+      <span class="legend-verbose">▲ Long entry · ▼ Short entry · ● Exit · small dot = exact fill (bar × price)</span>
     </div>
   </section>
 </div>
+<!-- Phone-only pane switcher. The desktop layout shows the trade list and the
+     chart side by side; 390px has room for exactly one, so below the
+     breakpoint they become two panes and this bar picks between them. Hidden
+     (display:none) at every wider width, so the desktop DOM is unchanged. -->
+<nav class="mobile-tabs" id="mobile-tabs" aria-label="View">
+  <button type="button" data-pane="list" aria-selected="true">取引 Trades</button>
+  <button type="button" data-pane="chart" aria-selected="false" id="mt-chart">図 Chart</button>
+</nav>
 <script>
 // The registry (server-side single source of truth) injected inline at serve
 // time by _index — NO trader name is hardcoded in this page. Shape:
@@ -230,10 +316,13 @@ let allTrades = [];
 // Last /api/trades error. Shown as a banner on the empty list so a load
 // failure isn't mistaken for "no trades yet" — the two look identical.
 let lastIngestError = null;
-// HTML-escape for interpolating server text (error strings, trader names) into
-// innerHTML. Module-level so both the trade list and the detail panel share it.
-const esc = s => String(s ?? "—").replace(/[&<>]/g, c =>
-  ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[c]));
+// HTML-escape for interpolating server text (error strings, a backtest's
+// stderr tail, trader names) into innerHTML. Module-level: the trade list, the
+// detail panel and the run row all share it. Quotes are in the set because
+// some of that text lands in an attribute (`title="…"`), where escaping only
+// the angle brackets still lets a quote break out.
+const esc = s => String(s ?? "—").replace(/[&<>"']/g, c =>
+  ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 // ─── Shareable-URL state ──────────────────────────────────────────────────────
 // The full backtest spec rides in the URL as ?bt=<uid> — the run's canonical
 // UID (strategy×fill×dataset@from..to, .toml stripped; the same token the
@@ -389,6 +478,16 @@ function fmtAgo(epoch) {
   if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
   if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
   return `${Math.floor(sec / 86400)}d ago`;
+}
+
+// Elapsed/remaining as a short human span. Fed server-side seconds, never a
+// difference of two clocks: a phone whose time is minutes off the server's
+// would otherwise render a run as having started in the future.
+function fmtDur(seconds) {
+  const sec = Math.max(0, Math.round(seconds));
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`;
+  return `${Math.floor(sec / 3600)}h${Math.floor((sec % 3600) / 60)}m`;
 }
 
 function fmtR(r) {
@@ -728,7 +827,13 @@ function updateAxesLabel(meta) {
   el.appendChild(chip);
 }
 
+// `generated_at` of the report the trade list currently shows. The boot
+// resync compares it with what the status endpoint reports, so it can only skip
+// its reload when the two are the same report.
+let loadedGeneratedAt = null;
+
 function updateBacktestStatus(exists, generatedAt, freshness, datasetOverride) {
+  loadedGeneratedAt = exists ? generatedAt : null;
   if (source !== "backtest") return;
   const el = document.getElementById("bt-status");
   if (!exists) {
@@ -774,8 +879,54 @@ function showBacktestConfig(on) {
 }
 
 
+// ══ Durable runs ════════════════════════════════════════════════════════
+// A backtest belongs to the SERVER, not to this tab. `/api/backtest/run`
+// returns the moment the subprocess is spawned, and every byte of progress
+// afterwards is read back from `/api/backtest/status` — so navigating away,
+// closing the tab, locking the phone or dropping off wifi cannot interrupt a
+// run, and a page that comes back only has to ask what is going on.
+//
+// The one thing worth keeping locally is WHICH run was ours, so an outcome
+// that landed while we were away reads as "your run finished" rather than
+// appearing from nowhere. That handle is the run_id the launch returned.
+const BT_RUN_KEY = "viz.btRunId";
+
+function rememberRun(id) {
+  try {
+    if (id) localStorage.setItem(BT_RUN_KEY, id);
+    else localStorage.removeItem(BT_RUN_KEY);
+  } catch (e) { /* private mode: we lose the wording, not the run */ }
+}
+function rememberedRun() {
+  try { return localStorage.getItem(BT_RUN_KEY) || ""; } catch (e) { return ""; }
+}
+
 // Handle of the active progress poller, so we never run two at once.
 let btPollTimer = null;
+// The in-flight watch, if any. Doubles as the "already attached" flag, so
+// every entry point (launch, load, foregrounding) can call in freely.
+let btWatch = null;
+// Whether some entry point already owns the run row. Claimed SYNCHRONOUSLY,
+// before anything awaits, because `btWatch` is only set after a status fetch
+// and two entrants would both sail past a check made before it: a bfcache
+// restore fires visibilitychange AND pageshow, either can land in the middle
+// of runBacktest between its POST and its own poll, and both can race the
+// initial load. Two owners meant two pollers on one interval handle,
+// loadTrades twice, and the outcome note appended twice.
+let btBusy = false;
+
+// Run `fn` as the sole owner of the run row, or do nothing if it is taken.
+// The claim is safe because the check and the set both happen before the first
+// await, and nothing else can run in between.
+async function claimRunRow(fn) {
+  if (btBusy) return;
+  btBusy = true;
+  try {
+    return await fn();
+  } finally {
+    btBusy = false;
+  }
+}
 
 function showBtProgress(on) {
   document.getElementById("bt-progress").classList.toggle("active", on);
@@ -808,40 +959,188 @@ function setBtProgress(fraction, etaSeconds, elapsedSeconds, segLabel) {
   }
 }
 
-// Poll /api/backtest/status until the run is no longer running, updating the
-// bar each tick. Returns the terminal status object (carries error, if any).
+async function fetchBtStatus() {
+  // no-store: a status poll that a proxy or the bfcache answers from cache
+  // would freeze the bar on a stale frame.
+  const resp = await fetch("/api/backtest/status", {cache: "no-store"});
+  return await resp.json();
+}
+
+function segLabelOf(s) {
+  return (s.segments_total || 1) > 1
+    ? `year ${Math.min((s.segments_done || 0) + 1, s.segments_total)}/${s.segments_total}`
+    : "";
+}
+
+// Poll until the server stops reporting a live run, updating the bar each
+// tick. Resolves with the TERMINAL status object (carries error, if any).
+//
+// A failed poll is deliberately not terminal: a phone that lost signal
+// mid-run has to find the run again when it comes back, not conclude it died.
 function pollBacktest() {
-  return new Promise((resolve) => {
-    let lastStatus = null;
+  if (btWatch) return btWatch;
+  btWatch = new Promise((resolve) => {
+    // The interval handle THIS watch owns. Ticks overlap — the interval is 1s
+    // and a fetch has no timeout — so a slow tick can land after its own watch
+    // is over and a NEW run has started. By then `btPollTimer` names the new
+    // run's interval, and letting the stale answer settle would clear the new
+    // run's timer, drop its watch and resolve a promise that is already
+    // settled: the bar freezes and Run stays disabled until a reload. A tick
+    // that is not from the current watch is simply dropped.
+    let timer = null;
+    const current = () => timer !== null && btPollTimer === timer;
     const tick = async () => {
+      let s;
       try {
-        const s = await (await fetch("/api/backtest/status")).json();
-        lastStatus = s;
-        if (s.running) {
-          const segLabel = s.segments_total > 1
-            ? `year ${Math.min(s.segments_done + 1, s.segments_total)}/${s.segments_total}`
-            : "";
-          setBtProgress(s.progress ?? 0, s.eta_seconds, s.elapsed_seconds, segLabel);
-        } else {
-          clearInterval(btPollTimer);
-          btPollTimer = null;
-          setBtProgress(1, s.eta_seconds, s.elapsed_seconds);
-          resolve(s);
-        }
+        s = await fetchBtStatus();
       } catch (e) {
-        // Transient fetch error — keep polling; the run is likely still going.
-        console.warn("status poll failed", e);
+        console.warn("status poll failed", e);  // transient — keep polling
+        return;
       }
+      if (!current()) return;
+      if (s.running) {
+        setBtProgress(s.progress ?? 0, s.eta_seconds, s.elapsed_seconds, segLabelOf(s));
+        return;
+      }
+      clearInterval(timer);
+      btPollTimer = null;
+      btWatch = null;
+      setBtProgress(1, s.eta_seconds, s.elapsed_seconds);
+      resolve(s);
     };
-    btPollTimer = setInterval(tick, 500);
-    tick();  // fire immediately so the bar moves without a 500ms gap
+    // 1s, not the old 500ms: the bar's own 0.3s width transition carries the
+    // motion between ticks, and a phone on cellular should not spend two
+    // requests a second on a run that takes minutes.
+    timer = setInterval(tick, 1000);
+    btPollTimer = timer;
+    tick();  // fire immediately so the bar moves without a 1s gap
+  });
+  return btWatch;
+}
+
+// Watch a run that is in flight — ours or one this page merely found — and
+// report how it ends. This IS the re-attach: the page joins a run already
+// under way instead of owning it.
+async function attachToRun(s) {
+  const btn = document.getElementById("bt-run-btn");
+  const status = document.getElementById("bt-status");
+  const mine = !!s.run_id && s.run_id === rememberedRun();
+  btn.disabled = true;
+  const since = s.started_at && s.server_time
+    ? ` (${fmtDur(s.server_time - s.started_at)} in)` : "";
+  status.textContent = mine
+    ? `Running…${since}`
+    : `Attached to a run already in progress${since}`;
+  showBtProgress(true);
+  setBtProgress(s.progress ?? 0, s.eta_seconds, s.elapsed_seconds, segLabelOf(s));
+  try {
+    await reportOutcome(await pollBacktest(), mine ? "" : "started elsewhere");
+  } finally {
+    showBtProgress(false);
+    btn.disabled = false;
+  }
+}
+
+// Turn a terminal status into what the run row says, and pull in the result
+// when there is one. `note` is appended to a successful line — it is how a
+// page that was away says so.
+async function reportOutcome(s, note, {reload = true} = {}) {
+  const status = document.getElementById("bt-status");
+  // The note says WHOSE run this was and what to do about it, so it belongs on
+  // a failure just as much as on a result: without it a foreign run's error
+  // reads as the user's own launch having failed.
+  const tail = note ? ` <span class="stale">· ${esc(note)}</span>` : "";
+  if (s.run_id && s.run_id === rememberedRun()) rememberRun("");  // reported; now history
+  if (s.status === "interrupted") {
+    // Half a run is not a result. Say what happened rather than loading a
+    // sidecar that belongs to some earlier run.
+    status.innerHTML =
+      `<span class="stale">Interrupted: ${esc(s.error || "the run did not finish")}</span>` + tail;
+    return;
+  }
+  if (s.status === "error" || s.error) {
+    const msg = (s.error || "unknown error").slice(0, 200);
+    status.innerHTML = `<span class="stale">Failed: ${esc(msg)}</span>` + tail;
+    console.error(s.error);
+    return;
+  }
+  // loadTrades rewrites the run row as "Last run: …" via updateBacktestStatus.
+  // `reload: false` is for the caller that has just loaded the trades itself —
+  // the row is already current and only wants the note.
+  if (reload) await loadTrades();
+  if (tail) status.insertAdjacentHTML("beforeend", tail);
+}
+
+// Ask the server what is happening and join in. Called at load and every time
+// the page comes back to the foreground: a phone that slept through a run, a
+// tab restored from the back/forward cache, a reload mid-run, or a run started
+// from another device entirely.
+// `justLoaded` says the caller has already loaded the trades, so an outcome
+// that is ALREADY terminal needs only its note appended rather than a second
+// identical /api/trades round trip. It applies to that case alone: a run this
+// call attaches to and then watches end still reloads, because by then the
+// list on screen predates the result.
+function resyncBacktest({justLoaded = false} = {}) {
+  if (source !== "backtest") return;
+  return claimRunRow(async () => {
+    let s;
+    try {
+      s = await fetchBtStatus();
+    } catch (e) {
+      console.warn("backtest resync failed", e);
+      return;
+    }
+    if (s.running) {
+      await attachToRun(s);
+      return;
+    }
+    // Nothing in flight. If the run WE launched ended while this page was
+    // gone, say how it went — otherwise there is nothing to re-attach to and
+    // the row already reads "Last run: …".
+    if (s.run_id && s.run_id === rememberedRun()) {
+      // `justLoaded` alone is not enough to skip the reload: the run can finish
+      // between that load and this status fetch, and then the list on screen is
+      // the PREVIOUS result with a "finished while you were away" note under
+      // it. Skip only when the report the list came from is the one this
+      // outcome is about.
+      const showing = justLoaded && s.generated_at != null
+        && s.generated_at === loadedGeneratedAt;
+      await reportOutcome(s, "finished while you were away", {reload: !showing});
+    }
   });
 }
 
-async function runBacktest() {
+// The status of whatever took the slot from us. A refusal marked `pending`
+// means the launch that beat us is still validating and has not seeded its
+// record yet, so /api/backtest/status would answer with the PREVIOUS run —
+// attaching to that shows an old result under a "that was another run" note,
+// for a run that started a moment later. Wait for the real one to appear. If
+// the launch that beat us turns out to fail validation, nothing ever appears
+// and the timeout falls through to telling the user to press Run again.
+async function liveRunAfter409(refusal) {
+  const deadline = Date.now() + 3000;
+  for (;;) {
+    let s;
+    try {
+      s = await fetchBtStatus();
+    } catch (e) {
+      // Null means "we never found out", which the caller has to say out loud
+      // rather than leave a stale "Running…" standing.
+      console.warn("status fetch after a 409 failed", e);
+      return null;
+    }
+    if (!refusal.pending || s.running || Date.now() >= deadline) return s;
+    await new Promise(r => setTimeout(r, 200));
+  }
+}
+
+function runBacktest() {
+  return claimRunRow(launchBacktest);
+}
+
+async function launchBacktest() {
   const btn = document.getElementById("bt-run-btn");
   const status = document.getElementById("bt-status");
-  if (btPollTimer) { clearInterval(btPollTimer); btPollTimer = null; }
   btn.disabled = true;
   status.textContent = "Syncing data…";
   // A long-lived tab keeps whatever bounds were prefilled at load, so a run
@@ -858,8 +1157,6 @@ async function runBacktest() {
   const from = fromEl.value;
   const to = toEl.value;
   status.textContent = "Running…";
-  showBtProgress(true);
-  setBtProgress(0, null, null);
   try {
     const strategy = document.getElementById("bt-strategy").value || undefined;
     const fill = document.getElementById("bt-fill").value || undefined;
@@ -871,27 +1168,52 @@ async function runBacktest() {
     const allow_dataset_override = !!(unlockEl && unlockEl.checked);
     // Warmup depth is the strategy's own [viz] warmup_days annotation — the
     // server resolves it per preset; there is deliberately no knob here.
-    // Kick off the run (returns immediately with an ETA), then poll for progress.
+    // Kick off the run. This returns as soon as the subprocess exists: from
+    // here on the run is the server's, and the page is just an observer.
     const resp = await fetch("/api/backtest/run", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({from, to, strategy, fill, dataset, allow_dataset_override}),
     });
     const data = await resp.json();
+    if (resp.status === 409) {
+      // A run is already in flight, so ours never started. That is not a
+      // failure the user caused — attach to the one that is running instead of
+      // reporting one. Deliberately WITHOUT remembering its id: it is somebody
+      // else's run, and claiming it would relabel it "Running…" and then
+      // "finished while you were away", which is a different claim entirely.
+      const live = await liveRunAfter409(data);
+      if (live && live.running) { await attachToRun(live); return; }
+      if (!live) {
+        // The refusal is the last thing we heard from the server. We know our
+        // launch did not start; we do not know what took the slot, and the row
+        // is still showing the "Running…" it was given a moment ago — which is
+        // now the one thing we are sure is false. Say so instead. Whatever is
+        // actually going on gets picked up by the next resync, on the next
+        // foregrounding or reload.
+        status.innerHTML = `<span class="stale">Could not reach the server — `
+          + `your run did not start. Check the connection and press Run again.</span>`;
+        return;
+      }
+      // Nothing is running: either that run finished between our POST and this
+      // look, or the launch that beat us failed its own validation. Either way
+      // ours did not start, and nothing of ours failed — show what is there and
+      // say so.
+      await reportOutcome(live, "that was another run — press Run again to launch yours");
+      return;
+    }
     if (!resp.ok) {
-      status.innerHTML = `<span class="stale">Failed: ${data.error || resp.status}</span>`;
+      status.innerHTML = `<span class="stale">Failed: ${esc(String(data.error || resp.status))}</span>`;
       console.error(data);
-      showBtProgress(false);
       return;
     }
+    // Remember the handle BEFORE watching, so even a tab closed one second
+    // later comes back knowing which run to ask about.
+    rememberRun(data.run_id);
+    showBtProgress(true);
+    setBtProgress(0, data.eta_seconds, 0);
     if (data.eta_seconds) status.textContent = `Running… (~${Math.round(data.eta_seconds)}s)`;
-    const final = await pollBacktest();
-    if (final && final.error) {
-      status.innerHTML = `<span class="stale">Failed: ${final.error.slice(0, 200)}</span>`;
-      console.error(final.error);
-      return;
-    }
-    await loadTrades();
+    await reportOutcome(await pollBacktest(), "");
   } finally {
     showBtProgress(false);
     btn.disabled = false;
@@ -1405,7 +1727,14 @@ function ensureChart() {
     wickUpColor: "#37d67a",
     wickDownColor: "#ff5d52",
   });
-  window.addEventListener("resize", () => chart.resize(container.clientWidth, container.clientHeight));
+  // Observe the BOX, not the window: on a phone the container changes size
+  // for reasons a resize event never fires for — the pane switch, the URL bar
+  // collapsing as you scroll, an orientation change that lands mid-frame.
+  if (window.ResizeObserver) {
+    new ResizeObserver(fitChart).observe(container);
+  } else {
+    window.addEventListener("resize", fitChart);
+  }
 }
 
 function clearOverlays() {
@@ -1525,6 +1854,9 @@ function addFillDot(time, price, color) {
 }
 
 async function selectTrade(t) {
+  // On a phone the chart is the other pane, so picking a trade means going to
+  // it. On desktop both are on screen and the class is inert.
+  setPane("chart");
   selectedKey = keyOf(t);
   selectedTradeParam = t.opportunity_id || keyOf(t);
   urlTradeConsumed = true;
@@ -1686,35 +2018,99 @@ async function selectTrade(t) {
   chart.timeScale().fitContent();
 }
 
+// ══ Phone panes ═════════════════════════════════════════════════════════
+// Below the CSS breakpoint the trade list and the chart are stacked panes and
+// only one is on screen; `.pane-list` / `.pane-chart` on `.app` picks which,
+// and #mobile-tabs sets it. Every rule keyed off those classes lives inside
+// the media query, so setting them on a desktop viewport changes nothing —
+// which is why this runs unconditionally rather than sniffing a width.
+const appEl = document.querySelector(".app");
+const paneTabs = Array.from(document.querySelectorAll("#mobile-tabs button"));
+
+// The last box the chart was sized to, so the ResizeObserver below cannot
+// bounce between two sizes.
+let chartBox = "";
+
+// Size the chart to its container. Called on every container resize, which on
+// a phone means rotation and the URL bar collapsing as well as a pane switch.
+// A hidden pane measures 0×0 — skip it and re-size when it comes back.
+function fitChart() {
+  if (!chart) return;
+  const c = document.getElementById("chart");
+  const w = c.clientWidth, h = c.clientHeight;
+  if (!w || !h) return;
+  const box = w + "×" + h;
+  if (box === chartBox) return;
+  chartBox = box;
+  chart.resize(w, h);
+}
+
+function setPane(name) {
+  appEl.classList.toggle("pane-list", name === "list");
+  appEl.classList.toggle("pane-chart", name === "chart");
+  paneTabs.forEach(b => b.setAttribute("aria-selected", String(b.dataset.pane === name)));
+  // The chart was last sized while its pane was display:none, i.e. to nothing.
+  // Wait for the layout that this class change causes, then fit.
+  if (name === "chart") requestAnimationFrame(fitChart);
+}
+
+paneTabs.forEach(b => b.addEventListener("click", () => setPane(b.dataset.pane)));
+setPane("list");
+
+// ── Phone: the config panel folds away ──
+// The eight config rows fill the entire first screen at 390px and push the
+// trade list below the fold. On a phone the section header becomes a
+// disclosure and the panel starts closed; the run row, its status and the
+// progress bar stay out of the fold, since those are what you open the page on
+// a phone to look at. At desktop widths the header is inert and the panel is
+// always open — leaving it foldable there would be a change nobody asked for,
+// and leaving it FOLDED there would hide the controls with no way back.
+const cfgSect = document.getElementById("bt-config-sect");
+const cfgWrap = document.getElementById("backtest-config");
+const phoneWidth = window.matchMedia("(max-width: 860px)");
+
+function syncConfigFold() {
+  if (!phoneWidth.matches) cfgWrap.classList.remove("folded");
+  const open = !cfgWrap.classList.contains("folded");
+  cfgSect.setAttribute("aria-expanded", String(open));
+  // Only a tab stop where it actually does something.
+  cfgSect.tabIndex = phoneWidth.matches ? 0 : -1;
+}
+
+function toggleConfigFold() {
+  if (!phoneWidth.matches) return;
+  cfgWrap.classList.toggle("folded");
+  syncConfigFold();
+}
+
+cfgSect.addEventListener("click", toggleConfigFold);
+cfgSect.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleConfigFold(); }
+});
+// Rotating a phone into landscape crosses the breakpoint; re-assert the rule
+// rather than leaving a fold behind on a viewport that has no way to undo it.
+phoneWidth.addEventListener("change", syncConfigFold);
+// A ?bt= link IS a setup — opening one on a phone should show the setup it
+// seeded, not a folded panel hiding it. Every other load starts folded.
+if (phoneWidth.matches && !urlSpec) cfgWrap.classList.add("folded");
+syncConfigFold();
+
+// ── Re-attach on every way back into the page ──
+// A run outlives the tab, so the page has to re-ask whenever it regains the
+// foreground, not only on a cold load: `visibilitychange` covers a phone
+// waking up or a tab being switched back to, and `pageshow` with `persisted`
+// covers iOS Safari restoring the page from the back/forward cache with its
+// timers frozen.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") resyncBacktest();
+});
+window.addEventListener("pageshow", (e) => { if (e.persisted) resyncBacktest(); });
+
 document.getElementById("asset-filter").addEventListener("change", applyFilters);
 document.getElementById("outcome-filter").addEventListener("change", applyFilters);
 document.getElementById("direction-filter").addEventListener("change", applyFilters);
 document.getElementById("refresh-btn").addEventListener("click", () => loadTrades({refresh: true}));
 document.getElementById("bt-run-btn").addEventListener("click", runBacktest);
-
-// If a backtest is already running (started before this page loaded, e.g. a
-// reload mid-run), reattach the progress bar instead of leaving it idle.
-async function reattachBacktest() {
-  if (source !== "backtest") return;
-  try {
-    const s = await (await fetch("/api/backtest/status")).json();
-    if (!s.running) return;
-    const btn = document.getElementById("bt-run-btn");
-    const status = document.getElementById("bt-status");
-    btn.disabled = true;
-    status.textContent = "Running…";
-    showBtProgress(true);
-    setBtProgress(s.progress ?? 0, s.eta_seconds, s.elapsed_seconds);
-    const final = await pollBacktest();
-    if (final && final.error) {
-      status.innerHTML = `<span class="stale">Failed: ${final.error.slice(0, 200)}</span>`;
-    } else {
-      await loadTrades();
-    }
-    showBtProgress(false);
-    btn.disabled = false;
-  } catch (e) { console.warn("reattach failed", e); }
-}
 
 initTraderSelect();
 initSourceToggle();
@@ -1722,8 +2118,11 @@ initSourceToggle();
 // sidecar's axes into those pickers. Sequence them — racing the two leaves
 // adoption looking at an empty picker and silently skipping.
 initBacktestDates();
-initSources().then(loadTrades, loadTrades);
-reattachBacktest();
+// resyncBacktest runs last so it reports a finished run's outcome INTO a row
+// the initial load has already written, rather than racing it — and is told so,
+// so it appends to that row instead of loading the same trades again.
+const bootResync = () => resyncBacktest({justLoaded: true});
+initSources().then(loadTrades, loadTrades).then(bootResync, bootResync);
 </script>
 </body>
 </html>

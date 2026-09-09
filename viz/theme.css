@@ -25,6 +25,9 @@ body {
   font-family: var(--mono);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+  /* Safari otherwise inflates text on rotation, which silently widens a
+     layout that fit the portrait viewport a moment earlier. */
+  -webkit-text-size-adjust: 100%;
 }
 
 /* ── Header ─────────────────────────────────────────────────────────── */
@@ -46,7 +49,6 @@ body {
   font: inherit; font-size: 10px; letter-spacing: .12em; text-transform: uppercase;
   padding: 0 12px; cursor: pointer; text-decoration: none; white-space: nowrap;
 }
-.hdr nav a:hover, .hdr nav button:hover { background: var(--ink); color: var(--bg); }
 .hdr nav button:disabled { opacity: .5; cursor: default; }
 
 /* ── Run picker (options come from the registry) ────────────────────── */
@@ -76,7 +78,6 @@ body {
      in the narrow sidebar instead of ellipsizing the dataset/date tail. */
   word-break: break-all;
 }
-.bt-uid:hover { color: var(--shu); border-bottom-color: var(--shu); }
 /* Brief post-copy confirmation, toggled by the click handler. */
 .bt-uid.copied { color: var(--win); border-bottom-color: var(--win); }
 .bt-uid.copied::after { content: " copied"; font-size: 9px; letter-spacing: .1em; }
@@ -90,7 +91,6 @@ body {
 }
 .seg2 .seg + .seg { border-left: 1px solid var(--line); }
 .seg2 .seg.active { background: var(--shu); color: #fff; font-weight: 700; }
-.seg2 .seg:not(.active):hover { color: var(--ink); }
 
 /* ── Section header: label + CJK stamp + rule filling remaining width ─ */
 .sect {
@@ -163,14 +163,17 @@ input[type=date]:disabled {
   font: inherit; font-size: 11px; font-weight: 700; letter-spacing: .22em; text-transform: uppercase;
   padding: 9px 0; cursor: pointer;
 }
-.run:hover { background: var(--shu); color: #fff; }
 .run:disabled { opacity: .55; cursor: default; }
-.run:disabled:hover { background: none; color: var(--shu); }
 .runmeta {
   display: flex; align-items: center; padding: 0 12px;
-  border-left: 1px solid var(--line); color: var(--dim); font-size: 10px; white-space: nowrap;
+  border-left: 1px solid var(--line); color: var(--dim); font-size: 10px;
+  /* This line carries failure text as well as "Last run: 3m ago". Let it
+     wrap inside the panel rather than widen it. */
+  min-width: 0; overflow-wrap: anywhere;
 }
-.runmeta .stale { color: var(--dim); }
+/* Quiet status text — "no backtest yet", a failure line, an aside on an
+   outcome. Used by every page's run status, not just the sidebar's. */
+.stale { color: var(--dim); }
 
 /* Full-width warning / caption lines under the run row. */
 .warnline {
@@ -236,14 +239,12 @@ input[type=date]:disabled {
   border: 1px solid var(--line-hard); padding: 2px 6px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 96px;
 }
-.trade:hover .trader-tag { color: inherit; border-color: currentColor; }
 /* Attribution the manage-log join couldn't prove — inferred from nearby ticks
    and prefixed "≈" in the markup. Dashed border so it reads as a guess. */
 .trade .trader-tag.inferred { border-style: dashed; opacity: .8; }
 .tv-detail .inferred .kd-note { color: var(--dim); font-size: 10px; }
 /* Trade took less than the configured risk (margin clamp / partial fill). */
 .trade .risk-cut { color: var(--shu); font-size: 10px; letter-spacing: .04em; }
-.trade:hover .risk-cut { color: inherit; }
 /* Untracked-position reconcile markers: a force-closed unowned position
    (bug fingerprint — loud) or a re-adopted bracketed one (informational). */
 .trade .flag-tag {
@@ -252,10 +253,7 @@ input[type=date]:disabled {
 }
 .trade .flag-tag.untracked_close { color: var(--loss); }
 .trade .flag-tag.recovered { color: var(--dim); }
-.trade:hover .flag-tag { color: inherit; }
 .trade .asset { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.trade:hover { background: var(--ink); color: var(--bg); }
-.trade:hover .when, .trade:hover .dir, .trade:hover .detail { color: inherit; border-color: currentColor; }
 .trade .rail { width: 3px; height: 100%; min-height: 26px; background: transparent; }
 .trade.selected .rail { background: var(--shu); }
 .trade .asset { font-weight: 700; letter-spacing: .04em; }
@@ -280,10 +278,39 @@ input[type=date]:disabled {
 .trade .pnl.pending, .trade .pnl.cancelled { color: var(--dim); font-weight: 400; }
 /* Round-trip fee on its own line under the PnL; absent on backtest rows. */
 .trade .pnl .fee { display: block; color: var(--dim); font-size: 9px; font-weight: 400; }
-.trade:hover .pnl .fee { color: inherit; }
 /* The price-detail line spans the full row width below the main cells. */
 .trade .detail {
   grid-column: 2 / -1; color: var(--dim); font-size: 10px; margin-top: 2px;
+}
+
+/* ── Hover ───────────────────────────────────────────────────────────────
+   Every hover style on the site lives here, behind `hover: hover`. On a
+   touchscreen :hover fires on tap and then STICKS to whatever was touched
+   last, so an inverted trade row would sit there looking selected next to the
+   row that actually is. Keyed off the input device, not the viewport: a small
+   window with a mouse keeps its hover, a large tablet does not get a stuck
+   one. The selected-row rail and the active segment are the cues that work on
+   both. */
+@media (hover: hover) {
+  .hdr nav a:hover, .hdr nav button:hover { background: var(--ink); color: var(--bg); }
+  .seg2 .seg:not(.active):hover { color: var(--ink); }
+  .bt-uid:hover { color: var(--shu); border-bottom-color: var(--shu); }
+  .run:hover { background: var(--shu); color: #fff; }
+  .run:disabled:hover { background: none; color: var(--shu); }
+  /* Video-inverted trade row: the row's own colors flip, and every cell that
+     carries its own color or border follows it to currentColor. */
+  .trade:hover { background: var(--ink); color: var(--bg); }
+  .trade:hover .when, .trade:hover .dir, .trade:hover .detail { color: inherit; border-color: currentColor; }
+  .trade:hover .trader-tag { color: inherit; border-color: currentColor; }
+  .trade:hover .risk-cut { color: inherit; }
+  .trade:hover .flag-tag { color: inherit; }
+  .trade:hover .pnl .fee { color: inherit; }
+}
+
+/* Without hover there is no second cue for "this row", so the selected row
+   gets a faint tint of its own. Desktop keeps the rail alone, as before. */
+@media (hover: none) {
+  .trade.selected { background: rgba(232, 69, 47, .08); }
 }
 
 .empty { padding: 40px; text-align: center; color: var(--dim); }
@@ -300,4 +327,101 @@ input[type=date]:disabled {
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   Phone layout — one breakpoint, shared by every page.
+
+   Below it the pages stop assuming a wide viewport: form controls grow to a
+   thumb-sized 44px, the label/field grids collapse to one column, list rows
+   stack into two lines, and nothing is allowed to push the document wider
+   than the screen. Above it not a single rule applies, so the desktop layout
+   is byte-for-byte what it was.
+
+   860px, not 480: the dashboard's sidebar alone is 500px, so a viewport that
+   cannot hold sidebar + a usable chart wants the stacked layout too — tablets
+   in portrait included.
+   ════════════════════════════════════════════════════════════════════════ */
+@media (max-width: 860px) {
+  /* A last-resort guard, not the layout's load-bearing wall: every rule below
+     is meant to fit inside the viewport on its own, and this only stops a
+     single overlooked long token from letting the whole document pan. */
+  html, body { max-width: 100%; overflow-x: hidden; }
+
+  /* iOS Safari zooms the page when a control smaller than 16px takes focus,
+     and leaves the viewport panned sideways with no way back. 16px is the
+     threshold, not a preference. */
+  input[type=date], input[type=text], input[type=number], select, textarea {
+    font-size: 16px;
+  }
+  /* 44px is the smallest reliably tappable target. */
+  input[type=date], select { height: 44px; padding: 0 10px; }
+  /* A checkbox is tapped through its label, which is what gets the 44px; the
+     box itself just needs to be big enough to read as one. */
+  input[type=checkbox] { width: 18px; height: 18px; }
+  label:has(> input[type=checkbox]) { min-height: 44px; align-items: center; }
+
+  /* ── Header: title on its own line, nav as full-width equal buttons ── */
+  .hdr { flex-wrap: wrap; }
+  .hdr .title { flex: 1 1 100%; }
+  .hdr nav { width: 100%; border-top: 1px solid var(--line); }
+  .hdr nav a, .hdr nav button {
+    flex: 1; justify-content: center; min-height: 44px;
+    border-left: 0; border-right: 1px solid var(--line);
+  }
+  .hdr nav a:last-child, .hdr nav button:last-child { border-right: 0; }
+  /* The uid chip is a single space-less token wider than the screen; it
+     already breaks anywhere, this just keeps it off the layout's width. */
+  .bt-axes-label { overflow-wrap: anywhere; }
+
+  /* ── Controls ── */
+  .trader-row { gap: 10px; }
+  /* Label column + field column, one pair per row. `.full` and `.span` keep
+     meaning what they meant: field-width and full-width. */
+  .grid { grid-template-columns: 88px minmax(0, 1fr); gap: 8px; }
+  .switch .box { min-height: 44px; display: inline-flex; align-items: center; }
+  .switch .why { overflow-wrap: anywhere; }
+  /* One filter select per line at 390px — two fit only by clipping the
+     longest option text ("Both directions") under the dropdown arrow. Wider
+     phones and tablets get two or three. */
+  .filters { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+  .seg2 .seg { padding: 12px 0; }
+
+  .runrow { flex-wrap: wrap; }
+  .run { padding: 14px 0; letter-spacing: .14em; }
+  .runmeta {
+    width: 100%; padding: 8px 12px;
+    border-left: 0; border-top: 1px solid var(--line);
+  }
+  /* The percentage caption carries a segment label ("47% · year 3/5") that
+     does not fit beside the track at 390px; let the track take the row and
+     the caption sit under it. */
+  .bt-progress { flex-wrap: wrap; }
+  .bt-progress .track { flex: 1 1 100%; }
+  .bt-progress .pct { min-width: 0; text-align: left; }
+
+  /* ── Trade rows: stacked lines instead of five columns ──
+     Line 1 is the identity and the number (asset · direction · P&L); the
+     timing and price detail drop underneath, where there is width for them. */
+  .trade, .trade.has-trader {
+    grid-template-columns: 3px minmax(0, auto) minmax(0, 1fr) auto;
+    column-gap: 8px; row-gap: 2px;
+    padding: 10px 12px 10px 0;
+    min-height: 56px;
+  }
+  .trade .rail   { grid-column: 1; grid-row: 1 / -1; }
+  .trade .asset  { grid-column: 2; grid-row: 1; }
+  .trade .dir    { grid-column: 3; grid-row: 1; justify-self: start; padding: 3px 8px; }
+  .trade .pnl    { grid-column: 4; grid-row: 1; }
+  .trade .trader-tag { grid-column: 2 / -1; grid-row: 2; justify-self: start; max-width: 100%; }
+  .trade .when   { grid-column: 2 / -1; grid-row: 3; }
+  .trade .detail { grid-column: 2 / -1; grid-row: 4; margin-top: 0; overflow-wrap: anywhere; }
+  /* No trader tag, no empty row between the headline and the timing. */
+  .trade:not(.has-trader) .when   { grid-row: 2; }
+  .trade:not(.has-trader) .detail { grid-row: 3; }
+
+  .statusline { flex-wrap: wrap; row-gap: 4px; }
+  .statusline .tail { margin-left: 0; }
+  .empty { padding: 28px 16px; }
+  .warnline, .captionline { line-height: 1.45; }
 }
