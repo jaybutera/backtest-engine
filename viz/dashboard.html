@@ -316,10 +316,13 @@ let allTrades = [];
 // Last /api/trades error. Shown as a banner on the empty list so a load
 // failure isn't mistaken for "no trades yet" — the two look identical.
 let lastIngestError = null;
-// HTML-escape for interpolating server text (error strings, trader names) into
-// innerHTML. Module-level so both the trade list and the detail panel share it.
-const esc = s => String(s ?? "—").replace(/[&<>]/g, c =>
-  ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[c]));
+// HTML-escape for interpolating server text (error strings, a backtest's
+// stderr tail, trader names) into innerHTML. Module-level: the trade list, the
+// detail panel and the run row all share it. Quotes are in the set because
+// some of that text lands in an attribute (`title="…"`), where escaping only
+// the angle brackets still lets a quote break out.
+const esc = s => String(s ?? "—").replace(/[&<>"']/g, c =>
+  ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 // ─── Shareable-URL state ──────────────────────────────────────────────────────
 // The full backtest spec rides in the URL as ?bt=<uid> — the run's canonical
 // UID (strategy×fill×dataset@from..to, .toml stripped; the same token the
@@ -485,14 +488,6 @@ function fmtDur(seconds) {
   if (sec < 60) return `${sec}s`;
   if (sec < 3600) return `${Math.floor(sec / 60)}m`;
   return `${Math.floor(sec / 3600)}h${Math.floor((sec % 3600) / 60)}m`;
-}
-
-// Server-supplied text (a backtest's stderr tail, mostly) reaches the run row
-// through innerHTML, so it goes through here first.
-function escapeHtml(str) {
-  return String(str).replace(/[&<>"']/g, c => (
-    {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]
-  ));
 }
 
 function fmtR(r) {
@@ -905,6 +900,27 @@ let btPollTimer = null;
 // The in-flight watch, if any. Doubles as the "already attached" flag, so
 // every entry point (launch, load, foregrounding) can call in freely.
 let btWatch = null;
+// Whether some entry point already owns the run row. Claimed SYNCHRONOUSLY,
+// before anything awaits, because `btWatch` is only set after a status fetch
+// and two entrants would both sail past a check made before it: a bfcache
+// restore fires visibilitychange AND pageshow, either can land in the middle
+// of runBacktest between its POST and its own poll, and both can race the
+// initial load. Two owners meant two pollers on one interval handle,
+// loadTrades twice, and the outcome note appended twice.
+let btBusy = false;
+
+// Run `fn` as the sole owner of the run row, or do nothing if it is taken.
+// The claim is safe because the check and the set both happen before the first
+// await, and nothing else can run in between.
+async function claimRunRow(fn) {
+  if (btBusy) return;
+  btBusy = true;
+  try {
+    return await fn();
+  } finally {
+    btBusy = false;
+  }
+}
 
 function showBtProgress(on) {
   document.getElementById("bt-progress").classList.toggle("active", on);
@@ -1018,47 +1034,52 @@ async function reportOutcome(s, note) {
     // Half a run is not a result. Say what happened rather than loading a
     // sidecar that belongs to some earlier run.
     status.innerHTML =
-      `<span class="stale">Interrupted: ${escapeHtml(s.error || "the run did not finish")}</span>`;
+      `<span class="stale">Interrupted: ${esc(s.error || "the run did not finish")}</span>`;
     return;
   }
   if (s.status === "error" || s.error) {
     const msg = (s.error || "unknown error").slice(0, 200);
-    status.innerHTML = `<span class="stale">Failed: ${escapeHtml(msg)}</span>`;
+    status.innerHTML = `<span class="stale">Failed: ${esc(msg)}</span>`;
     console.error(s.error);
     return;
   }
   // loadTrades rewrites the run row as "Last run: …" via updateBacktestStatus.
   await loadTrades();
-  if (note) status.insertAdjacentHTML("beforeend", ` <span class="stale">· ${escapeHtml(note)}</span>`);
+  if (note) status.insertAdjacentHTML("beforeend", ` <span class="stale">· ${esc(note)}</span>`);
 }
 
 // Ask the server what is happening and join in. Called at load and every time
 // the page comes back to the foreground: a phone that slept through a run, a
 // tab restored from the back/forward cache, a reload mid-run, or a run started
 // from another device entirely.
-async function resyncBacktest() {
+function resyncBacktest() {
   if (source !== "backtest") return;
-  if (btWatch) return;  // already attached — the poller owns the row
-  let s;
-  try {
-    s = await fetchBtStatus();
-  } catch (e) {
-    console.warn("backtest resync failed", e);
-    return;
-  }
-  if (s.running) {
-    await attachToRun(s);
-    return;
-  }
-  // Nothing in flight. If the run WE launched ended while this page was gone,
-  // say how it went — otherwise there is nothing to re-attach to and the row
-  // already reads "Last run: …".
-  if (s.run_id && s.run_id === rememberedRun()) {
-    await reportOutcome(s, "finished while you were away");
-  }
+  return claimRunRow(async () => {
+    let s;
+    try {
+      s = await fetchBtStatus();
+    } catch (e) {
+      console.warn("backtest resync failed", e);
+      return;
+    }
+    if (s.running) {
+      await attachToRun(s);
+      return;
+    }
+    // Nothing in flight. If the run WE launched ended while this page was
+    // gone, say how it went — otherwise there is nothing to re-attach to and
+    // the row already reads "Last run: …".
+    if (s.run_id && s.run_id === rememberedRun()) {
+      await reportOutcome(s, "finished while you were away");
+    }
+  });
 }
 
-async function runBacktest() {
+function runBacktest() {
+  return claimRunRow(launchBacktest);
+}
+
+async function launchBacktest() {
   const btn = document.getElementById("bt-run-btn");
   const status = document.getElementById("bt-status");
   btn.disabled = true;
@@ -1097,15 +1118,20 @@ async function runBacktest() {
     });
     const data = await resp.json();
     if (resp.status === 409) {
-      // A run is already in flight — quite possibly this phone's own, launched
-      // in a tab that has since gone away. That is not a failure the user
-      // caused, so attach to it instead of reporting one.
-      if (data.run_id) rememberRun(data.run_id);
+      // A run is already in flight, so ours never started. That is not a
+      // failure the user caused — attach to the one that is running instead of
+      // reporting one. Deliberately WITHOUT remembering its id: it is somebody
+      // else's run, and claiming it would relabel it "Running…" and then
+      // "finished while you were away", which is a different claim entirely.
       const live = await fetchBtStatus();
       if (live.running) { await attachToRun(live); return; }
+      // It finished between our POST and this look. Nothing failed and nothing
+      // is running, so show that run's result and say why ours did not start.
+      await reportOutcome(live, "another run was already in flight — press Run again to launch yours");
+      return;
     }
     if (!resp.ok) {
-      status.innerHTML = `<span class="stale">Failed: ${escapeHtml(String(data.error || resp.status))}</span>`;
+      status.innerHTML = `<span class="stale">Failed: ${esc(String(data.error || resp.status))}</span>`;
       console.error(data);
       return;
     }

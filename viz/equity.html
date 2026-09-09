@@ -436,6 +436,23 @@ function rememberedRun() {
 let btPollTimer = null;
 // The in-flight watch, if any. Doubles as the "already attached" flag.
 let btWatch = null;
+// Whether some entry point already owns the control row. Claimed
+// SYNCHRONOUSLY, before anything awaits: `btWatch` is only set after a status
+// fetch, so a check made before it lets two entrants through. A bfcache
+// restore fires visibilitychange AND pageshow, and either can land inside
+// runBacktest between its POST and its own poll.
+let btBusy = false;
+
+// Run `fn` as the sole owner of the control row, or do nothing if it is taken.
+async function claimRunRow(fn) {
+  if (btBusy) return;
+  btBusy = true;
+  try {
+    return await fn();
+  } finally {
+    btBusy = false;
+  }
+}
 
 function showBtProgress(on) {
   const p = document.getElementById("bt-progress");
@@ -500,11 +517,10 @@ function pollBacktest() {
   return btWatch;
 }
 
-function escapeHtml(str) {
-  return String(str).replace(/[&<>"']/g, c => (
-    {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]
-  ));
-}
+// HTML-escape for interpolating server text (a backtest's stderr tail, mostly)
+// into innerHTML. Same helper, same name and same set as the dashboard's.
+const esc = s => String(s ?? "—").replace(/[&<>"']/g, c =>
+  ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 
 // Turn a terminal status into what the control row says, pulling in the result
 // when there is one. `note` is appended on success — it is how a page that was
@@ -515,16 +531,16 @@ async function reportOutcome(s, note) {
   if (s.status === "interrupted") {
     // Half a run is not a result: say so rather than charting a sidecar that
     // belongs to some earlier run.
-    status.innerHTML = `<span class="stale">Interrupted: ${escapeHtml(s.error || "the run did not finish")}</span>`;
+    status.innerHTML = `<span class="stale">Interrupted: ${esc(s.error || "the run did not finish")}</span>`;
     return;
   }
   if (s.status === "error" || s.error) {
-    status.innerHTML = `<span class="stale">Failed: ${escapeHtml((s.error || "unknown error").slice(0, 200))}</span>`;
+    status.innerHTML = `<span class="stale">Failed: ${esc((s.error || "unknown error").slice(0, 200))}</span>`;
     console.error(s.error);
     return;
   }
   await loadTrades();  // rewrites the row as "Last run: …"
-  if (note) status.insertAdjacentHTML("beforeend", ` <span class="stale">· ${escapeHtml(note)}</span>`);
+  if (note) status.insertAdjacentHTML("beforeend", ` <span class="stale">· ${esc(note)}</span>`);
 }
 
 // Watch a run already in flight — ours or one started elsewhere — and report
@@ -547,18 +563,23 @@ async function attachToRun(s) {
 
 // Ask the server what is happening and join in. Called at load and every time
 // the page comes back to the foreground.
-async function resyncBacktest() {
-  if (btWatch) return;
-  let s;
-  try { s = await fetchBtStatus(); }
-  catch (e) { console.warn("backtest resync failed", e); return; }
-  if (s.running) { await attachToRun(s); return; }
-  if (s.run_id && s.run_id === rememberedRun()) {
-    await reportOutcome(s, "finished while you were away");
-  }
+function resyncBacktest() {
+  return claimRunRow(async () => {
+    let s;
+    try { s = await fetchBtStatus(); }
+    catch (e) { console.warn("backtest resync failed", e); return; }
+    if (s.running) { await attachToRun(s); return; }
+    if (s.run_id && s.run_id === rememberedRun()) {
+      await reportOutcome(s, "finished while you were away");
+    }
+  });
 }
 
-async function runBacktest() {
+function runBacktest() {
+  return claimRunRow(launchBacktest);
+}
+
+async function launchBacktest() {
   const btn = document.getElementById("bt-run-btn");
   const status = document.getElementById("bt-status");
   const from = document.getElementById("bt-from").value;
@@ -573,14 +594,19 @@ async function runBacktest() {
     });
     const data = await resp.json();
     if (resp.status === 409) {
-      // A run is already in flight — possibly this device's own, from a tab
-      // that has since gone. Attach to it instead of reporting a failure.
-      if (data.run_id) rememberRun(data.run_id);
+      // A run is already in flight, so ours never started. Attach to that one
+      // rather than reporting a failure the user did not cause — and do NOT
+      // remember its id, or a run somebody else started would be labeled as
+      // ours.
       const live = await fetchBtStatus();
       if (live.running) { await attachToRun(live); return; }
+      // It finished between our POST and this look: nothing failed, nothing is
+      // running. Show that run's result and say why ours did not start.
+      await reportOutcome(live, "another run was already in flight — press Run again to launch yours");
+      return;
     }
     if (!resp.ok) {
-      status.innerHTML = `<span class="stale">Failed: ${escapeHtml(String(data.error || resp.status))}</span>`;
+      status.innerHTML = `<span class="stale">Failed: ${esc(String(data.error || resp.status))}</span>`;
       console.error(data);
       return;
     }
