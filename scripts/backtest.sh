@@ -9,8 +9,16 @@
 # untouched, so per-run flags (--warmup-days, --dataset, …) ride along.
 #
 # Environment:
-#   BT_STRATEGY  strategy preset      (default: config/strategy/rsi_atr.toml)
-#   BT_FILL      fill lens preset     (default: config/fill/market_on_open.toml)
+#   BT_STRATEGIES_DIR  strategies root: a tree of presets with sibling fill/
+#                      and datasets/ dirs (default: config/strategy/private
+#                      when it exists, else this repo's config/). Also accepted
+#                      under its original name ICT_STRATEGIES_DIR.
+#   BT_STRATEGY  strategy preset, relative to the root or absolute. Required
+#                when a root is configured — a tree names its own presets, and
+#                this script does not guess which one you meant.
+#                (default without a root: config/strategy/rsi_atr.toml)
+#   BT_FILL      fill lens, relative to the root's fill/ or absolute
+#                (default without a root: config/fill/market_on_open.toml)
 #   BT_JSON      report path          (default: data/backtest_trades.json;
 #                                      set empty to skip writing one)
 #   BT_BIN       binary to run        (default: target/release/backtest, built
@@ -30,8 +38,48 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
-STRATEGY="${BT_STRATEGY:-config/strategy/rsi_atr.toml}"
-FILL="${BT_FILL:-config/fill/market_on_open.toml}"
+# Resolve the strategies root the same way viz/server.py does, so a preset
+# named in the UI and the same name typed here mean one file. With no root
+# configured the repo's own demo presets are the defaults, which is what a
+# fresh clone gets.
+ROOT="${BT_STRATEGIES_DIR:-${ICT_STRATEGIES_DIR:-}}"
+if [[ -z "$ROOT" && -d "config/strategy/private" ]]; then
+  ROOT="config/strategy/private"
+fi
+if [[ -n "$ROOT" ]]; then
+  ROOT="$(cd "$ROOT" 2>/dev/null && pwd)" || {
+    echo "strategies root not found: $ROOT (unset BT_STRATEGIES_DIR to use the bundled demos)" >&2
+    exit 1
+  }
+fi
+
+# A name is taken relative to the given directory, absolute paths pass through,
+# and an existing path relative to the repo root wins over both — so the old
+# spelling ("config/strategy/example.toml") keeps working under a root.
+resolve() {
+  local name="$1" dir="$2"
+  case "$name" in
+    /*) echo "$name"; return ;;
+  esac
+  if [[ -n "$dir" && -f "$dir/$name" ]]; then echo "$dir/$name"; return; fi
+  echo "$name"
+}
+
+if [[ -n "$ROOT" ]]; then
+  [[ -n "${BT_STRATEGY:-}" ]] || {
+    echo "BT_STRATEGY is required with a strategies root ($ROOT): name a preset under it," >&2
+    echo "e.g. BT_STRATEGY=<family>/<preset>.toml" >&2
+    exit 1
+  }
+  STRATEGY="$(resolve "$BT_STRATEGY" "$ROOT")"
+  # No default lens under a root either: each tree's presets are graded under
+  # their own, and the viz reads that from the preset's `[viz] fill`.
+  [[ -n "${BT_FILL:-}" ]] || { echo "BT_FILL is required with a strategies root ($ROOT)" >&2; exit 1; }
+  FILL="$(resolve "$BT_FILL" "$ROOT/fill")"
+else
+  STRATEGY="${BT_STRATEGY:-config/strategy/rsi_atr.toml}"
+  FILL="${BT_FILL:-config/fill/market_on_open.toml}"
+fi
 
 DATE_ARGS=()
 EXTRA=()

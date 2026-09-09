@@ -48,6 +48,8 @@ from viz.registry import RunSpec, default_run, get_runs, resolve_run
 
 # ── Layout ───────────────────────────────────────────────────────────────────
 
+logger = logging.getLogger(__name__)
+
 DATA_DIR = Path("data")
 BACKTEST_PATH = Path("data/backtest_trades.json")
 
@@ -56,29 +58,90 @@ BACKTEST_PATH = Path("data/backtest_trades.json")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKTEST_SCRIPT = REPO_ROOT / "scripts" / "backtest.sh"
 
-# Strategy presets: pure algorithm (trade-gating params + the asset list), no
-# data sources. The run endpoint composes a strategy with a dataset by writing
-# a temp child preset that `base = `s the strategy and appends the dataset's
-# `[[source]]` tables. Kept in this dir so the child's relative `base` path
-# resolves exactly as a hand-written preset's would.
-STRATEGY_DIR = Path("config/strategy")
-DEFAULT_STRATEGY = "example.toml"
-# Temp child preset the UI writes; lives alongside the presets so `base` resolves.
-UI_STRATEGY_PATH = STRATEGY_DIR / "_viz_session.toml"
+# Presets come in three axes — strategy (pure algorithm: gating params plus the
+# asset list), fill lens, dataset — and the run endpoint composes a strategy
+# with a dataset by writing a temp child preset that `base = `s the strategy and
+# appends the dataset's `[[source]]` tables.
+#
+# A strategies ROOT holds all three axes together: presets at the top or one
+# directory down, plus sibling `fill/` and `datasets/` trees. `BT_STRATEGIES_DIR`
+# (or `ICT_STRATEGIES_DIR`, the name the original viewer used and the one
+# `scripts/backtest.sh` still honours) points at one. Unset, it falls back to
+# `config/strategy/private` — a private preset repo cloned there, gitignored,
+# per the README — and failing that to this repo's own `config/` demos.
+#
+# The demos and a real root are alternatives, never a union. A configured root
+# supplies every axis it has, and this repo's `config/strategy/*.toml` stay on
+# disk as the public quickstart without appearing in anyone's picker: someone
+# running their own strategies did not ask to scroll past `example.toml`.
+def _resolve_strategies_root() -> Path | None:
+    """The configured strategies root, or None when only the demos exist.
+
+    First `BT_STRATEGIES_DIR`, then `ICT_STRATEGIES_DIR`, then the conventional
+    `config/strategy/private` checkout. A name that is set but does not point at
+    a directory is a misconfiguration worth hearing about, so it is logged
+    rather than silently ignored.
+    """
+    for var in ("BT_STRATEGIES_DIR", "ICT_STRATEGIES_DIR"):
+        raw = os.environ.get(var, "").strip()
+        if not raw:
+            continue
+        cand = Path(raw).expanduser()
+        if cand.is_dir():
+            # Absolute, so every path built from it survives the subprocess
+            # `cd`-ing to the repo root and a caller starting the server from
+            # anywhere.
+            return cand.resolve()
+        logger.warning("%s is set to %s, which is not a directory — ignoring it", var, raw)
+    default = REPO_ROOT / "config" / "strategy" / "private"
+    return default.resolve() if default.is_dir() else None
+
+
+STRATEGIES_ROOT = _resolve_strategies_root()
+
+# Strategy presets. With a root, they are named by their path under it
+# ("<family>/<preset>.toml") with no prefix of any kind: the name is what the
+# preset calls itself in its own tree, so a deep link made on one machine means
+# the same preset on another. Without one, the repo's demos.
+STRATEGY_DIR = STRATEGIES_ROOT or Path("config/strategy")
+# Fallback default, used only when the root has no picker to name one — see
+# `_default_strategy`. A tree's OWN first pick is not this repo's business to
+# know, and hardcoding one here would name someone's private preset in a public
+# file.
+FALLBACK_STRATEGY = "example.toml"
+
+# Subdirectories of a root that hold something other than strategies: the two
+# other run axes, the tree's own tooling, and its git metadata.
+NON_STRATEGY_DIRS = frozenset({"fill", "datasets", "tools", ".git"})
+
+# The picker allowlist at <root>/_picker.toml: `presets = [...]` names the
+# strategy presets the dropdown lists, in display order. Everything else under
+# the root stays runnable — by name through `POST /api/backtest/run`, through
+# `scripts/backtest.sh`, and in the UI opened with `?presets=all` — but is
+# hidden from the picker: reference ports, candidates, long-window variants. No
+# file means every preset is listed.
+PICKER_ALLOWLIST_NAME = "_picker.toml"
+
+# Temp child preset the UI writes per run. It must sit beside the strategy it
+# composes, because the child's relative `base`/`script` paths resolve against
+# its own parent — but a root is usually a git checkout of someone's private
+# preset repo, and a file the server rewrites on every run has no business
+# dirtying it. So it goes under `data/` and carries an absolute `base`, which
+# resolves from anywhere.
+UI_STRATEGY_PATH = DATA_DIR / "_viz_session.toml"
 
 # Dataset presets declare ONLY data sources (which candle files back each asset,
 # with an optional scale/offset transform), never algorithm params and never the
 # asset list. A dataset with no `[[source]]` table means "each asset loads its
 # own data/<asset>_1m.parquet".
-DATASET_DIR = Path("config/datasets")
-DEFAULT_DATASET = "local.toml"
+DATASET_DIR = (STRATEGIES_ROOT / "datasets") if STRATEGIES_ROOT else Path("config/datasets")
+DEFAULT_DATASET = "live.toml" if STRATEGIES_ROOT else "local.toml"
 
 # Fill-lens presets: pure simulation policy — how the backtest models entry
 # fills (the `[fill]` table) — orthogonal to both strategy and dataset. Passed
-# to the replay binary as `--fill config/fill/<name>` via backtest.sh's
-# BT_FILL env var.
-FILL_DIR = Path("config/fill")
-DEFAULT_FILL = "market_hybrid.toml"
+# to the replay binary as `--fill <path>` via backtest.sh's BT_FILL env var.
+FILL_DIR = (STRATEGIES_ROOT / "fill") if STRATEGIES_ROOT else Path("config/fill")
+DEFAULT_FILL = "market_hybrid_03.toml" if STRATEGIES_ROOT else "market_hybrid.toml"
 
 # Fitted duration model (seconds vs. candle count) driving the progress bar's
 # ETA. Absent or stale is fine — the estimator falls back to a linear guess.
@@ -95,8 +158,6 @@ EXHIBIT_HTML_PATH = Path(__file__).parent / "exhibit.html"
 # Shared stylesheet, linked by every page so the token block and the common
 # component styles live in one place.
 THEME_CSS_PATH = Path(__file__).parent / "theme.css"
-
-logger = logging.getLogger(__name__)
 
 
 def _as_number(value: object, default: float) -> float:
@@ -288,33 +349,17 @@ def _read_strategy_assets_sources(name: str) -> dict:
     return {"assets": assets, "sources": _sources_from({"source": raw})}
 
 
-def _list_presets(directory: Path, skip_dirs: frozenset[str] = frozenset()) -> list[str]:
-    """Preset names under `directory`, underscore-prefixed files excluded.
+def _list_presets(directory: Path) -> list[str]:
+    """Preset filenames in `directory`, underscore-prefixed files excluded.
 
     The underscore prefix marks a file that is machinery rather than a choice
-    — the composed session preset, a label registry — so it never appears in
-    a picker.
-
-    The walk is recursive and names are returned relative to `directory`, so a
-    preset organised into a subdirectory (`private/momentum/breakout.toml`) is
-    selectable as one sitting at the top. Every consumer joins the name back
-    onto `directory`, and a nested preset's relative `base` resolves against
-    its own parent, so a name with a path in it needs no special handling
-    downstream. A directory whose name starts with "_" is skipped whole, and
-    so is `.git` — a strategy tree pulled in as its own checkout carries one,
-    and walking it would be pointless work.
+    — the composed session preset, a label registry, the picker allowlist — so
+    it never appears in a picker. Flat: the fill and dataset axes are one
+    directory of files each, not trees.
     """
     if not directory.exists():
         return []
-    out: list[str] = []
-    for p in directory.rglob("*.toml"):
-        rel = p.relative_to(directory)
-        if any(part.startswith("_") or part == ".git" for part in rel.parts):
-            continue
-        if skip_dirs and rel.parts[:-1] and rel.parts[-2] in skip_dirs:
-            continue
-        out.append(rel.as_posix())
-    return sorted(out)
+    return sorted(p.name for p in directory.glob("*.toml") if not p.name.startswith("_"))
 
 
 def _list_datasets() -> list[str]:
@@ -325,15 +370,75 @@ def _list_fills() -> list[str]:
     return _list_presets(FILL_DIR)
 
 
-# A private strategy tree is a whole config repo: it carries its own fill
-# lenses and dataset presets in sibling directories beside the strategies.
-# Those are the other two axes of a run, not strategies, so a directory with
-# one of these names is not walked for the strategy picker.
-NON_STRATEGY_DIRS = frozenset({"fill", "datasets", "tools"})
+def _picker_allowlist() -> list[str] | None:
+    """Ordered preset names from `<root>/_picker.toml`, or None when there is
+    no readable allowlist — then every preset is listed. Duplicates collapse to
+    their first position, so the file can be edited without care for repeats."""
+    path = STRATEGY_DIR / PICKER_ALLOWLIST_NAME
+    if not path.exists():
+        return None
+    doc = _load_toml(path)
+    names = doc.get("presets")
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        logger.warning(
+            "picker allowlist %s has no `presets` string list; listing every preset", path,
+        )
+        return None
+    return list(dict.fromkeys(names))
 
 
-def _list_strategies() -> list[str]:
-    return _list_presets(STRATEGY_DIR, skip_dirs=NON_STRATEGY_DIRS)
+def _list_strategies(all_presets: bool = False) -> list[str]:
+    """Strategy preset names under the strategies root, as `<dir>/<file>.toml`.
+
+    One directory per strategy is the convention, so the walk is exactly two
+    levels: presets at the root and presets one directory down. `fill/`,
+    `datasets/`, `tools/` and `.git/` hold something other than strategies, and
+    a dot-prefixed directory is never someone's strategy either.
+
+    With an allowlist (`_picker.toml`) only its presets are returned, in its
+    order — that is what the picker shows. `all_presets=True` ignores it: the
+    run endpoint validates against the full set, so a hidden preset is still
+    runnable by name. Allowlist names with no file on disk are dropped and
+    logged, never invented.
+    """
+    if not STRATEGY_DIR.exists():
+        return []
+    found: list[str] = []
+    for p in list(STRATEGY_DIR.glob("*.toml")) + list(STRATEGY_DIR.glob("*/*.toml")):
+        if p.parent != STRATEGY_DIR and (
+            p.parent.name in NON_STRATEGY_DIRS or p.parent.name.startswith(".")
+        ):
+            continue
+        if p.name.startswith("_"):
+            continue
+        found.append(p.relative_to(STRATEGY_DIR).as_posix())
+    found.sort()
+    if all_presets:
+        return found
+    allow = _picker_allowlist()
+    if allow is None:
+        return found
+    present = set(found)
+    missing = [n for n in allow if n not in present]
+    if missing:
+        logger.warning(
+            "picker allowlist %s names presets not on disk: %s",
+            STRATEGY_DIR / PICKER_ALLOWLIST_NAME, ", ".join(missing),
+        )
+    return [n for n in allow if n in present]
+
+
+def _default_strategy() -> str:
+    """The preset the UI opens on: the picker's FIRST entry.
+
+    A tree's own `_picker.toml` already declares its display order, and the
+    thing you most want to look at is what you put at the top of that list —
+    so the default is read from there rather than named in this repo, which
+    has no business knowing what anyone's private presets are called. With no
+    picker, the first preset alphabetically; with no root at all, the demo.
+    """
+    listed = _list_strategies()
+    return listed[0] if listed else FALLBACK_STRATEGY
 
 
 def _preset_description(path: Path, cap: int = 200) -> str:
@@ -411,6 +516,30 @@ def _strategy_constraints(name: str) -> dict:
             if isinstance(r, str) and r
         ]
     return {"requires_dataset": req, "own_sources": bool(doc.get("source"))}
+
+
+def _strategy_viz_fill(name: str) -> str | None:
+    """The strategy's `[viz] fill` annotation — its pinned lens — or None.
+
+    A preset's published numbers were graded under ONE fill lens, and lenses are
+    not interchangeable across strategy families: a market-on-open CME preset
+    graded with `pryme_1m` is mispriced by an HL lens, whose stop gap alone
+    moves the result. So the preset declares its canonical lens and the UI
+    selects it whenever the caller has not named one, in place of the global
+    `DEFAULT_FILL`. An explicit choice — payload, deep link, picker — still wins.
+
+    Normalised to a `.toml` filename however the preset spelled it; a garbage
+    value reads as unpinned. NOT inherited through `base`: each preset that
+    wants a pin declares it, same as `requires_dataset`.
+    """
+    viz = _load_toml(STRATEGY_DIR / name).get("viz")
+    if not isinstance(viz, dict):
+        return None
+    raw = viz.get("fill")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    raw = raw.strip()
+    return raw if raw.endswith(".toml") else f"{raw}.toml"
 
 
 def _strategy_viz_warmup(name: str) -> int:
@@ -501,6 +630,9 @@ def _strategy_presets_with_desc(names: list[str]) -> list[dict]:
             "desc": _preset_description(STRATEGY_DIR / name),
             "requires_dataset": c["requires_dataset"],
             "own_sources": c["own_sources"],
+            # The preset's pinned lens, or null. The UI selects it when the
+            # user has not named one; see `_strategy_viz_fill`.
+            "fill": _strategy_viz_fill(name),
         })
     return out
 
@@ -1523,7 +1655,7 @@ class BacktestVizServer:
         dataset_sources = _read_dataset_sources(dataset)
         strat = request.query.get("strategy") or ""
         assets: list[str] = []
-        if strat and strat in _list_strategies():
+        if strat and strat in _list_strategies(all_presets=True):
             info = _read_strategy_assets_sources(strat)
             assets = list(info["assets"])
             # An own-sources strategy runs standalone, so with a source-free
@@ -1556,7 +1688,11 @@ class BacktestVizServer:
         shown read-only, because assets belong to the strategy and not to the
         dataset.
         """
-        strategies = _list_strategies()
+        # `?presets=all` lists every preset under the root, ignoring the
+        # picker allowlist — the escape hatch for reaching a hidden one from
+        # the UI. The default is the allowlist (see `PICKER_ALLOWLIST_NAME`).
+        all_presets = request.query.get("presets") == "all"
+        strategies = _list_strategies(all_presets=all_presets)
         datasets = _list_datasets()
         fills = _list_fills()
 
@@ -1564,7 +1700,7 @@ class BacktestVizServer:
             "strategies": _strategy_presets_with_desc(strategies),
             "fills": _fill_presets_with_desc(fills),
             "datasets": _presets_with_desc(datasets, DATASET_DIR),
-            "default_strategy": DEFAULT_STRATEGY,
+            "default_strategy": _default_strategy(),
             "default_fill": DEFAULT_FILL,
             "default_dataset": DEFAULT_DATASET,
             "sourceless_datasets": _sourceless_datasets(datasets),
@@ -1573,7 +1709,9 @@ class BacktestVizServer:
         strat = request.query.get("strategy")
         if not strat:
             return web.json_response(base)
-        if strat not in strategies:
+        # Validated against every preset, not just the listed ones: a `?bt=`
+        # deep link to a hidden preset must still resolve its assets.
+        if strat not in _list_strategies(all_presets=True):
             return web.json_response({"error": f"unknown strategy preset: {strat}"}, status=400)
         info = _read_strategy_assets_sources(strat)
         own_stems = sorted({f for s in info["sources"].values() for f in s["files"]})
@@ -1604,22 +1742,34 @@ class BacktestVizServer:
         / `[strategy]` overrides, then append the dataset's `[[source]]`
         tables. The result is exactly one level deep.
 
-        Written into STRATEGY_DIR so relative `base` paths resolve identically
-        to a hand-written preset's.
+        Written under `data/`, not into the strategies tree: a root is normally
+        a checkout of someone's preset repo, and a file rewritten on every run
+        would leave it permanently dirty. That puts the child somewhere its
+        parent's relative path does not resolve from, so `base` is written
+        ABSOLUTE — the engine accepts either, and an absolute path resolves the
+        same from any directory. `script` and `engine` inside the parent still
+        resolve against the parent's own location, which has not moved.
         """
-        doc = _load_toml(STRATEGY_DIR / strategy)
+        strat_path = (STRATEGY_DIR / strategy).resolve()
+        doc = _load_toml(strat_path)
         own_base = doc.get("base")  # grandparent, or None
+        # The grandparent is spelled relative to the STRATEGY's directory, so
+        # anchor it there before making it absolute.
+        base_path = (strat_path.parent / own_base).resolve() if own_base else strat_path
 
         lines = [
             "# AUTO-GENERATED by the viz server; overwritten on each UI-driven run.",
             "# Flattened compose of strategy + dataset (one inheritance level).",
-            f'base = "{own_base or strategy}"',
+            f'base = {json.dumps(str(base_path))}',
         ]
         # Inline the strategy's own top-level overrides. Only meaningful when
         # the strategy was itself a child; harmless duplication otherwise.
         if own_base:
             if "engine" in doc:
-                lines.append(f'engine = "{doc["engine"]}"')
+                # Same relocation problem as `base`: spelled relative to the
+                # strategy's own directory, resolved before it moves.
+                eng = (strat_path.parent / str(doc["engine"])).resolve()
+                lines.append(f"engine = {json.dumps(str(eng))}")
             if "assets" in doc:
                 lines.append("assets = [" + ", ".join(f'"{a}"' for a in doc["assets"]) + "]")
         lines.append("")
@@ -1722,15 +1872,18 @@ class BacktestVizServer:
 
         # Validate every axis against its directory listing, so a bad or
         # path-traversing name can never reach an argv slot.
-        base_strategy = payload.get("strategy") or DEFAULT_STRATEGY
-        if base_strategy not in _list_strategies():
+        base_strategy = payload.get("strategy") or _default_strategy()
+        if base_strategy not in _list_strategies(all_presets=True):
             return web.json_response(
                 {"error": f"unknown strategy preset: {base_strategy}"}, status=400,
             )
         dataset = payload.get("dataset") or DEFAULT_DATASET
         if dataset not in _list_datasets():
             return web.json_response({"error": f"unknown dataset preset: {dataset}"}, status=400)
-        fill = payload.get("fill") or DEFAULT_FILL
+        # An unnamed lens falls back to the STRATEGY's pin before the global
+        # default: the preset knows which lens its numbers were graded under,
+        # and the global default is only right for the family it came from.
+        fill = payload.get("fill") or _strategy_viz_fill(base_strategy) or DEFAULT_FILL
         if fill not in _list_fills():
             return web.json_response({"error": f"unknown fill preset: {fill}"}, status=400)
 

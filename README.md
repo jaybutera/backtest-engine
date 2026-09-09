@@ -509,32 +509,87 @@ rather than rescaling the trade.
     viz/            web UI (Python)
     config/fill/    fill lenses
     config/strategy/ strategy presets
-    config/strategy/private/  optional: a private preset tree, gitignored
+    config/strategy/private/  default strategies root, gitignored (see below)
     scripts/        backtest and ensemble runners, the Databento fetcher,
                     the synthetic generator, the parameter sweep
 
-## Private strategies
+## Your own strategies: the strategies root
 
 The presets committed here are demos. Real strategies generally cannot live in
-a public repo, so the visualizer and the runners also read
-`config/strategy/private/`, which is gitignored and never committed. Point it
-at a private repo of your own:
+a public repo, so both the visualizer and `scripts/backtest.sh` can take all
+three preset axes from a **strategies root** elsewhere on disk — a directory
+laid out like this:
+
+    <root>/_picker.toml       which presets the dropdown lists, and in what order
+    <root>/<name>/*.toml      strategy presets, one directory per strategy
+    <root>/fill/*.toml        fill lenses
+    <root>/datasets/*.toml    dataset presets
+    <root>/tools/             whatever tooling the tree carries
+
+Point `BT_STRATEGIES_DIR` at it:
+
+    BT_STRATEGIES_DIR=~/src/my-strategies uv run viz serve
+
+`ICT_STRATEGIES_DIR` is accepted as a second name for the same thing, because
+that is what the viewer this one grew out of called it and existing shells
+still export it. With neither set, the root defaults to
+`config/strategy/private/` — gitignored here, so a private preset repo cloned
+there works with no configuration at all:
 
     git clone <your-private-strategy-repo> config/strategy/private
 
-The strategy picker walks that tree recursively, so presets keep whatever
-directory structure the private repo gives them and are named by their
-relative path. Sibling `fill/`, `datasets/` and `tools/` directories in such a
-repo are left off the strategy axis; underscore-prefixed files stay hidden as
-they do anywhere else. Nothing about the layout is required: with no private
-checkout the directory simply does not exist and only the demos are listed.
+A strategy is named by its path under the root, with no prefix of any kind:
+`<family>/<preset>.toml` is what the picker shows, what a `?bt=` deep link
+carries, and what `BT_STRATEGY` takes. The same name therefore means the same
+preset on every machine that has the tree.
 
-Keeping it a separate checkout rather than a submodule is deliberate. A
-submodule entry would put a private URL in this repo's history and make
-`git clone --recurse-submodules` fail for anyone without access to it; an
-ignored directory costs a clone step and asks nothing of people who only want
-the engine. `scripts/check-leaks.sh` skips the directory for the same reason,
-so a working copy with private strategies pulled still passes the check.
+The walk is two levels — presets at the root and presets one directory down —
+and `fill/`, `datasets/`, `tools/` and `.git/` are not part of the strategy
+axis. Files starting with `_` are machinery, never choices.
+
+`_picker.toml` is optional. With one, its `presets = [...]` list is exactly
+what the dropdown shows, in that order:
+
+    presets = [
+      "momentum/breakout.toml",
+      "meanrev/pullback.toml",
+    ]
+
+Everything else under the root stays runnable — by name through
+`POST /api/backtest/run`, through `scripts/backtest.sh`, and in the UI opened
+with `?presets=all` — it is just hidden from the dropdown, which is what you
+want for reference ports, candidates and long-window variants. Without the
+file, every preset is listed. A name in the list with no file on disk is
+dropped and logged rather than shown as a broken entry.
+
+The picker's first entry is also the preset the UI opens on, so put the one you
+most want to look at at the top. With no picker the default is the first preset
+alphabetically.
+
+**The demos and a root are alternatives, not a union.** With a root configured,
+this repo's own `config/strategy/*.toml` stay on disk as the public quickstart
+but do not appear in the picker: someone running their own strategies did not
+ask to scroll past `example.toml` to reach them.
+
+A preset may pin the fill lens its published numbers were graded under:
+
+    [viz]
+    fill = "pryme_1m.toml"
+
+The UI selects that lens whenever the caller has not named one, in place of the
+global default. An explicit choice still wins.
+
+The per-run composed preset the server writes goes to `data/_viz_session.toml`,
+never into the root — a root is normally someone's git checkout, and a file
+rewritten on every run has no business dirtying it. It carries an absolute
+`base`, so it resolves from wherever it sits.
+
+Keeping the default root a plain checkout rather than a submodule is
+deliberate. A submodule entry would put a private URL in this repo's history
+and make `git clone --recurse-submodules` fail for anyone without access to it;
+an ignored directory costs a clone step and asks nothing of people who only
+want the engine. `scripts/check-leaks.sh` skips it for the same reason, so a
+working copy with private strategies pulled still passes the check.
 
 To update it later, pull inside that directory:
 
