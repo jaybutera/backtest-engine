@@ -1075,10 +1075,26 @@ class BacktestVizServer:
     def _publish_result(self, src: Path) -> int | None:
         """Move a finished run's sidecar into place; return its mtime.
 
-        `os.replace` within one directory is atomic, which is the whole point:
-        readers never observe a partial file. None if the move fails, which the
-        callers turn into a run that produced no result.
+        The report is parsed first. The engine writes it with a plain
+        `std::fs::write`, which is not atomic, so a process killed partway
+        through leaves a truncated file behind — and the orphan path's only
+        evidence that a run finished is that this file is there. Publishing
+        that would put a half-written report at the path every page reads and
+        label it `done` with a fresh `.meta.json`. Parsing it once per run is
+        nothing next to the run that produced it.
+
+        `os.replace` within one directory is atomic, which is the point of the
+        move itself: a reader never observes a partial file.
+
+        None if the report is missing or unreadable, or if the move fails —
+        which the callers turn into a run that produced no result.
         """
+        try:
+            with src.open() as f:
+                json.load(f)
+        except (OSError, ValueError):
+            logger.warning("staged report at %s is missing or not readable JSON", src)
+            return None
         try:
             os.replace(src, self.backtest_path)
             return int(self.backtest_path.stat().st_mtime)
@@ -1105,6 +1121,22 @@ class BacktestVizServer:
             except OSError:
                 logger.warning("could not remove stale segment sidecar %s", path)
 
+    def _clear_staged_result(self, run: dict) -> None:
+        """Delete what a run staged but never published.
+
+        Reached by every terminal state except `done`. The engine can write the
+        report and still exit non-zero, so a failed run leaves a complete-
+        looking file behind — and because the name carries the run id, a
+        leftover accumulates rather than being overwritten by the next run.
+        """
+        staged = self._run_result_path(run.get("run_id"))
+        if staged is None:
+            return
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("could not remove staged report %s", staged)
+
     def _interrupt_run(self, run: dict, why: str) -> None:
         """Close out a run that cannot produce a result, saying why.
 
@@ -1118,14 +1150,9 @@ class BacktestVizServer:
             pid=None,
         )
         self._clear_segment_temps(int(_as_number(run.get("segments_total"), 1)) or 1)
-        staged = self._run_result_path(run.get("run_id"))
-        if staged is not None:
-            # Whatever this run staged is not a result, and leaving it would
-            # let a later reconcile publish a half-finished report.
-            try:
-                staged.unlink(missing_ok=True)
-            except OSError:
-                logger.warning("could not remove staged sidecar %s", staged)
+        # Whatever this run staged is not a result, and leaving it would let a
+        # later reconcile publish a half-finished report.
+        self._clear_staged_result(run)
         self._save_run_state()
 
     def _legacy_sidecar_written_since(self, started_at: object) -> int | None:
@@ -1188,7 +1215,7 @@ class BacktestVizServer:
         # is gone. A pre-staging record falls back to the mtime guess.
         staged = self._run_result_path(run.get("run_id")) if run.get("staged") else None
         if staged is not None:
-            mtime = self._publish_result(staged) if staged.exists() else None
+            mtime = self._publish_result(staged)
         else:
             mtime = self._legacy_sidecar_written_since(run.get("started_at"))
         if mtime is None:
@@ -1258,7 +1285,7 @@ class BacktestVizServer:
             while self._pid_alive(run.get("pid")):
                 await asyncio.sleep(1.0)
             self._settle_orphan_run(
-                run, "the adopted run exited without writing a sidecar",
+                run, "the adopted run ended without leaving a complete result",
             )
 
     # ── Pages ────────────────────────────────────────────────────────────────
@@ -1634,12 +1661,19 @@ class BacktestVizServer:
             # phone after a reload) uses this to ATTACH to the run in flight
             # instead of reporting a failure the user did not cause.
             live = self._bt_run or {}
+            # `pending` says a launch has claimed the slot but has not seeded
+            # its record yet. There is no id to hand back — and the record that
+            # IS there belongs to the PREVIOUS run, so naming it would send the
+            # caller to attach to an old result under a "that was another run"
+            # note. Saying so lets the page wait for the real one instead.
+            pending = self._launching and not in_flight
             return web.json_response({
                 "error": "backtest already running",
-                "run_id": live.get("run_id"),
-                "started_at": live.get("started_at"),
-                "eta_seconds": live.get("eta_seconds"),
-                "adopted": bool(live.get("adopted")),
+                "pending": pending,
+                "run_id": None if pending else live.get("run_id"),
+                "started_at": None if pending else live.get("started_at"),
+                "eta_seconds": None if pending else live.get("eta_seconds"),
+                "adopted": bool(live.get("adopted")) and not pending,
             }, status=409)
         self._launching = True
         try:
@@ -1844,14 +1878,22 @@ class BacktestVizServer:
             logger.exception("%s crashed", what)
         finally:
             run = self._bt_run
-            if not cancelled and run is not None and run.get("status") == "running":
-                run.update(
-                    status="error",
-                    finished_at=time.time(),
-                    pid=None,
-                    error=run.get("error") or f"{what} exited without reporting an outcome",
-                )
-                self._save_run_state()
+            if not cancelled and run is not None:
+                if run.get("status") == "running":
+                    run.update(
+                        status="error",
+                        finished_at=time.time(),
+                        pid=None,
+                        error=run.get("error") or f"{what} exited without reporting an outcome",
+                    )
+                    self._save_run_state()
+                if run.get("status") != "done":
+                    # One sweep covering every way a run can end without
+                    # publishing: a non-zero exit that still wrote a report, a
+                    # publish that failed, a driver that crashed. Not on
+                    # cancellation — the run is still going and still writing
+                    # to that file, and the next process needs it to settle.
+                    self._clear_staged_result(run)
 
     async def _run_backtest_task(
         self, env: dict, sources_applied: bool, warmup_days: int,
@@ -1984,10 +2026,10 @@ class BacktestVizServer:
             # Publish only now, and only from the staging path: until this
             # point the report on disk is still the previous run's, which is
             # exactly what a reader should see while this one is in flight.
-            generated = self._publish_result(staged) if staged.exists() else None
+            generated = self._publish_result(staged)
             if generated is None:
                 self._bt_run["status"] = "error"
-                self._bt_run["error"] = "backtest wrote no sidecar"
+                self._bt_run["error"] = "the backtest left no readable report"
                 self._save_run_state()
                 return
             self._bt_run["status"] = "done"
