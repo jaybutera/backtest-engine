@@ -63,7 +63,7 @@
 //! ```
 //!
 //! The order within one candle is: scanner step (history, ATR, day
-//! tracker, sessions, swings / gaps / breaks, levels, equal levels, gap
+//! tracker and sessions on base bars, swings / gaps / breaks, levels, equal levels, gap
 //! lifecycle, sweeps) → `on_day` → `on_bar` → draw map rebuild when due →
 //! `emit` per candidate → registry maintenance (retest refresh, decay,
 //! pruning). `on_bar` runs when the bar carries a sweep or a break, or the

@@ -1053,6 +1053,11 @@ impl Scanner {
         self.levels.binary_search_by_key(&id, |l| l.id).ok()
     }
 
+    /// Every level held, in id order.
+    pub fn all_levels(&self) -> impl Iterator<Item = &Level> {
+        self.levels.iter()
+    }
+
     pub fn level(&self, id: i64) -> Option<&Level> {
         self.level_index(id).map(|i| &self.levels[i])
     }
@@ -2420,7 +2425,7 @@ impl Scanner {
     // ── Per-candle driver ───────────────────────────────────────────────────
 
     /// Step every service for one completed candle, up to the strategy's
-    /// first hook. Order: history + ATR; day tracker (base bars); sessions;
+    /// first hook. Order: history + ATR; day tracker and sessions (base bars);
     /// swing / gap / break detection; swings → levels; equal levels; gap
     /// lifecycle; sweeps. The strategy then sees the events; after its hook
     /// the caller runs [`Scanner::rebuild_draw`] and [`Scanner::after_hooks`].
@@ -2451,7 +2456,17 @@ impl Scanner {
             None
         };
 
-        self.session_process(c);
+        // Session and period extremes are tracked on base bars only. An HTF
+        // composite carries its period-start stamp and arrives after the base
+        // bar that closed it, so feeding it here would read a stamp from
+        // inside a session that already ended, reopen it, and emit the
+        // session's extremes a second time when the next base bar closes it
+        // again; across a day boundary it flips the session date backwards
+        // the same way and re-emits the previous day's high and low. The base
+        // bars already carry every price an HTF bar is built from.
+        if is_base {
+            self.session_process(c);
+        }
 
         let ring = self.rings.get(&tf).unwrap();
         let swings = self.detect_swings(ring, tf);
@@ -2789,6 +2804,40 @@ mod tests {
             timestamp: DateTime::from_timestamp(ts, 0).unwrap().naive_utc(),
             complete: true,
         }
+    }
+
+    fn candle_tf(tf: &str, ts: i64, o: f64, h: f64, l: f64, c: f64) -> Candle {
+        Candle { timeframe: tf_id(tf), ..candle(ts, o, h, l, c) }
+    }
+
+    fn count_source(sc: &Scanner, src: &str) -> usize {
+        sc.all_levels().filter(|l| l.status == Status::Active && sc.source_name(l.source) == src).count()
+    }
+
+    /// An HTF composite arrives after the base bar that closed it, carrying
+    /// its period-start stamp. Fed to the session tracker it would reopen a
+    /// session that had just ended and emit its extremes twice.
+    #[test]
+    fn a_late_htf_bar_does_not_reopen_an_ended_session() {
+        let mut c = cfg();
+        c.sessions = SessionsCfg {
+            enabled: true,
+            tz_offset_secs: 0,
+            sessions: vec![SessionSpec { name: "s".into(), start_hour: 1, end_hour: 2 }],
+            open_marks: vec![],
+        };
+        let mut sc = Scanner::new(c);
+        for m in 0..60 {
+            let p = 100.0 + (m as f64 / 7.0).sin();
+            sc.process(&candle(3600 + m * 60, p, p + 0.5, p - 0.5, p));
+        }
+        sc.process(&candle(7200, 100.0, 100.2, 99.8, 100.0));
+        assert_eq!(count_source(&sc, "session_high"), 1);
+        // The 01:00 hourly composite closes with the 02:00 base bar.
+        sc.process(&candle_tf("1h", 3600, 100.0, 101.5, 98.5, 100.0));
+        sc.process(&candle(7260, 100.0, 100.2, 99.8, 100.0));
+        assert_eq!(count_source(&sc, "session_high"), 1, "one session, one high");
+        assert_eq!(count_source(&sc, "session_low"), 1);
     }
 
     #[test]
