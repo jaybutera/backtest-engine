@@ -1325,25 +1325,20 @@ fn dyn_to_string(d: &Dynamic) -> String {
     }
 }
 
-/// A run id from a script value: a string as given, `()` as "", a sweep map
-/// (anything with `level_id` and `start_ts`) as `S{epoch}.{level_id}.{tf}.{start_ts}`
-/// with the map's `tf` when it has one and the current candle's otherwise.
+/// A run id from a script value: a string as given, `()` as "", a map as a
+/// sweep run `S{epoch}.{level_id}.{tf}.{start_ts}`, with the current
+/// candle's timeframe and 0 for a missing `level_id` or `start_ts`.
 fn run_id(t: &TraceSink, d: &Dynamic) -> String {
     if d.is_unit() {
         return String::new();
     }
     if let Some(m) = d.read_lock::<Map>() {
-        let lid = m.get("level_id").and_then(|x| x.as_int().ok());
-        let start = m.get("start_ts").and_then(|x| x.as_int().ok());
-        if let (Some(lid), Some(start)) = (lid, start) {
-            let tf = m
-                .get("tf")
-                .and_then(|x| x.clone().into_immutable_string().ok())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| t.tf_name(t.tf()));
-            return t.sweep_run(lid, &tf, start);
-        }
-        return String::new();
+        let int = |k: &str| -> i64 {
+            m.get(k)
+                .map(|x| x.as_int().or_else(|_| x.as_float().map(|f| f as i64)).unwrap_or(0))
+                .unwrap_or(0)
+        };
+        return t.sweep_run(int("level_id"), &t.tf_name(t.tf()), int("start_ts"));
     }
     dyn_to_string(d)
 }

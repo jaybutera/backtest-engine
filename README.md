@@ -482,6 +482,135 @@ the bar's open instead, which is where a resting stop or target order
 actually fills when the market jumps over it; the stop is checked before
 the target.
 
+## The trace contract
+
+`replay --trace <dir>` writes what a strategy saw and decided, bar by bar,
+for a replay viewer or a decision debugger:
+
+    backtest replay --strategy config/strategy/example_sweep.toml -a ES \
+      --timeframe 5m --timeframe 15m --from 2026-08-03 --to 2026-08-14 --warmup-days 5 \
+      --json-sidecar data/backtest_trades.json \
+      --trace data/backtest_trades.trace --trace-from 2026-08-10 --trace-to 2026-08-12
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--trace <dir>` | off | Directory for the per-asset files and `manifest.json`. |
+| `--trace-from <YYYY-MM-DD>` | `--from` | First traced day. Clamped to `--from`: warmup bars are never traced. |
+| `--trace-to <YYYY-MM-DD>` | `--to` | Last traced day, inclusive. |
+| `--trace-detail basic\|full` | `basic` | `full` adds `lv.refresh`, `fvg.*` and a `hook` record for every wake-only call. |
+| `--trace-max-mb <N>` | `512` | Byte budget per asset file. Past it the file stops and the manifest records `truncated_at`. |
+
+Tracing only reads. A traced run books the same trades as an untraced one,
+and the JSON report is byte-identical (`cmp` the two sidecars); the engine's
+tests pin this for batch and `--streaming` runs and across scanner rebuilds.
+An unwritable trace directory prints one warning and the run carries on.
+
+### Files
+
+`<dir>/<asset>.trace.jsonl` per asset (`:` in the name becomes `_`), and
+`<dir>/manifest.json`, written after the JSON report:
+
+| Key | Meaning |
+|---|---|
+| `schema` | `1`. |
+| `engine_rev` | `backtest-engine <crate version>`. |
+| `strategy_file`, `fill_file` | Absolute paths, or null. |
+| `run_from`, `run_to`, `warmup_days` | The run's `--from`, `--to`, `--warmup-days`. |
+| `trace_from`, `trace_to` | First and last second of the traced window, UTC, `YYYY-MM-DDTHH:MM:SS`. |
+| `detail` | `basic` or `full`. |
+| `sidecar`, `sidecar_sha256` | The JSON report path and the SHA-256 of the body written there. A viewer shows a trace only when the hash matches the report it displays. Null without `--json-sidecar`. |
+| `assets` | Per asset: `file`, `records`, `bytes`, `truncated_at` (base-bar unix seconds, or null), `failed`. |
+| `snap_level_fields`, `snap_dev_fields` | Column order of the snapshot rows. |
+
+### Record envelope
+
+Every line is one JSON object:
+
+| Field | Meaning |
+|---|---|
+| `k` | Kind, dotted (`lv.birth`, `sw.cross`, `adm.result` ...). |
+| `n` | Node id in the strategy's decision diagram; `x_<name>` for decision points a diagram may not draw; `""` for structural records. |
+| `b` | Base-bar time, unix seconds (bar-open stamp). The replay clock; non-decreasing within a file. |
+| `t`, `tf` | Stamp and timeframe of the candle being processed. An HTF candle carries its period-start stamp and the `b` of the base bar it arrived with. |
+| `ph` | Phase: `bar`, `emit`, `admit`, `close`, `book`, `snap`, `rebuild`. |
+| `q` | Sequence number, the line's index in the file. |
+| `run` | Run id (below). |
+| `p` | Parent run id, when there is one. |
+| `o` | Outcome (`yes`, `new`, `held`, `back_in`, `next_bar`, `take`, `skip` ...). |
+| `v` | The values read or computed. NaN and infinities are `null`. |
+| `cmp` | The comparisons made: `[{"l": "bar low", "lv": 7765.75, "op": "<", "r": "level +/- noise_atr * ATR", "rv": 7765.93, "ok": true}]`. |
+
+### Run ids
+
+| Run | Id |
+|---|---|
+| Level | `L{epoch}.{lid}` |
+| Sweep crossing | `S{epoch}.{lid}.{tf}.{start_ts}` |
+| Fair-value gap | `F{epoch}.{id}` |
+| Opportunity | `O{opportunity id}`, the report's `opportunity_id` |
+| Context | `CX.draw`, `CX.day` |
+
+`epoch` starts at 0 and goes up by one at every scanner rebuild
+(`rebuild_from_scratch_days`), because a rebuilt scanner numbers its levels
+and gaps from zero again. Scripts add their own runs (`D{id}`, `W{id}` ...).
+
+### Kinds the engine writes
+
+| Kind | Node | `v` |
+|---|---|---|
+| `lv.birth` | `period`, `sess`, `swing`, `x_script_level` | `lid, price, side, source, ltf, lts, touch, sig, atr, merge_checked, tol` |
+| `lv.merge` | `merge` | `lid, price, in_price, in_source, in_tf, dist, tol, touch_before, touch, sig_before, sig` |
+| `lv.expire` | `expq` | `lid, decay, decay_candles, divisor` |
+| `lv.prune` | `expired` | `removed, kept` |
+| `lv.refresh` (full) | `decay` | `lid, dist, thr` |
+| `lv.rebuild` | `""` | `epoch_from, epoch_to, tape_bars, levels_before, levels_after` |
+| `sw.cross` | `crossq` | `lid, side, level, extreme, atr, noise_atr, min_cross, line, sig, min_sig` |
+| `sw.dev` | `dev` | `count, extreme, extreme_ts, extended` |
+| `sw.done` | `doneq` | `count, max_multi, how` (`o`: `next_bar`, or `yes` with `how` `held` / `back_in`) |
+| `sw.final` | `sweep` | the sweep's fields (`level_id, level_price, level_source, level_sig, level_side, dir, start_ts, extreme_ts, extreme_price, magnitude_atr, level_formed_at`) plus `atr` |
+| `fvg.new`, `fvg.status` (full) | `x_fvg` | `id, dir, tf, ts, near, far, ce, status, is_ifvg, c1_stop` (`o`: `new`, `mitigated`, `filled`, `inverted`, `cap`) |
+| `st.break` | `x_break` | `tf, ts, level, dir` |
+| `hook` | `bar` | `o, h, l, c, atr, sweeps` (swept level ids), `breaks` (count), `wake` (true on a wake-only call) |
+| `cx.draw` | `draw` | `price, atr, targets: [[lid, price, dir, distance_atr, significance, draw_score], ...]` |
+| `cx.day` | `card` | `day_ms, open, high, low, close` |
+| `adm.result` | `take`, `x_admit_result` | `decision, reason, entry, stop, tp, engine_override` (`"invalid_geometry"` when the engine refused a script's `take`) |
+| `book.<event>` | `take` (placed), `exit` (closed), `x_book` | the book event's journal object |
+| `snap.levels` | `""` | `epoch, levels` (every active level, rows in `snap_level_fields` order) |
+| `snap.dev` | `""` | `epoch, dev` (open crossings on active levels, rows in `snap_dev_fields` order) |
+
+Snapshots are written at the first traced base bar, at the first base bar
+of each later UTC day, and after each rebuild, so a viewer can seek by
+folding forward from the latest snapshot. Book events written at the end of
+the run, for positions the run closed, carry the last bar's `b`.
+
+### From a script
+
+Two host functions are always registered, traced or not:
+
+    tracing() -> bool
+    trace(kind: string, node: string, run, values: map)
+
+`tracing()` is true before the first bar (in `init`) and on bars inside the
+trace window, and false without `--trace`, during warmup and after the
+window. `cfg.trace` in `init` is true when the run is traced. `trace()`
+returns at once outside the window. `run` is a string, `()` for none, or a
+sweep map, which the host formats as `S{epoch}.{level_id}.{tf}.{start_ts}`
+with the current candle's timeframe (a missing `level_id` or `start_ts` reads
+as 0). The host writes nothing for `on_trace_snapshot`'s return value. Keys `o`, `p` and `cmp` in `values` move into the envelope. A
+script that defines `on_trace_snapshot(ts)` is called after each engine
+snapshot to write its own `snap.script` records. The usual guard reads
+`tracing()` once in `init` and wraps every call site:
+
+```rhai
+fn init(cfg) { #{ tr: tracing(), … } }
+…
+if this.tr { trace("opp.min", "minq", "O" + o.id, #{ score: o.score, o: "pass" }); }
+```
+
+Code inside the guard must only read. `scan.significance(...)` interns
+unknown source names, so a trace block that calls it with a new name changes
+the scanner; reuse values the decision code already computed instead.
+
 ## Trade management
 
 Independent of signal logic, the harness can move a stop to breakeven at a
