@@ -195,6 +195,8 @@ use crate::strategy::{
     AdmitContext, Book, BuildContext, Decision, SharedSeries, SkipReason, Strategy,
     StrategyFactory, TakeParams,
 };
+use crate::trace::{Phase, TraceHandle, TraceSink};
+use serde_json::{json, Value as JsonValue};
 
 /// The knobs the Rhai factory adds to `[strategy]`.
 pub static RHAI_KNOBS: &[Knob] = &[
@@ -246,7 +248,7 @@ impl StrategyFactory for RhaiFactory {
         let engine_path = ctx
             .engine
             .map(|e| resolve_relative(e, ctx.strategy_file));
-        match RhaiStrategy::new(
+        match RhaiStrategy::new_traced(
             &path,
             ctx.asset,
             ctx.params,
@@ -255,6 +257,7 @@ impl StrategyFactory for RhaiFactory {
             ctx.params.get_u32("script_history") as usize,
             ctx.market.series.clone(),
             ctx.script,
+            ctx.trace.clone(),
         ) {
             Ok(s) => Box::new(s),
             Err(e) => {
@@ -677,6 +680,12 @@ pub struct RhaiStrategy {
     /// `BACKTEST_RHAI_STATS` is set.
     stats: RefCell<HashMap<&'static str, (u64, std::time::Duration)>>,
     stats_on: bool,
+    /// Decision-trace sink when the run is traced (`--trace`). Shared with
+    /// the native scanner and the `trace()` host function.
+    trace: Option<TraceHandle>,
+    /// Whether the script defines `on_trace_snapshot(ts)`, called after each
+    /// engine snapshot while tracing.
+    has_on_trace_snapshot: bool,
 }
 
 impl Drop for RhaiStrategy {
@@ -712,6 +721,32 @@ impl RhaiStrategy {
         history: usize,
         market: HashMap<String, SharedSeries>,
         script_table: &toml::value::Table,
+    ) -> Result<Self, Box<EvalAltResult>> {
+        Self::new_traced(
+            path,
+            asset,
+            params,
+            engine_path,
+            timeframes,
+            history,
+            market,
+            script_table,
+            None,
+        )
+    }
+
+    /// [`Self::new`] with a decision-trace sink (None = untraced).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_traced(
+        path: &Path,
+        asset: &str,
+        params: &crate::params::Params,
+        engine_path: Option<&Path>,
+        timeframes: &[String],
+        history: usize,
+        market: HashMap<String, SharedSeries>,
+        script_table: &toml::value::Table,
+        trace: Option<TraceHandle>,
     ) -> Result<Self, Box<EvalAltResult>> {
         let mut engine = Engine::new();
         engine.set_optimization_level(rhai::OptimizationLevel::Full);
@@ -756,6 +791,27 @@ impl RhaiStrategy {
             let now2 = now.clone();
             engine.register_fn("now", move || -> i64 { now2.get() });
         }
+        // tracing() / trace(kind, node, run, values): the decision trace.
+        // Registered whether or not the run is traced, so a script calls them
+        // unconditionally; untraced, tracing() is false and trace() returns
+        // at once.
+        {
+            let tr = trace.clone();
+            engine.register_fn("tracing", move || -> bool {
+                tr.as_ref().is_some_and(|t| t.script_tracing())
+            });
+            let tr = trace.clone();
+            engine.register_fn(
+                "trace",
+                move |kind: &str, node: &str, run: Dynamic, values: Map| {
+                    if let Some(t) = tr.as_ref() {
+                        if t.on() {
+                            script_trace(t, kind, node, &run, values);
+                        }
+                    }
+                },
+            );
+        }
         // opp(signal_type, tf, direction, ts): a new opportunity for this asset.
         {
             let a = asset_for_opp.clone();
@@ -788,6 +844,7 @@ impl RhaiStrategy {
         let has_on_day = has_fn("on_day");
         let has_on_candle = has_fn("on_candle");
         let has_on_rebuild = has_fn("on_rebuild");
+        let has_on_trace_snapshot = has_fn("on_trace_snapshot");
         if !has_on_candle && !has_on_bar && !has_bar_close {
             return Err(
                 "script defines none of `on_candle(c)`, `on_bar(c, atr, sweeps, breaks)` \
@@ -815,6 +872,7 @@ impl RhaiStrategy {
             Dynamic::from_array(timeframes.iter().map(|t| t.clone().into()).collect()),
         );
         cfg.insert("history".into(), (history as i64).into());
+        cfg.insert("trace".into(), trace.is_some().into());
         cfg.insert(
             "script".into(),
             toml_to_dynamic(&toml::Value::Table(script_table.clone())),
@@ -845,6 +903,9 @@ impl RhaiStrategy {
             .unwrap_or_default();
         if scan.is_none() && has_on_bar && !has_on_candle {
             return Err("script defines `on_bar` but its state has no `scan` scanner".into());
+        }
+        if let (Some(sc), Some(t)) = (&scan, &trace) {
+            sc.0.borrow_mut().set_trace(Some(t.clone()));
         }
 
         // Rebuild-from-scratch horizons. The window is floored at 32 days so a
@@ -891,6 +952,8 @@ impl RhaiStrategy {
             asset: asset.to_string(),
             stats: RefCell::new(HashMap::new()),
             stats_on: std::env::var_os("BACKTEST_RHAI_STATS").is_some(),
+            trace,
+            has_on_trace_snapshot,
         })
     }
 
@@ -1037,6 +1100,11 @@ impl RhaiStrategy {
                 window.first().map(|c| c.timestamp.to_string()).unwrap_or_default()
             );
         }
+        let tape_bars = window.len();
+        let (levels_before, epoch_from) = match &self.trace {
+            Some(t) => (scan.0.borrow().sizes().1, t.epoch()),
+            None => (0, 0),
+        };
         scan.0.borrow_mut().rebuild_from(window);
         drop(tape);
         // The script holds native ids across bars — a developing track keeps
@@ -1050,12 +1118,59 @@ impl RhaiStrategy {
                 self.fail("on_rebuild", e);
             }
         }
+        if let Some(t) = &self.trace {
+            if t.on() {
+                t.set_phase(Phase::Rebuild);
+                t.record(
+                    "lv.rebuild",
+                    "",
+                    "",
+                    None,
+                    None,
+                    json!({
+                        "epoch_from": epoch_from, "epoch_to": t.epoch(), "tape_bars": tape_bars,
+                        "levels_before": levels_before, "levels_after": scan.0.borrow().sizes().1,
+                    }),
+                    None,
+                );
+                self.write_snapshots(t, ts);
+            }
+        }
+    }
+
+    /// `snap.levels` and `snap.dev` from the scanner, then the script's
+    /// optional `on_trace_snapshot(ts)` for its own `snap.script` records.
+    fn write_snapshots(&self, t: &TraceSink, ts: i64) {
+        let prev = t.phase();
+        t.set_phase(Phase::Snap);
+        if let Some(scan) = &self.scan {
+            scan.0.borrow().trace_snapshot(t);
+        }
+        if self.has_on_trace_snapshot {
+            if let Err(e) = self.call("on_trace_snapshot", (ts,)) {
+                self.fail("on_trace_snapshot", e);
+            }
+        }
+        t.set_phase(prev);
     }
 
     /// One bar through the native scanner and the script's event hooks.
     /// Returns what `emit` (or `on_bar`, for scripts without `emit`) produced.
     fn drive_scanner(&self, candle: &Candle, scan: &ScanHandle) -> Dynamic {
         let ev: BarEvents = scan.0.borrow_mut().process(candle);
+        if let (Some(t), Some(d)) = (&self.trace, &ev.day_closed) {
+            if t.on() {
+                t.record(
+                    "cx.day",
+                    "card",
+                    "CX.day",
+                    None,
+                    None,
+                    json!({"day_ms": d.day_ms, "open": d.open, "high": d.high, "low": d.low, "close": d.close}),
+                    None,
+                );
+            }
+        }
         if let (Some(day), true) = (ev.day_closed, self.has_on_day) {
             if let Err(e) = self.call("on_day", (candle.clone(), day_map(&day))) {
                 self.fail("on_day", e);
@@ -1068,6 +1183,11 @@ impl RhaiStrategy {
                 || s.wake.contains(&candle.timeframe)
                 || s.wake.contains(&u16::MAX)
         };
+        if let Some(t) = &self.trace {
+            if t.on() {
+                self.trace_bar_events(t, candle, &ev, awake);
+            }
+        }
         let mut cands: Array = Array::new();
         if awake && self.has_on_bar {
             let sweeps: Array = ev.sweeps.iter().map(|s| Dynamic::from_map(sweep_map(s))).collect();
@@ -1091,6 +1211,9 @@ impl RhaiStrategy {
         }
         scan.0.borrow_mut().rebuild_draw(candle, &ev);
         let mut out: Array = Array::new();
+        if let Some(t) = &self.trace {
+            t.set_phase(Phase::Emit);
+        }
         for cand in cands {
             if cand.is::<ScriptOpp>() || !self.has_emit {
                 out.push(cand);
@@ -1105,11 +1228,124 @@ impl RhaiStrategy {
                 Err(e) => self.fail("emit", e),
             }
         }
+        if let Some(t) = &self.trace {
+            t.set_phase(Phase::Bar);
+        }
         scan.0.borrow_mut().after_hooks(candle, ev.atr);
         // Last in the bar: the rebuild never alters the bar it fires on.
         self.maybe_rebuild(scan, candle);
         Dynamic::from_array(out)
     }
+
+    /// `st.break` for every structure break on this bar, and a `hook` record
+    /// when `on_bar` is about to run: always on event bars, and on wake-only
+    /// bars under `full` detail.
+    fn trace_bar_events(&self, t: &TraceSink, candle: &Candle, ev: &BarEvents, awake: bool) {
+        for b in &ev.breaks {
+            t.record(
+                "st.break",
+                "x_break",
+                "",
+                None,
+                None,
+                json!({"tf": t.tf_name(b.tf), "ts": b.ts, "level": b.level, "dir": dir_str(b.dir).as_str()}),
+                None,
+            );
+        }
+        let events = !ev.sweeps.is_empty() || !ev.breaks.is_empty();
+        if awake && self.has_on_bar && (events || t.full()) {
+            let sweeps: Vec<i64> = ev.sweeps.iter().map(|s| s.level_id).collect();
+            t.record(
+                "hook",
+                "bar",
+                "",
+                None,
+                None,
+                json!({
+                    "o": candle.open, "h": candle.high, "l": candle.low, "c": candle.close,
+                    "atr": ev.atr, "sweeps": sweeps, "breaks": ev.breaks.len(), "wake": !events,
+                }),
+                None,
+            );
+        }
+    }
+
+    /// `adm.result`: what `admit` decided, including the engine's own
+    /// invalid-geometry override of a script `take`.
+    fn trace_admit(&self, t: &TraceSink, opp: &Opportunity, d: &Decision, engine_override: bool) {
+        let (node, o, reason, entry, stop, tp) = match d {
+            Decision::Take(tp) => ("take", "take", JsonValue::Null, Some(tp.entry), Some(tp.stop), Some(tp.tp)),
+            Decision::Skip(r) => (
+                "x_admit_result",
+                "skip",
+                json!(r.as_str()),
+                opp.entry,
+                opp.stop,
+                opp.target,
+            ),
+        };
+        t.record(
+            "adm.result",
+            node,
+            &format!("O{}", opp.id),
+            None,
+            Some(o),
+            json!({
+                "decision": o, "reason": reason, "entry": entry, "stop": stop, "tp": tp,
+                "engine_override": if engine_override { json!("invalid_geometry") } else { JsonValue::Null },
+            }),
+            None,
+        );
+    }
+}
+
+/// The body of the script's `trace(kind, node, run, values)` call: lift
+/// `o`, `p` and `cmp` out of `values` into the envelope, format a sweep-map
+/// run id, and write the record.
+fn script_trace(t: &TraceSink, kind: &str, node: &str, run: &Dynamic, mut values: Map) {
+    let o = values.remove("o").map(|d| dyn_to_string(&d));
+    let p = values.remove("p").map(|d| run_id(t, &d));
+    let cmp = values.remove("cmp").map(|d| dyn_to_json(&d));
+    let v = dyn_to_json(&Dynamic::from_map(values));
+    let run = run_id(t, run);
+    t.record(kind, node, &run, p.as_deref(), o.as_deref(), v, cmp);
+}
+
+fn dyn_to_json(d: &Dynamic) -> JsonValue {
+    match serde_json::to_value(d) {
+        Ok(v) => v,
+        Err(e) => json!({ "_error": e.to_string() }),
+    }
+}
+
+fn dyn_to_string(d: &Dynamic) -> String {
+    match d.clone().into_immutable_string() {
+        Ok(s) => s.to_string(),
+        Err(_) => d.to_string(),
+    }
+}
+
+/// A run id from a script value: a string as given, `()` as "", a sweep map
+/// (anything with `level_id` and `start_ts`) as `S{epoch}.{level_id}.{tf}.{start_ts}`
+/// with the map's `tf` when it has one and the current candle's otherwise.
+fn run_id(t: &TraceSink, d: &Dynamic) -> String {
+    if d.is_unit() {
+        return String::new();
+    }
+    if let Some(m) = d.read_lock::<Map>() {
+        let lid = m.get("level_id").and_then(|x| x.as_int().ok());
+        let start = m.get("start_ts").and_then(|x| x.as_int().ok());
+        if let (Some(lid), Some(start)) = (lid, start) {
+            let tf = m
+                .get("tf")
+                .and_then(|x| x.clone().into_immutable_string().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| t.tf_name(t.tf()));
+            return t.sweep_run(lid, &tf, start);
+        }
+        return String::new();
+    }
+    dyn_to_string(d)
 }
 
 impl Strategy for RhaiStrategy {
@@ -1120,6 +1356,13 @@ impl Strategy for RhaiStrategy {
         let ts = ndt_secs(candle.timestamp);
         if ts > self.now.get() {
             self.now.set(ts);
+        }
+        if let Some(t) = &self.trace {
+            t.set_bar(candle);
+            if candle.timeframe == crate::models::base_tf_id() && t.on() && t.snapshot_due() {
+                t.mark_snapshot();
+                self.write_snapshots(t, ts);
+            }
         }
         {
             let mut h = self.hist.borrow_mut();
@@ -1150,8 +1393,28 @@ impl Strategy for RhaiStrategy {
     }
 
     fn admit(&self, opp: &Opportunity, ctx: &AdmitContext<'_>) -> Decision {
+        let Some(t) = &self.trace else {
+            return self.admit_decide(opp, ctx).0;
+        };
+        t.set_phase(Phase::Admit);
+        let (d, engine_override) = self.admit_decide(opp, ctx);
+        if t.on() {
+            self.trace_admit(t, opp, &d, engine_override);
+        }
+        d
+    }
+
+    fn on_bar_close(&mut self, candle: &Candle, book: &mut Book<'_>) {
+        self.bar_close(candle, book)
+    }
+}
+
+impl RhaiStrategy {
+    /// The admission decision, and whether the engine overrode a script
+    /// `take` as invalid geometry.
+    fn admit_decide(&self, opp: &Opportunity, ctx: &AdmitContext<'_>) -> (Decision, bool) {
         if !self.has_admit {
-            return crate::strategy::default_admit(opp, ctx);
+            return (crate::strategy::default_admit(opp, ctx), false);
         }
         let meta = self.meta.borrow_mut().remove(&opp.id).unwrap_or_default();
         let so = ScriptOpp {
@@ -1183,13 +1446,16 @@ impl Strategy for RhaiStrategy {
                 .into_immutable_string()
                 .map(|s| s.to_string())
                 .unwrap_or_else(|_| "skip".to_string());
-            return Decision::Skip(match reason.as_str() {
-                "below_min_score" => SkipReason::BelowMinScore,
-                "no_entry_stop" => SkipReason::NoEntryStop,
-                "non_positive_risk" => SkipReason::NonPositiveRisk,
-                "invalid_geometry" => SkipReason::InvalidGeometry,
-                _ => SkipReason::Custom(reason),
-            });
+            return (
+                Decision::Skip(match reason.as_str() {
+                    "below_min_score" => SkipReason::BelowMinScore,
+                    "no_entry_stop" => SkipReason::NoEntryStop,
+                    "non_positive_risk" => SkipReason::NonPositiveRisk,
+                    "invalid_geometry" => SkipReason::InvalidGeometry,
+                    _ => SkipReason::Custom(reason),
+                }),
+                false,
+            );
         }
         let take = (|| -> Result<TakeParams, Box<EvalAltResult>> {
             Ok(TakeParams {
@@ -1201,16 +1467,16 @@ impl Strategy for RhaiStrategy {
         match take {
             Ok(t) => {
                 if !t.is_valid(opp.direction) {
-                    Decision::Skip(SkipReason::InvalidGeometry)
+                    (Decision::Skip(SkipReason::InvalidGeometry), true)
                 } else {
-                    Decision::Take(t)
+                    (Decision::Take(t), false)
                 }
             }
             Err(e) => self.fail("admit", e),
         }
     }
 
-    fn on_bar_close(&mut self, candle: &Candle, book: &mut Book<'_>) {
+    fn bar_close(&mut self, candle: &Candle, book: &mut Book<'_>) {
         if !self.has_bar_close {
             return;
         }
@@ -1238,6 +1504,9 @@ impl Strategy for RhaiStrategy {
         let sb = ScriptBook {
             ptr: self.book_ptr.clone(),
         };
+        if let Some(t) = &self.trace {
+            t.set_phase(Phase::Close);
+        }
         let r = self.call("on_bar_close", (candle.clone(), sb));
         self.book_ptr.set(std::ptr::null_mut());
         if let Err(e) = r {

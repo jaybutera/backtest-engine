@@ -33,6 +33,14 @@
 //! moves, closes. A consumer that mirrors the book onto a real venue acts
 //! on these; a journal writes them out. With it off (the batch default)
 //! nothing is recorded and nothing is returned.
+//!
+//! # Traces
+//!
+//! [`Session::attach_trace`] gives an asset a decision-trace sink. The
+//! session then turns on that asset's event recording, drains the events
+//! after every candle and writes each as a `book.<kind>` record. The return
+//! contract does not change: events still come back to the caller only when
+//! the session was created with `record_events`.
 
 use std::collections::HashMap;
 
@@ -42,6 +50,7 @@ use crate::paper::PaperTrader;
 use crate::pipeline::Pipeline;
 use crate::strategy::{MarketData, Strategy};
 use crate::timeframe::TimeframeBuilder;
+use crate::trace::{Phase, TraceHandle};
 
 /// One streaming run: per-asset pipelines around a shared market view.
 pub struct Session {
@@ -54,6 +63,8 @@ pub struct Session {
     record_events: bool,
     /// Assets in registration order, for deterministic iteration.
     assets: Vec<(u16, String)>,
+    /// Decision-trace sinks by asset id. Empty for an untraced run.
+    traces: HashMap<u16, TraceHandle>,
 }
 
 impl Session {
@@ -68,6 +79,7 @@ impl Session {
             append_market,
             record_events,
             assets: Vec::new(),
+            traces: HashMap::new(),
         }
     }
 
@@ -129,14 +141,47 @@ impl Session {
         }
     }
 
-    fn process(&mut self, candle: &Candle) -> Vec<BookEvent> {
-        self.pipeline.process_candle(candle);
-        if !self.record_events {
-            return Vec::new();
+    /// Attach a decision-trace sink to a registered asset. Turns on that
+    /// asset's book-event recording (which changes nothing about how the
+    /// book behaves) so its transitions can be written as `book.*` records.
+    pub fn attach_trace(&mut self, asset: &str, handle: TraceHandle) {
+        let aid = models::asset_id(asset);
+        if let Some(pt) = self.pipeline.traders.get_mut(&aid) {
+            pt.record_events = true;
         }
-        match self.pipeline.traders.get_mut(&candle.asset) {
+        self.traces.insert(aid, handle);
+    }
+
+    fn process(&mut self, candle: &Candle) -> Vec<BookEvent> {
+        let trace = if self.traces.is_empty() {
+            None
+        } else {
+            self.traces.get(&candle.asset).cloned()
+        };
+        let Some(t) = trace else {
+            self.pipeline.process_candle(candle);
+            if !self.record_events {
+                return Vec::new();
+            }
+            return match self.pipeline.traders.get_mut(&candle.asset) {
+                Some(pt) => pt.take_events(),
+                None => Vec::new(),
+            };
+        };
+        t.set_bar(candle);
+        self.pipeline.process_candle(candle);
+        let events = match self.pipeline.traders.get_mut(&candle.asset) {
             Some(pt) => pt.take_events(),
             None => Vec::new(),
+        };
+        // The strategy saw HTF composites after this base bar; the book
+        // records belong to the base bar itself.
+        t.set_bar(candle);
+        write_book_events(&t, &events);
+        if self.record_events {
+            events
+        } else {
+            Vec::new()
         }
     }
 
@@ -163,10 +208,45 @@ impl Session {
     /// session never calls this).
     pub fn finish(mut self) -> Vec<(String, PaperTrader)> {
         let assets = std::mem::take(&mut self.assets);
+        let traces = std::mem::take(&mut self.traces);
         assets
             .into_iter()
-            .filter_map(|(aid, name)| self.pipeline.finish(aid).map(|pt| (name, pt)))
+            .filter_map(|(aid, name)| {
+                let mut pt = self.pipeline.finish(aid)?;
+                // Positions closed by the end of the run are book events
+                // too; a traced asset writes them before handing back.
+                if let Some(t) = traces.get(&aid) {
+                    let events = pt.take_events();
+                    write_book_events(t, &events);
+                }
+                Some((name, pt))
+            })
             .collect()
+    }
+}
+
+/// Write drained book events as `book.<kind>` records, run `O<opportunity
+/// id>`, node `take` for a placement, `exit` for a close, `x_book` otherwise.
+fn write_book_events(t: &TraceHandle, events: &[BookEvent]) {
+    if events.is_empty() || !t.on() {
+        return;
+    }
+    t.set_phase(Phase::Book);
+    for ev in events {
+        let node = match ev {
+            BookEvent::EntryPlaced { .. } => "take",
+            BookEvent::Closed { .. } => "exit",
+            _ => "x_book",
+        };
+        t.record(
+            &format!("book.{}", ev.kind()),
+            node,
+            &format!("O{}", ev.opportunity_id()),
+            None,
+            None,
+            ev.to_json(),
+            None,
+        );
     }
 }
 

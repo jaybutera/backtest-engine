@@ -34,6 +34,7 @@ use crate::models::{self, Candle};
 use crate::paper::{self, PaperTrader, TickStore};
 use crate::session::{self, Session};
 use crate::strategy::{BuildContext, MarketData, SharedSeries, Strategy, StrategyFactory};
+use crate::trace::{self, AssetStats, TraceConfig, TraceHandle, TraceSink};
 use crate::{data, fees, params, strategy_config};
 
 use chrono::NaiveDateTime;
@@ -142,6 +143,31 @@ pub struct ReplayArgs {
     /// real data (diff the two runs' sidecars).
     #[arg(long)]
     pub streaming: bool,
+
+    /// Write a decision trace (one JSONL file per asset plus manifest.json)
+    /// into this directory. Tracing only reads: the trades and the JSON
+    /// report are byte-identical with and without it.
+    #[arg(long)]
+    pub trace: Option<String>,
+
+    /// First traced day, `YYYY-MM-DD`. Default: `--from`. Never earlier than
+    /// `--from`: warmup bars are not traced.
+    #[arg(long = "trace-from")]
+    pub trace_from: Option<String>,
+
+    /// Last traced day, `YYYY-MM-DD` (inclusive). Default: `--to`.
+    #[arg(long = "trace-to")]
+    pub trace_to: Option<String>,
+
+    /// `basic`, or `full` to add per-bar level refreshes, gap records and a
+    /// record for every wake-only hook call.
+    #[arg(long = "trace-detail", default_value = "basic")]
+    pub trace_detail: String,
+
+    /// Byte budget per asset trace file, in MiB. Past it the trace stops and
+    /// the manifest records where (`truncated_at`).
+    #[arg(long = "trace-max-mb", default_value = "512")]
+    pub trace_max_mb: u64,
 }
 
 /// Parse the process command line and run it against these factories.
@@ -245,6 +271,10 @@ pub struct ResolvedReplay<'f> {
     pub min_score: f64,
     pub rr: f64,
     pub max_hold: usize,
+    /// The decision-trace configuration, when `--trace` was given.
+    pub trace: Option<TraceConfig>,
+    /// Run facts the trace manifest records.
+    pub trace_run: trace::ManifestRun,
 }
 
 impl ResolvedReplay<'_> {
@@ -258,8 +288,14 @@ impl ResolvedReplay<'_> {
         pt
     }
 
-    /// Build one per-asset strategy instance from the run's factory.
-    pub fn build_strategy(&self, asset: &str, market: &MarketData) -> Box<dyn Strategy> {
+    /// Build one per-asset strategy instance from the run's factory, with
+    /// this asset's trace sink when the run is traced.
+    pub fn build_strategy(
+        &self,
+        asset: &str,
+        market: &MarketData,
+        trace: Option<TraceHandle>,
+    ) -> Box<dyn Strategy> {
         self.factory.build(&BuildContext {
             asset,
             params: &self.params,
@@ -268,8 +304,55 @@ impl ResolvedReplay<'_> {
             strategy_file: self.strategy_file.as_deref(),
             market,
             script: &self.script_table,
+            trace,
         })
     }
+
+    /// Open this asset's trace sink, when the run is traced.
+    pub fn open_trace(&self, asset: &str) -> Option<TraceHandle> {
+        self.trace.as_ref().map(|c| TraceSink::open(c, asset))
+    }
+}
+
+/// Resolve the `--trace*` flags against the report window. The trace window
+/// defaults to the report window and is clamped inside it, so warmup bars
+/// are never traced.
+fn resolve_trace(
+    args: &ReplayArgs,
+    window_start: Option<NaiveDateTime>,
+    window_end: Option<NaiveDateTime>,
+) -> Result<Option<TraceConfig>, String> {
+    let Some(dir) = args.trace.as_ref() else {
+        if args.trace_from.is_some() || args.trace_to.is_some() {
+            return Err("--trace-from / --trace-to need --trace <dir>".to_string());
+        }
+        return Ok(None);
+    };
+    let detail = trace::Detail::parse(&args.trace_detail)?;
+    let secs = |t: NaiveDateTime| t.and_utc().timestamp();
+    let parse = |s: &str, what: &str| {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+            .map_err(|e| format!("--{what} must be YYYY-MM-DD: {e}"))
+    };
+    let mut from = window_start.map(secs).unwrap_or(i64::MIN);
+    if let Some(s) = args.trace_from.as_deref() {
+        from = from.max(secs(parse(s, "trace-from")?));
+    }
+    let mut to = window_end.map(secs).unwrap_or(i64::MAX);
+    if let Some(s) = args.trace_to.as_deref() {
+        to = to.min(secs(parse(s, "trace-to")? + chrono::Duration::days(1)));
+    }
+    if from >= to {
+        return Err("the trace window is empty (check --trace-from / --trace-to against --from / --to)".to_string());
+    }
+    Ok(Some(TraceConfig {
+        dir: PathBuf::from(dir),
+        from,
+        to,
+        detail,
+        max_bytes: args.trace_max_mb.saturating_mul(1 << 20),
+    }))
 }
 
 /// Resolve a replay command line into a [`ResolvedReplay`]: pick the
@@ -392,6 +475,14 @@ pub fn resolve<'f>(
         .map(|s| parse_date(s, "to") + chrono::Duration::days(1));
     // Warmup extends the LOAD bound backwards without moving the REPORT bound.
     let load_start = window_start.map(|s| s - chrono::Duration::days(args.warmup_days as i64));
+    let trace = resolve_trace(&args, window_start, window_end)?;
+    let trace_run = trace::ManifestRun {
+        strategy_file: args.config_strategy.as_ref().map(PathBuf::from),
+        fill_file: args.config_fill.as_ref().map(PathBuf::from),
+        run_from: args.from.clone(),
+        run_to: args.to.clone(),
+        warmup_days: args.warmup_days,
+    };
 
     // Higher timeframes: the factory's declared needs, plus any the CLI adds.
     let mut timeframes = factory.timeframes();
@@ -422,6 +513,8 @@ pub fn resolve<'f>(
         load_start,
         timeframes,
         roll_adjust: args.roll_adjust,
+        trace,
+        trace_run,
     })
 }
 
@@ -508,7 +601,7 @@ fn run_replay(args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
     // per-asset strategy is built on its own thread from that borrow. Each
     // thread runs a single-asset Session — the identical loop body a
     // streaming driver runs over a live feed.
-    let traders: Vec<PaperTrader> = if streaming {
+    let finished: Vec<(PaperTrader, Option<(String, AssetStats)>)> = if streaming {
         run_streaming(run, asset_series, &mut asset_ticks, exec_book)
     } else {
         std::thread::scope(|scope| {
@@ -528,10 +621,14 @@ fn run_replay(args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
                             pt.exec_tick.insert(models::asset_id(&asset_str), tick);
                         }
                     }
-                    let strategy = run.build_strategy(&asset_str, market);
+                    let th = run.open_trace(&asset_str);
+                    let strategy = run.build_strategy(&asset_str, market, th.clone());
 
                     let mut session = Session::new(market.clone(), false, false);
                     session.add_asset(&asset_str, strategy, &run.timeframes, pt);
+                    if let Some(h) = &th {
+                        session.attach_trace(&asset_str, h.clone());
+                    }
 
                     let guard = series.read();
                     for candle in guard.iter() {
@@ -548,7 +645,8 @@ fn run_replay(args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
                         "  {asset_str} done: {} candles, {} trades",
                         n_candles, pt.opportunities_taken
                     );
-                    pt
+                    let stats = th.map(|h| (asset_str.clone(), h.finish()));
+                    (pt, stats)
                 })
             })
             .collect();
@@ -558,6 +656,13 @@ fn run_replay(args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
                 .collect()
         })
     };
+
+    let mut trace_stats: Vec<(String, AssetStats)> = Vec::new();
+    let mut traders: Vec<PaperTrader> = Vec::with_capacity(finished.len());
+    for (pt, st) in finished {
+        traders.push(pt);
+        trace_stats.extend(st);
+    }
 
     // ── Merge ──────────────────────────────────────────────────────────────
     let merged = session::merge_traders(run.build_trader(), traders, run.window_start);
@@ -595,13 +700,34 @@ fn run_replay(args: ReplayArgs, factories: &[&dyn StrategyFactory]) {
         None
     };
 
+    let mut sidecar_written = false;
     if let (Some(path), Some(ref body)) = (json_sidecar.as_ref(), json.as_ref()) {
         if let Some(parent) = Path::new(path).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         match std::fs::write(path, body) {
-            Ok(_) => eprintln!("Wrote JSON report: {path}"),
+            Ok(_) => {
+                sidecar_written = true;
+                eprintln!("Wrote JSON report: {path}");
+            }
             Err(e) => eprintln!("warning: could not write {path}: {e}"),
+        }
+    }
+
+    // The trace manifest comes after the sidecar: it carries the sha256 of
+    // the report body exactly as written, which is how a viewer tells a
+    // trace that belongs to the report it shows from a stale one.
+    if let Some(tc) = &run.trace {
+        let sidecar = match (json_sidecar.as_deref(), json.as_deref()) {
+            (Some(p), Some(body)) if sidecar_written => Some((p, body)),
+            _ => None,
+        };
+        match trace::write_manifest(tc, &run.trace_run, &trace_stats, sidecar) {
+            Ok(p) => {
+                let recs: u64 = trace_stats.iter().map(|(_, s)| s.records).sum();
+                eprintln!("Wrote trace: {} ({recs} records)", p.display());
+            }
+            Err(e) => eprintln!("warning: could not write the trace manifest: {e}"),
         }
     }
 
@@ -622,13 +748,14 @@ fn run_streaming(
     asset_series: Vec<(String, SharedSeries)>,
     asset_ticks: &mut HashMap<String, Vec<models::Tick>>,
     exec_book: &HashMap<String, paper::ExecSeries>,
-) -> Vec<PaperTrader> {
+) -> Vec<(PaperTrader, Option<(String, AssetStats)>)> {
     let mut market = MarketData::new();
     for (a, _) in &asset_series {
         market.insert(a, SharedSeries::default());
     }
     let mut session = Session::new(market.clone(), true, false);
     let mut feed: Vec<Candle> = Vec::new();
+    let mut sinks: HashMap<String, TraceHandle> = HashMap::new();
     for (asset_str, series) in &asset_series {
         let ticks = asset_ticks.remove(asset_str).unwrap_or_default();
         let mut pt = run.build_trader();
@@ -641,8 +768,13 @@ fn run_streaming(
                 pt.exec_tick.insert(models::asset_id(asset_str), tick);
             }
         }
-        let strategy = run.build_strategy(asset_str, &market);
+        let th = run.open_trace(asset_str);
+        let strategy = run.build_strategy(asset_str, &market, th.clone());
         session.add_asset(asset_str, strategy, &run.timeframes, pt);
+        if let Some(h) = th {
+            session.attach_trace(asset_str, h.clone());
+            sinks.insert(asset_str.clone(), h);
+        }
         feed.extend(series.read().iter().cloned());
     }
     // Concatenated in asset order, then stably sorted by time: candles of
@@ -655,7 +787,8 @@ fn run_streaming(
         .into_iter()
         .map(|(asset, pt)| {
             eprintln!("  {asset} done (streaming): {} trades", pt.opportunities_taken);
-            pt
+            let stats = sinks.remove(&asset).map(|h| (asset.clone(), h.finish()));
+            (pt, stats)
         })
         .collect()
 }
