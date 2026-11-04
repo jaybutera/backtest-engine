@@ -27,6 +27,8 @@ use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
 use crate::models::{tf_id, Candle, Direction};
+use crate::trace::{cmp_row, TraceHandle, TraceSink};
+use serde_json::{json, Value};
 
 /// Numbers as a script writes them: an integer where a float is expected
 /// (or the reverse) is accepted, since Rhai literals and TOML values do
@@ -709,6 +711,12 @@ pub struct Scanner {
     pub wake: HashSet<u16>,
     /// Whether the strategy wants the book hook on bars with nothing closed.
     pub wake_book: bool,
+    /// Decision-trace sink, when the run is traced. Read-only: nothing in
+    /// the scanner branches on it except to decide whether to write.
+    trace: Option<TraceHandle>,
+    /// Set while a level is being added through the script API, so its
+    /// `lv.birth` record names the script as the source.
+    adding_from_script: bool,
 }
 
 fn dir_of_side(side: Side) -> Direction {
@@ -856,6 +864,8 @@ impl Scanner {
             last_atr: 0.0,
             wake: HashSet::new(),
             wake_book: false,
+            trace: None,
+            adding_from_script: false,
             cfg,
         }
     }
@@ -924,13 +934,35 @@ impl Scanner {
                     && (l.price - price).abs() <= tol
                 {
                     let (src, ltf, new_touch) = (l.source, l.tf, l.touch + touch);
+                    let (touch_before, sig_before) = (l.touch, l.sig);
                     let sig = self.significance(src, ltf, new_touch);
                     let l = &mut self.levels[i];
                     l.touch = new_touch;
                     l.sig = sig;
                     l.decay = 0.0;
                     l.last_touch = ts;
-                    return l.id;
+                    let (id, kept) = (l.id, l.price);
+                    if let Some(t) = &self.trace {
+                        if t.on() {
+                            let dist = (kept - price).abs();
+                            t.record(
+                                "lv.merge",
+                                "merge",
+                                &t.level_run(id),
+                                None,
+                                Some("yes"),
+                                json!({
+                                    "lid": id, "price": kept, "in_price": price,
+                                    "in_source": self.source_name(source),
+                                    "in_tf": t.tf_name(tf), "dist": dist, "tol": tol,
+                                    "touch_before": touch_before, "touch": new_touch,
+                                    "sig_before": sig_before, "sig": sig,
+                                }),
+                                Some(json!([cmp_row("|level - incoming|", dist, "<=", "atr * cluster_atr_tolerance", tol, true)])),
+                            );
+                        }
+                    }
+                    return id;
                 }
             }
         }
@@ -951,7 +983,50 @@ impl Scanner {
             sig,
             developing: 0,
         });
+        if let Some(t) = &self.trace {
+            if t.on() {
+                let tol = if atr > 0.0 {
+                    json!(atr * self.cfg.levels.cluster_atr_tolerance)
+                } else {
+                    Value::Null
+                };
+                t.record(
+                    "lv.birth",
+                    self.birth_node(source),
+                    &t.level_run(id),
+                    None,
+                    Some("new"),
+                    json!({
+                        "lid": id, "price": price, "side": side.as_str(),
+                        "source": self.source_name(source), "ltf": t.tf_name(tf), "lts": ts,
+                        "touch": touch, "sig": sig, "atr": atr,
+                        "merge_checked": atr > 0.0, "tol": tol,
+                    }),
+                    None,
+                );
+            }
+        }
         id
+    }
+
+    /// The diagram node a level's birth belongs to, by where it came from.
+    fn birth_node(&self, source: u16) -> &'static str {
+        if self.adding_from_script {
+            "x_script_level"
+        } else if [self.src_pdh, self.src_pdl, self.src_pwh, self.src_pwl, self.src_pmh, self.src_pml]
+            .contains(&source)
+        {
+            "period"
+        } else if source == self.src_session_high
+            || source == self.src_session_low
+            || self.open_mark_src.contains(&source)
+        {
+            "sess"
+        } else if [self.src_swing_high, self.src_swing_low, self.src_eqh, self.src_eql].contains(&source) {
+            "swing"
+        } else {
+            "x_script_level"
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -966,7 +1041,10 @@ impl Scanner {
         atr: f64,
     ) -> i64 {
         let s = self.source_id(source);
-        self.add_level(price, side, s, tf, ts, touch, atr)
+        self.adding_from_script = true;
+        let id = self.add_level(price, side, s, tf, ts, touch, atr);
+        self.adding_from_script = false;
+        id
     }
 
     fn level_index(&self, id: i64) -> Option<usize> {
@@ -1072,23 +1150,41 @@ impl Scanner {
             return;
         }
         let dist = atr * thr;
+        let tr = self.trace.as_ref().filter(|t| t.full());
         for l in self.levels.iter_mut() {
             if l.status != Status::Active {
                 continue;
             }
-            match l.side {
+            let gap = match l.side {
                 Side::Bsl => {
                     if high < l.price && (l.price - high) <= dist {
                         l.decay = 0.0;
                         l.last_touch = now;
+                        l.price - high
+                    } else {
+                        continue;
                     }
                 }
                 Side::Ssl => {
                     if low > l.price && (low - l.price) <= dist {
                         l.decay = 0.0;
                         l.last_touch = now;
+                        low - l.price
+                    } else {
+                        continue;
                     }
                 }
+            };
+            if let Some(t) = tr {
+                t.record(
+                    "lv.refresh",
+                    "decay",
+                    &t.level_run(l.id),
+                    None,
+                    Some("yes"),
+                    json!({"lid": l.id, "dist": gap, "thr": dist}),
+                    Some(json!([cmp_row("distance to level", gap, "<=", "refresh_atr * ATR", dist, true)])),
+                );
             }
         }
     }
@@ -1108,12 +1204,40 @@ impl Scanner {
             l.decay += (1.0 / divisor) as f32;
             if l.decay >= max {
                 l.status = Status::Expired;
+                if let Some(t) = &self.trace {
+                    if t.on() {
+                        t.record(
+                            "lv.expire",
+                            "expq",
+                            &t.level_run(l.id),
+                            None,
+                            Some("yes"),
+                            json!({"lid": l.id, "decay": l.decay as f64, "decay_candles": max as f64, "divisor": divisor}),
+                            Some(json!([cmp_row("decay", l.decay as f64, ">=", "decay_candles", max as f64, true)])),
+                        );
+                    }
+                }
             }
         }
     }
 
     fn prune_levels(&mut self) {
+        let before = self.levels.len();
         self.levels.retain(|l| l.status == Status::Active);
+        if let Some(t) = &self.trace {
+            let kept = self.levels.len();
+            if kept < before && t.on() {
+                t.record(
+                    "lv.prune",
+                    "expired",
+                    "",
+                    None,
+                    None,
+                    json!({"removed": before - kept, "kept": kept}),
+                    None,
+                );
+            }
+        }
     }
 
     // ── Sweeps ──────────────────────────────────────────────────────────────
@@ -1170,6 +1294,11 @@ impl Scanner {
                     self.levels[idx].developing -= 1;
                     let sw = self.finalize_sweep(&dev, idx, atr);
                     self.mark_swept(idx);
+                    if let Some(t) = &self.trace {
+                        if t.on() {
+                            self.trace_sweep_end(t, &dev, &sw, c, "back_in", max_multi, atr, min_cross);
+                        }
+                    }
                     sweeps.push(sw);
                 }
                 continue;
@@ -1183,8 +1312,38 @@ impl Scanner {
                     dir: dir_of_side(side),
                 });
                 self.levels[idx].developing += 1;
+                if let Some(t) = &self.trace {
+                    if t.on() {
+                        let line = match side {
+                            Side::Bsl => lprice + min_cross,
+                            Side::Ssl => lprice - min_cross,
+                        };
+                        let (bar, op) = match side {
+                            Side::Bsl => ("bar high", ">"),
+                            Side::Ssl => ("bar low", "<"),
+                        };
+                        let tfn = t.tf_name(c.timeframe);
+                        t.record(
+                            "sw.cross",
+                            "crossq",
+                            &t.sweep_run(lid, &tfn, ts),
+                            Some(&t.level_run(lid)),
+                            Some("yes"),
+                            json!({
+                                "lid": lid, "side": side.as_str(), "level": lprice,
+                                "extreme": extreme, "atr": atr,
+                                "noise_atr": self.cfg.sweep.noise_atr, "min_cross": min_cross,
+                                "line": line, "sig": sig, "min_sig": min_sig,
+                            }),
+                            Some(json!([
+                                cmp_row(bar, extreme, op, "level +/- noise_atr * ATR", line, true),
+                                cmp_row("level sig", sig, ">=", "min_level_sig", min_sig, true),
+                            ])),
+                        );
+                    }
+                }
             }
-            let done = {
+            let (done, extended) = {
                 let d = self.developing.get_mut(&key).unwrap();
                 d.count += 1;
                 let more = match side {
@@ -1195,17 +1354,103 @@ impl Scanner {
                     d.extreme_price = extreme;
                     d.extreme_ts = ts;
                 }
-                d.count >= max_multi
+                (d.count >= max_multi, more)
             };
+            if let Some(t) = &self.trace {
+                if t.on() {
+                    let d = &self.developing[&key];
+                    let tfn = t.tf_name(c.timeframe);
+                    let run = t.sweep_run(lid, &tfn, d.start_ts);
+                    t.record(
+                        "sw.dev",
+                        "dev",
+                        &run,
+                        None,
+                        None,
+                        json!({"count": d.count, "extreme": d.extreme_price, "extreme_ts": d.extreme_ts, "extended": extended}),
+                        None,
+                    );
+                    if !done {
+                        t.record(
+                            "sw.done",
+                            "doneq",
+                            &run,
+                            None,
+                            Some("next_bar"),
+                            json!({"count": d.count, "max_multi": max_multi, "how": Value::Null}),
+                            Some(json!([cmp_row("bars beyond", d.count as f64, ">=", "max_multi_candle", max_multi as f64, false)])),
+                        );
+                    }
+                }
+            }
             if done {
                 let dev = self.developing.remove(&key).unwrap();
                 self.levels[idx].developing -= 1;
                 let sw = self.finalize_sweep(&dev, idx, atr);
                 self.mark_swept(idx);
+                if let Some(t) = &self.trace {
+                    if t.on() {
+                        self.trace_sweep_end(t, &dev, &sw, c, "held", max_multi, atr, min_cross);
+                    }
+                }
                 sweeps.push(sw);
             }
         }
         sweeps
+    }
+
+    /// `sw.done` and `sw.final` for a crossing that just finalized, `how`
+    /// being "held" (stayed beyond for max_multi_candle bars) or "back_in"
+    /// (a bar came back inside the noise band).
+    #[allow(clippy::too_many_arguments)]
+    fn trace_sweep_end(
+        &self,
+        t: &TraceSink,
+        dev: &Developing,
+        sw: &Sweep,
+        c: &Candle,
+        how: &str,
+        max_multi: i64,
+        atr: f64,
+        min_cross: f64,
+    ) {
+        let tfn = t.tf_name(c.timeframe);
+        let run = t.sweep_run(sw.level_id, &tfn, dev.start_ts);
+        let cmp = if how == "held" {
+            cmp_row("bars beyond", dev.count as f64, ">=", "max_multi_candle", max_multi as f64, true)
+        } else {
+            let (bar, op, line, x) = match sw.level_side {
+                Side::Bsl => ("bar high", "<=", sw.level_price + min_cross, c.high),
+                Side::Ssl => ("bar low", ">=", sw.level_price - min_cross, c.low),
+            };
+            cmp_row(bar, x, op, "level +/- noise_atr * ATR", line, true)
+        };
+        t.record(
+            "sw.done",
+            "doneq",
+            &run,
+            None,
+            Some("yes"),
+            json!({"count": dev.count, "max_multi": max_multi, "how": how}),
+            Some(json!([cmp])),
+        );
+        t.record(
+            "sw.final",
+            "sweep",
+            &run,
+            Some(&t.level_run(sw.level_id)),
+            Some(how),
+            json!({
+                "level_id": sw.level_id, "level_price": sw.level_price,
+                "level_source": sw.level_source, "level_sig": sw.level_sig,
+                "level_side": sw.level_side.as_str(),
+                "dir": if sw.dir == Direction::Bull { "bull" } else { "bear" },
+                "start_ts": sw.start_ts, "extreme_ts": sw.extreme_ts,
+                "extreme_price": sw.extreme_price, "magnitude_atr": sw.magnitude_atr,
+                "level_formed_at": sw.level_formed_at, "atr": atr,
+            }),
+            None,
+        );
     }
 
     // ── Sessions ────────────────────────────────────────────────────────────
@@ -1689,7 +1934,30 @@ impl Scanner {
         let idx = self.fvg_push(f);
         self.fvg_active.push(idx);
         self.fvg_by_tf.entry(sig.tf).or_default().push(idx);
+        self.trace_fvg("fvg.new", idx, "new");
         self.fvg_cap_kind(false);
+    }
+
+    /// `fvg.new` / `fvg.status` for the gap at `idx` (`full` detail only).
+    fn trace_fvg(&self, kind: &str, idx: usize, why: &str) {
+        let Some(t) = &self.trace else { return };
+        if !t.full() {
+            return;
+        }
+        let f = &self.fvgs[idx];
+        t.record(
+            kind,
+            "x_fvg",
+            &format!("F{}.{}", t.epoch(), f.id),
+            None,
+            Some(why),
+            json!({
+                "id": f.id, "dir": if f.dir == Direction::Bull { "bull" } else { "bear" },
+                "tf": t.tf_name(f.tf), "ts": f.ts, "near": f.near, "far": f.far, "ce": f.ce,
+                "status": f.status.as_str(), "is_ifvg": f.is_inverted_kind, "c1_stop": f.c1_stop,
+            }),
+            None,
+        );
     }
 
     fn fvg_cap_kind(&mut self, inverted: bool) {
@@ -1712,6 +1980,7 @@ impl Scanner {
             if f.is_inverted_kind == inverted && f.status == FvgStatus::Unmitigated {
                 f.status = FvgStatus::Filled;
                 n_to_remove -= 1;
+                self.trace_fvg("fvg.status", idx, "cap");
             }
         }
         self.fvg_rebuild_active();
@@ -1749,6 +2018,7 @@ impl Scanner {
                 Direction::Bull => {
                     if body_low < far {
                         self.fvgs[idx].status = FvgStatus::Inverted;
+                        self.trace_fvg("fvg.status", idx, "inverted");
                         let id = self.fvgs.len() as i64;
                         let fi = self.fvg_push(Fvg {
                             id,
@@ -1762,22 +2032,26 @@ impl Scanner {
                             is_inverted_kind: true,
                             c1_stop: None,
                         });
+                        self.trace_fvg("fvg.new", fi, "new");
                         new_inverted.push(fi);
                         any_removed = true;
                         continue;
                     }
                     if status == FvgStatus::Mitigated && c.low <= far {
                         self.fvgs[idx].status = FvgStatus::Filled;
+                        self.trace_fvg("fvg.status", idx, "filled");
                         any_removed = true;
                         continue;
                     }
                     if status == FvgStatus::Unmitigated && c.low <= ce {
                         self.fvgs[idx].status = FvgStatus::Mitigated;
+                        self.trace_fvg("fvg.status", idx, "mitigated");
                     }
                 }
                 Direction::Bear => {
                     if body_high > far {
                         self.fvgs[idx].status = FvgStatus::Inverted;
+                        self.trace_fvg("fvg.status", idx, "inverted");
                         let id = self.fvgs.len() as i64;
                         let fi = self.fvg_push(Fvg {
                             id,
@@ -1791,17 +2065,20 @@ impl Scanner {
                             is_inverted_kind: true,
                             c1_stop: None,
                         });
+                        self.trace_fvg("fvg.new", fi, "new");
                         new_inverted.push(fi);
                         any_removed = true;
                         continue;
                     }
                     if status == FvgStatus::Mitigated && c.high >= far {
                         self.fvgs[idx].status = FvgStatus::Filled;
+                        self.trace_fvg("fvg.status", idx, "filled");
                         any_removed = true;
                         continue;
                     }
                     if status == FvgStatus::Unmitigated && c.high >= ce {
                         self.fvgs[idx].status = FvgStatus::Mitigated;
+                        self.trace_fvg("fvg.status", idx, "mitigated");
                     }
                 }
             }
@@ -2262,6 +2539,33 @@ impl Scanner {
         let cutoff = ts - window;
         self.recent_sweeps.retain(|s| s.start_ts >= cutoff);
         self.build_draw(c.close, ev.atr, ts);
+        if let (Some(t), Some(dm)) = (&self.trace, &self.draw_map) {
+            if t.on() {
+                let targets: Vec<Value> = dm
+                    .targets
+                    .iter()
+                    .map(|x| {
+                        json!([
+                            x.level_id,
+                            x.price,
+                            if x.dir == Direction::Bull { "bull" } else { "bear" },
+                            x.distance_atr,
+                            x.significance,
+                            x.draw_score
+                        ])
+                    })
+                    .collect();
+                t.record(
+                    "cx.draw",
+                    "draw",
+                    "CX.draw",
+                    None,
+                    None,
+                    json!({"price": dm.price, "atr": dm.atr, "targets": targets}),
+                    None,
+                );
+            }
+        }
     }
 
     /// The registry maintenance that follows the strategy's hooks: retest
@@ -2309,6 +2613,11 @@ impl Scanner {
     /// state, so they are carried across rather than re-derived — a fresh
     /// scanner starts with them empty, which would silently mute every
     /// `on_bar(wake)` hook the script had registered.
+    ///
+    /// The trace sink is carried across the same way, after the replay: the
+    /// replay into the fresh scanner runs with no sink, so a rebuild writes no
+    /// records for history it re-derives. The sink's epoch advances, because
+    /// the fresh scanner's level ids restart from zero.
     pub fn rebuild_from(&mut self, tape: &[Candle]) {
         let mut fresh = Scanner::new(self.cfg.clone());
         for c in tape {
@@ -2318,7 +2627,66 @@ impl Scanner {
         }
         fresh.wake = std::mem::take(&mut self.wake);
         fresh.wake_book = self.wake_book;
+        fresh.trace = self.trace.take();
+        if let Some(t) = &fresh.trace {
+            t.bump_epoch();
+        }
         *self = fresh;
+    }
+
+    /// Attach (or detach) a decision-trace sink.
+    pub fn set_trace(&mut self, trace: Option<TraceHandle>) {
+        self.trace = trace;
+    }
+
+    /// The attached trace sink, if any.
+    pub fn trace(&self) -> Option<&TraceHandle> {
+        self.trace.as_ref()
+    }
+
+    /// Write `snap.levels` (every active level) and `snap.dev` (every open
+    /// developing crossing on an active level) to `sink`, rows in the field
+    /// order of [`crate::trace::SNAP_LEVEL_FIELDS`] and
+    /// [`crate::trace::SNAP_DEV_FIELDS`].
+    pub fn trace_snapshot(&self, sink: &TraceSink) {
+        if !sink.on() {
+            return;
+        }
+        let epoch = sink.epoch();
+        let levels: Vec<Value> = self
+            .levels
+            .iter()
+            .filter(|l| l.status == Status::Active)
+            .map(|l| {
+                json!([
+                    l.id,
+                    l.price,
+                    l.side.as_str(),
+                    self.source_name(l.source),
+                    sink.tf_name(l.tf),
+                    l.ts,
+                    l.touch,
+                    l.sig,
+                    l.decay as f64,
+                    l.last_touch,
+                    l.developing
+                ])
+            })
+            .collect();
+        sink.record("snap.levels", "", "", None, None, json!({"epoch": epoch, "levels": levels}), None);
+        let mut devs: Vec<(&(i64, u16), &Developing)> = self
+            .developing
+            .iter()
+            .filter(|((lid, _), _)| self.level(*lid).is_some_and(|l| l.status == Status::Active))
+            .collect();
+        devs.sort_by_key(|((lid, tf), d)| (*lid, *tf, d.start_ts));
+        let dev: Vec<Value> = devs
+            .into_iter()
+            .map(|((lid, tf), d)| {
+                json!([*lid, sink.tf_name(*tf), d.start_ts, d.extreme_price, d.extreme_ts, d.count])
+            })
+            .collect();
+        sink.record("snap.dev", "", "", None, None, json!({"epoch": epoch, "dev": dev}), None);
     }
 
     pub fn candle_count(&self) -> i64 {

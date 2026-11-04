@@ -98,6 +98,7 @@ pub mod session;
 pub mod strategy;
 pub mod strategy_config;
 pub mod timeframe;
+pub mod trace;
 
 pub use models::{Candle, Direction, Opportunity, PaperTrade, Tick, TradeResult};
 pub use paper::PaperTrader;

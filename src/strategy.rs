@@ -517,6 +517,10 @@ pub struct BuildContext<'a> {
     /// The strategy file's free-form `[script]` table, unvalidated. Empty
     /// when there is none.
     pub script: &'a toml::value::Table,
+    /// This asset's decision-trace sink when the run was started with
+    /// `--trace`. A factory that ignores it builds an untraced strategy; the
+    /// Rhai factory hands it to the script host and the native scanner.
+    pub trace: Option<crate::trace::TraceHandle>,
 }
 
 /// Builds [`Strategy`] instances, and declares what they need from config.
