@@ -150,11 +150,6 @@ pub struct ReplayArgs {
     #[arg(long)]
     pub trace: Option<String>,
 
-    /// First traced day, `YYYY-MM-DD`. Default: `--from`. Never earlier than
-    /// `--from`: warmup bars are not traced.
-    #[arg(long = "trace-from")]
-    pub trace_from: Option<String>,
-
     /// Last traced day, `YYYY-MM-DD` (inclusive). Default: `--to`.
     #[arg(long = "trace-to")]
     pub trace_to: Option<String>,
@@ -314,17 +309,18 @@ impl ResolvedReplay<'_> {
     }
 }
 
-/// Resolve the `--trace*` flags against the report window. The trace window
-/// defaults to the report window and is clamped inside it, so warmup bars
-/// are never traced.
+/// Resolve the `--trace*` flags. The trace window opens at the first bar the
+/// engine loads (`load_start`, warmup included), so every bar that built the
+/// engine's state is in the trace; there is no later start. `--trace-to`
+/// may end it early.
 fn resolve_trace(
     args: &ReplayArgs,
-    window_start: Option<NaiveDateTime>,
+    load_start: Option<NaiveDateTime>,
     window_end: Option<NaiveDateTime>,
 ) -> Result<Option<TraceConfig>, String> {
     let Some(dir) = args.trace.as_ref() else {
-        if args.trace_from.is_some() || args.trace_to.is_some() {
-            return Err("--trace-from / --trace-to need --trace <dir>".to_string());
+        if args.trace_to.is_some() {
+            return Err("--trace-to needs --trace <dir>".to_string());
         }
         return Ok(None);
     };
@@ -335,16 +331,13 @@ fn resolve_trace(
             .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
             .map_err(|e| format!("--{what} must be YYYY-MM-DD: {e}"))
     };
-    let mut from = window_start.map(secs).unwrap_or(i64::MIN);
-    if let Some(s) = args.trace_from.as_deref() {
-        from = from.max(secs(parse(s, "trace-from")?));
-    }
+    let from = load_start.map(secs).unwrap_or(i64::MIN);
     let mut to = window_end.map(secs).unwrap_or(i64::MAX);
     if let Some(s) = args.trace_to.as_deref() {
         to = to.min(secs(parse(s, "trace-to")? + chrono::Duration::days(1)));
     }
     if from >= to {
-        return Err("the trace window is empty (check --trace-from / --trace-to against --from / --to)".to_string());
+        return Err("the trace window is empty (check --trace-to against --from / --warmup-days)".to_string());
     }
     Ok(Some(TraceConfig {
         dir: PathBuf::from(dir),
@@ -475,7 +468,7 @@ pub fn resolve<'f>(
         .map(|s| parse_date(s, "to") + chrono::Duration::days(1));
     // Warmup extends the LOAD bound backwards without moving the REPORT bound.
     let load_start = window_start.map(|s| s - chrono::Duration::days(args.warmup_days as i64));
-    let trace = resolve_trace(&args, window_start, window_end)?;
+    let trace = resolve_trace(&args, load_start, window_end)?;
     let trace_run = trace::ManifestRun {
         strategy_file: args.config_strategy.as_ref().map(PathBuf::from),
         fill_file: args.config_fill.as_ref().map(PathBuf::from),

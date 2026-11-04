@@ -490,12 +490,11 @@ for a replay viewer or a decision debugger:
     backtest replay --strategy config/strategy/example_sweep.toml -a ES \
       --timeframe 5m --timeframe 15m --from 2026-08-03 --to 2026-08-14 --warmup-days 5 \
       --json-sidecar data/backtest_trades.json \
-      --trace data/backtest_trades.trace --trace-from 2026-08-10 --trace-to 2026-08-12
+      --trace data/backtest_trades.trace --trace-to 2026-08-12
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--trace <dir>` | off | Directory for the per-asset files and `manifest.json`. |
-| `--trace-from <YYYY-MM-DD>` | `--from` | First traced day. Clamped to `--from`: warmup bars are never traced. |
+| `--trace <dir>` | off | Directory for the per-asset files and `manifest.json`. The trace starts at the first bar the engine loads, warmup included, so every bar behind the engine's state is in it. |
 | `--trace-to <YYYY-MM-DD>` | `--to` | Last traced day, inclusive. |
 | `--trace-detail basic\|full` | `basic` | `full` adds `lv.refresh`, `fvg.*` and a `hook` record for every wake-only call. |
 | `--trace-max-mb <N>` | `512` | Byte budget per asset file. Past it the file stops and the manifest records `truncated_at`. |
@@ -591,8 +590,8 @@ Two host functions are always registered, traced or not:
     trace(kind: string, node: string, run, values: map)
 
 `tracing()` is true before the first bar (in `init`) and on bars inside the
-trace window, and false without `--trace`, during warmup and after the
-window. `cfg.trace` in `init` is true when the run is traced. `trace()`
+trace window (warmup bars included), and false without `--trace` and after
+the window. `cfg.trace` in `init` is true when the run is traced. `trace()`
 returns at once outside the window. `run` is a string, `()` for none, or a
 sweep map, which the host formats as `S{epoch}.{level_id}.{tf}.{start_ts}`
 with the current candle's timeframe (a missing `level_id` or `start_ts` reads

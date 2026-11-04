@@ -563,7 +563,7 @@ mod tests {
         assert!(s.script_tracing(), "before the first bar tracing() reads true");
         s.set_bar(&candle(1, "1m"));
         assert!(!s.on());
-        assert!(!s.script_tracing(), "warmup bars read false");
+        assert!(!s.script_tracing(), "bars before the window read false");
         s.record("early", "", "", None, None, json!({}), None);
         s.set_bar(&candle(2, "1m"));
         assert!(s.on());
