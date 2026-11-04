@@ -452,7 +452,7 @@ pub struct ManifestRun {
 /// Field order of each row of `snap.levels` `v.levels`.
 pub const SNAP_LEVEL_FIELDS: &[&str] = &[
     "lid", "price", "side", "source", "ltf", "lts", "touch", "sig", "decay", "last_touch",
-    "developing",
+    "developing", "list", "born", "swept_on",
 ];
 /// Field order of each row of `snap.dev` `v.dev`.
 pub const SNAP_DEV_FIELDS: &[&str] = &["lid", "tf", "start_ts", "extreme", "extreme_ts", "count"];

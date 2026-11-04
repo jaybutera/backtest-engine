@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
-use crate::models::{tf_id, Candle, Direction};
+use crate::models::{tf_id, tf_name, Candle, Direction};
 use crate::trace::{cmp_row, TraceHandle, TraceSink};
 use serde_json::{json, Value};
 
@@ -200,13 +200,15 @@ pub struct LevelsCfg {
     /// it resets the level's decay. 0 disables.
     #[serde(default, deserialize_with = "lenient::f64")]
     pub refresh_atr: f64,
-    /// Decay ticks once every this many candles (all timeframes counted).
+    /// Decay ticks once every this many base bars.
     #[serde(default = "d_10", deserialize_with = "lenient::i64")]
     pub decay_every: i64,
-    /// Non-active levels are dropped every this many candles.
+    /// Non-active levels are dropped every this many base bars.
     #[serde(default = "d_50", deserialize_with = "lenient::i64")]
     pub prune_every: i64,
-    /// Minutes per timeframe name, the decay divisor (default 1).
+    /// Minutes per timeframe name (default 1). A level of timeframe X gains
+    /// `tf_minutes[base] / tf_minutes[X]` decay per tick, so `decay_candles`
+    /// reads as base bars for a base-timeframe level whatever the base is.
     #[serde(default, deserialize_with = "lenient::map_f64")]
     pub tf_minutes: HashMap<String, f64>,
 }
@@ -455,11 +457,51 @@ impl Side {
     }
 }
 
+/// The registry list a level lives in.
+///
+/// A level is born into the list of the candle timeframe that produced it
+/// (a 15m swing into the 15m list, a previous-day high into 1D). Session-clock
+/// levels (session extremes, open marks) belong to no candle timeframe and
+/// share one session list. A bar on timeframe T reads its own list, every
+/// list of a longer timeframe, and the session list; it never reads a list of
+/// a shorter timeframe. See [`Scanner`] for the dedup and sweep rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LevelList {
+    Tf(u16),
+    Session,
+}
+
+impl LevelList {
+    pub fn name(self) -> String {
+        match self {
+            LevelList::Tf(tf) => tf_name(tf).to_string(),
+            LevelList::Session => "session".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Status {
+pub enum Status {
+    /// In its list and readable by every view that has not swept it.
     Active,
-    Swept,
+    /// Swept in every view that reads it; dropped at the next prune.
+    Spent,
+    /// Decayed out; dropped at the next prune.
     Expired,
+    /// Taken over by a longer-timeframe level within tolerance; dropped at
+    /// the next prune.
+    Absorbed,
+}
+
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Active => "active",
+            Status::Spent => "spent",
+            Status::Expired => "expired",
+            Status::Absorbed => "absorbed",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -468,21 +510,68 @@ pub struct Level {
     pub price: f64,
     pub side: Side,
     source: u16,
+    /// The timeframe the level's significance and decay are read for: the
+    /// producing bar's timeframe (the base timeframe for session levels).
     pub tf: u16,
+    pub list: LevelList,
+    /// When the level formed (a swing's pivot bar, a period's boundary).
     pub ts: i64,
+    /// When the level became known: the close of the bar whose processing
+    /// produced it, or the boundary instant for session and period levels,
+    /// whose price is final the moment the boundary passes. A bar that opened
+    /// before this cannot sweep the level.
+    pub born: i64,
     pub touch: i64,
-    status: Status,
+    pub status: Status,
     decay: f32,
     pub last_touch: i64,
     pub sig: f64,
     /// Developing sweeps (across timeframes) on this level.
     developing: i64,
+    /// Timeframes whose view has swept this level. Each timeframe sweeps a
+    /// level once; the others keep reading it.
+    swept_on: Vec<u16>,
 }
 
-/// A finalized liquidity sweep.
+impl Level {
+    /// Whether `tf`'s view has already swept this level.
+    pub fn swept_on(&self, tf: u16) -> bool {
+        self.swept_on.contains(&tf)
+    }
+
+    /// The timeframes that have swept this level, in the order they did.
+    pub fn swept_tfs(&self) -> &[u16] {
+        &self.swept_on
+    }
+
+    /// Active, and not yet swept by `tf`'s view. Whether `tf` reads the
+    /// level's list at all is the caller's question.
+    fn live_for(&self, tf: u16) -> bool {
+        self.status == Status::Active && !self.swept_on.contains(&tf)
+    }
+}
+
+/// One list of the registry, ids ascending (ids come from one counter and a
+/// list only appends and prunes).
+#[derive(Clone)]
+struct ListStore {
+    list: LevelList,
+    /// Length of the list's timeframe in seconds; `i64::MAX` for the session
+    /// list, which every view reads.
+    span: i64,
+    levels: Vec<Level>,
+}
+
+/// A finalized liquidity sweep: one timeframe's view of one level. The same
+/// level can be swept once per timeframe that reads it, and each is its own
+/// event; `tf` says which bar timeframe produced this one.
 #[derive(Clone, Debug)]
 pub struct Sweep {
+    /// The timeframe of the bars that crossed and finalized the sweep.
+    pub tf: u16,
     pub level_id: i64,
+    pub level_tf: u16,
+    pub level_list: LevelList,
     pub level_price: f64,
     pub level_source: String,
     pub level_sig: f64,
@@ -652,6 +741,44 @@ struct EqState {
 // ─── The scanner ────────────────────────────────────────────────────────────
 
 /// All services, stepped once per candle. See the module docs.
+///
+/// # The level registry
+///
+/// Levels live in one list per candle timeframe plus one session list
+/// ([`LevelList`]). The rules, for a bar on timeframe T:
+///
+/// - **Reads.** T's view is T's own list, every list of a longer timeframe,
+///   and the session list. A 15m bar never sees a 1m level; a 1m bar sees
+///   every list. Session levels sit in their own list rather than being
+///   copied into every timeframe's: one level, one id, one touch and decay
+///   state, with nothing to keep in step.
+/// - **Birth guard.** A bar sweeps (and refreshes) only levels born at or
+///   before its open. Same-timeframe levels satisfy this by construction; it
+///   is what stops an HTF bar from sweeping a longer-or-equal level, or a
+///   session level, with price action printed before the level existed.
+/// - **Sweeps are per view.** Each timeframe's view sweeps a level at most
+///   once ([`Level::swept_on`]). A 1m sweep of a 15m level is a 1m event and
+///   leaves the level live for 5m, 15m and anything else that reads it; a
+///   15m bar that later crosses it produces a separate 15m sweep. A level is
+///   spent, and leaves its list at the next prune, once every timeframe that
+///   reads it and has delivered a bar so far has swept it. For a 1m level
+///   that is the first 1m sweep, as before.
+/// - **Merging within a list** is the cluster merge: a new level of one side
+///   within `atr * cluster_atr_tolerance` of an active level in the same list
+///   adds its touches to that level.
+/// - **Dedup across lists flows downwards only.** A new level within
+///   tolerance of an active, longer-timeframe (or session) level that its own
+///   timeframe has not swept is not created: its view already reads that
+///   level, so the call returns the longer level's id and changes nothing
+///   about it. A new longer-timeframe (or session) level takes over the
+///   shorter lists' active levels within tolerance the same way: they are
+///   marked absorbed and their open crossings dropped. Tolerance is always
+///   the shorter timeframe's ATR times `cluster_atr_tolerance`; with no ATR
+///   on that timeframe yet there is no dedup. A longer list is never changed
+///   by a shorter timeframe's level.
+/// - **Clock.** Decay, prune and the draw map's cadence count base bars, so
+///   they run on wall time whatever set of timeframes is fed. A level of
+///   timeframe X ages by `tf_minutes[base] / tf_minutes[X]` per tick.
 #[derive(Clone)]
 pub struct Scanner {
     cfg: ScannerCfg,
@@ -682,9 +809,18 @@ pub struct Scanner {
     atr_cache: FxHashMap<u16, f64>,
     candle_count: i64,
 
-    levels: Vec<Level>,
+    /// The registry: one store per list, ascending by span (session last).
+    lists: Vec<ListStore>,
     next_level_id: i64,
     developing: FxHashMap<(i64, u16), Developing>,
+    /// Timeframes that have delivered a bar, as (span, tf), ascending.
+    seen_tfs: Vec<(i64, u16)>,
+    spans: FxHashMap<u16, i64>,
+    /// Base candles processed: the clock for decay, pruning and draw cadence.
+    base_count: i64,
+    /// Close time of the bar being processed: the birth stamp of the levels
+    /// it produces (and of levels a script adds from its hooks).
+    bar_close: i64,
 
     signals: VecDeque<Signal>,
     swing_seen: HashSet<(u8, u16, i64)>,
@@ -745,6 +881,25 @@ fn atr_of(b: &VecDeque<Candle>, period: i64) -> f64 {
 
 fn secs(c: &Candle) -> i64 {
     c.timestamp.and_utc().timestamp()
+}
+
+/// A timeframe's length in seconds, from its name: `<n><unit>` with unit `m`,
+/// `h`, `D`, `W` or `M` (a month counted as 30 days, which only has to order
+/// it above a week). A name that does not parse counts as one minute, the
+/// same fallback the engine's timeframe table uses.
+pub fn tf_span_secs(tf: u16) -> i64 {
+    let name = tf_name(tf);
+    let split = name.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(name.len());
+    let n: i64 = name[..split].parse().unwrap_or(1).max(1);
+    let unit = match &name[split..] {
+        "m" => 60,
+        "h" => 3_600,
+        "D" | "d" => 86_400,
+        "W" | "w" => 604_800,
+        "M" => 2_592_000,
+        _ => return 60,
+    };
+    n * unit
 }
 
 impl Scanner {
@@ -837,9 +992,13 @@ impl Scanner {
             ring_cap,
             atr_cache: FxHashMap::default(),
             candle_count: 0,
-            levels: Vec::new(),
+            lists: Vec::new(),
             next_level_id: 0,
             developing: FxHashMap::default(),
+            seen_tfs: Vec::new(),
+            spans: FxHashMap::default(),
+            base_count: 0,
+            bar_close: i64::MIN,
             signals: VecDeque::new(),
             swing_seen: HashSet::new(),
             fvg_seen: HashSet::new(),
@@ -912,8 +1071,62 @@ impl Scanner {
 
     // ── Registry ────────────────────────────────────────────────────────────
 
-    /// Add a level, merging into an active same-side level within the
-    /// cluster tolerance when `atr > 0`. Returns the level's id.
+    /// A timeframe's span in seconds, memoized.
+    fn span_of(&self, tf: u16) -> i64 {
+        self.spans.get(&tf).copied().unwrap_or_else(|| tf_span_secs(tf))
+    }
+
+    fn list_span(&self, list: LevelList) -> i64 {
+        match list {
+            LevelList::Tf(tf) => self.span_of(tf),
+            LevelList::Session => i64::MAX,
+        }
+    }
+
+    /// The list a new level belongs to: the session list for session-clock
+    /// sources, otherwise its timeframe's.
+    fn list_for(&self, source: u16, tf: u16) -> LevelList {
+        if source == self.src_session_high
+            || source == self.src_session_low
+            || self.open_mark_src.contains(&source)
+        {
+            LevelList::Session
+        } else {
+            LevelList::Tf(tf)
+        }
+    }
+
+    /// The store index of `list`, created in span order when missing.
+    fn store_index(&mut self, list: LevelList) -> usize {
+        if let Some(i) = self.lists.iter().position(|s| s.list == list) {
+            return i;
+        }
+        let span = self.list_span(list);
+        let at = self
+            .lists
+            .iter()
+            .position(|s| s.span > span)
+            .unwrap_or(self.lists.len());
+        self.lists.insert(
+            at,
+            ListStore {
+                list,
+                span,
+                levels: Vec::new(),
+            },
+        );
+        at
+    }
+
+    /// Whether a bar of span `view_span` reads store `si`.
+    fn reads(&self, view_span: i64, si: usize) -> bool {
+        self.lists[si].span >= view_span
+    }
+
+    /// Add a level to its list, born at the close of the bar being processed.
+    /// See [`Scanner`] for the merge and cross-list dedup rules; returns the
+    /// id the caller should hold (an existing level's, when it merged or was
+    /// read through to a longer-timeframe level).
     #[allow(clippy::too_many_arguments)]
     pub fn add_level(
         &mut self,
@@ -925,63 +1138,74 @@ impl Scanner {
         touch: i64,
         atr: f64,
     ) -> i64 {
+        let born = self.bar_close;
+        self.add_level_born(price, side, source, tf, ts, born, touch, atr)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_level_born(
+        &mut self,
+        price: f64,
+        side: Side,
+        source: u16,
+        tf: u16,
+        ts: i64,
+        born: i64,
+        touch: i64,
+        atr: f64,
+    ) -> i64 {
+        let list = self.list_for(source, tf);
+        let si = self.store_index(list);
+        let span = self.lists[si].span;
         if atr > 0.0 {
             let tol = atr * self.cfg.levels.cluster_atr_tolerance;
-            for i in 0..self.levels.len() {
-                let l = &self.levels[i];
-                if l.status == Status::Active
-                    && l.side == side
-                    && (l.price - price).abs() <= tol
-                {
-                    let (src, ltf, new_touch) = (l.source, l.tf, l.touch + touch);
-                    let (touch_before, sig_before) = (l.touch, l.sig);
-                    let sig = self.significance(src, ltf, new_touch);
-                    let l = &mut self.levels[i];
-                    l.touch = new_touch;
-                    l.sig = sig;
-                    l.decay = 0.0;
-                    l.last_touch = ts;
-                    let (id, kept) = (l.id, l.price);
-                    if let Some(t) = &self.trace {
-                        if t.on() {
-                            let dist = (kept - price).abs();
-                            t.record(
-                                "lv.merge",
-                                "merge",
-                                &t.level_run(id),
-                                None,
-                                Some("yes"),
-                                json!({
-                                    "lid": id, "price": kept, "in_price": price,
-                                    "in_source": self.source_name(source),
-                                    "in_tf": t.tf_name(tf), "dist": dist, "tol": tol,
-                                    "touch_before": touch_before, "touch": new_touch,
-                                    "sig_before": sig_before, "sig": sig,
-                                }),
-                                Some(json!([cmp_row("|level - incoming|", dist, "<=", "atr * cluster_atr_tolerance", tol, true)])),
-                            );
-                        }
+            // Same list: the cluster merge.
+            let hit = self.lists[si]
+                .levels
+                .iter()
+                .position(|l| l.status == Status::Active && l.side == side && (l.price - price).abs() <= tol);
+            if let Some(i) = hit {
+                return self.merge_into(si, i, price, source, tf, touch, ts, tol);
+            }
+            // Longer lists, longest first (session first of all): this
+            // timeframe's view already reads a level there, so the new one is
+            // the same liquidity under the longer level's identity.
+            if list != LevelList::Session {
+                for oi in (0..self.lists.len()).rev() {
+                    if self.lists[oi].span <= span {
+                        continue;
                     }
-                    return id;
+                    let hit = self.lists[oi]
+                        .levels
+                        .iter()
+                        .find(|l| l.live_for(tf) && l.side == side && (l.price - price).abs() <= tol);
+                    if let Some(l) = hit {
+                        let id = l.id;
+                        self.trace_read_through(l, price, source, tf, list, tol);
+                        return id;
+                    }
                 }
             }
         }
         let id = self.next_level_id;
         self.next_level_id += 1;
         let sig = self.significance(source, tf, touch);
-        self.levels.push(Level {
+        self.lists[si].levels.push(Level {
             id,
             price,
             side,
             source,
             tf,
+            list,
             ts,
+            born,
             touch,
             status: Status::Active,
             decay: 0.0,
             last_touch: ts,
             sig,
             developing: 0,
+            swept_on: Vec::new(),
         });
         if let Some(t) = &self.trace {
             if t.on() {
@@ -1001,12 +1225,144 @@ impl Scanner {
                         "source": self.source_name(source), "ltf": t.tf_name(tf), "lts": ts,
                         "touch": touch, "sig": sig, "atr": atr,
                         "merge_checked": atr > 0.0, "tol": tol,
+                        "list": list.name(), "born": born,
                     }),
                     None,
                 );
             }
         }
+        self.absorb_shorter(si, id, price, side);
         id
+    }
+
+    /// The same-list cluster merge of an incoming level into `lists[si].levels[i]`.
+    #[allow(clippy::too_many_arguments)]
+    fn merge_into(
+        &mut self,
+        si: usize,
+        i: usize,
+        price: f64,
+        source: u16,
+        tf: u16,
+        touch: i64,
+        ts: i64,
+        tol: f64,
+    ) -> i64 {
+        let l = &self.lists[si].levels[i];
+        let (src, ltf, new_touch) = (l.source, l.tf, l.touch + touch);
+        let (touch_before, sig_before) = (l.touch, l.sig);
+        let sig = self.significance(src, ltf, new_touch);
+        let list = self.lists[si].list;
+        let l = &mut self.lists[si].levels[i];
+        l.touch = new_touch;
+        l.sig = sig;
+        l.decay = 0.0;
+        l.last_touch = ts;
+        let (id, kept) = (l.id, l.price);
+        if let Some(t) = &self.trace {
+            if t.on() {
+                let dist = (kept - price).abs();
+                t.record(
+                    "lv.merge",
+                    "merge",
+                    &t.level_run(id),
+                    None,
+                    Some("yes"),
+                    json!({
+                        "lid": id, "price": kept, "in_price": price,
+                        "in_source": self.source_name(source),
+                        "in_tf": t.tf_name(tf), "dist": dist, "tol": tol,
+                        "touch_before": touch_before, "touch": new_touch,
+                        "sig_before": sig_before, "sig": sig,
+                        "list": list.name(), "in_list": list.name(), "cross_list": false,
+                    }),
+                    Some(json!([cmp_row("|level - incoming|", dist, "<=", "atr * cluster_atr_tolerance", tol, true)])),
+                );
+            }
+        }
+        id
+    }
+
+    /// `lv.merge` for an incoming level that a longer list already covers.
+    /// Nothing about the longer level changes, so its touch and significance
+    /// are reported as they stand.
+    fn trace_read_through(&self, l: &Level, price: f64, source: u16, tf: u16, in_list: LevelList, tol: f64) {
+        let Some(t) = &self.trace else { return };
+        if !t.on() {
+            return;
+        }
+        let dist = (l.price - price).abs();
+        t.record(
+            "lv.merge",
+            "merge",
+            &t.level_run(l.id),
+            None,
+            Some("yes"),
+            json!({
+                "lid": l.id, "price": l.price, "in_price": price,
+                "in_source": self.source_name(source),
+                "in_tf": t.tf_name(tf), "dist": dist, "tol": tol,
+                "touch_before": l.touch, "touch": l.touch,
+                "sig_before": l.sig, "sig": l.sig,
+                "list": l.list.name(), "in_list": in_list.name(), "cross_list": true,
+            }),
+            Some(json!([cmp_row("|level - incoming|", dist, "<=", "atr * cluster_atr_tolerance", tol, true)])),
+        );
+    }
+
+    /// A new level in store `si` takes over the active levels of every
+    /// shorter list within that list's tolerance on the same side.
+    fn absorb_shorter(&mut self, si: usize, id: i64, price: f64, side: Side) {
+        let span = self.lists[si].span;
+        let factor = self.cfg.levels.cluster_atr_tolerance;
+        let mut dropped: Vec<i64> = Vec::new();
+        for oi in 0..self.lists.len() {
+            if self.lists[oi].span >= span {
+                continue;
+            }
+            let LevelList::Tf(otf) = self.lists[oi].list else { continue };
+            let tol = self.atr_cache.get(&otf).copied().unwrap_or(0.0) * factor;
+            if tol <= 0.0 {
+                continue;
+            }
+            for k in 0..self.lists[oi].levels.len() {
+                let l = &self.lists[oi].levels[k];
+                if l.status != Status::Active || l.side != side || (l.price - price).abs() > tol {
+                    continue;
+                }
+                if let Some(t) = &self.trace {
+                    if t.on() {
+                        let kept = &self.lists[si].levels.last().expect("just pushed");
+                        let dist = (l.price - price).abs();
+                        t.record(
+                            "lv.merge",
+                            "merge",
+                            &t.level_run(id),
+                            None,
+                            Some("yes"),
+                            json!({
+                                "lid": id, "price": price, "in_price": l.price, "in_lid": l.id,
+                                "in_source": self.source_name(l.source),
+                                "in_tf": t.tf_name(l.tf), "dist": dist, "tol": tol,
+                                "touch_before": kept.touch, "touch": kept.touch,
+                                "sig_before": kept.sig, "sig": kept.sig,
+                                "list": kept.list.name(), "in_list": l.list.name(), "cross_list": true,
+                            }),
+                            Some(json!([cmp_row("|level - incoming|", dist, "<=", "atr * cluster_atr_tolerance", tol, true)])),
+                        );
+                    }
+                }
+                let l = &mut self.lists[oi].levels[k];
+                l.status = Status::Absorbed;
+                if l.developing > 0 {
+                    dropped.push(l.id);
+                    l.developing = 0;
+                }
+            }
+        }
+        if !dropped.is_empty() {
+            self.developing.retain(|(lid, _), _| !dropped.contains(lid));
+        }
     }
 
     /// The diagram node a level's birth belongs to, by where it came from.
@@ -1029,6 +1385,9 @@ impl Scanner {
         }
     }
 
+    /// [`Scanner::add_level`] by source name, as a script adds a level: into
+    /// the list of `tf` (the session list for a session source), born at the
+    /// close of the bar being processed.
     #[allow(clippy::too_many_arguments)]
     pub fn add_level_named(
         &mut self,
@@ -1047,30 +1406,61 @@ impl Scanner {
         id
     }
 
-    fn level_index(&self, id: i64) -> Option<usize> {
-        // Ids are issued in index order and pruning keeps order, so a
-        // binary search on id finds the slot.
-        self.levels.binary_search_by_key(&id, |l| l.id).ok()
-    }
-
-    /// Every level held, in id order.
-    pub fn all_levels(&self) -> impl Iterator<Item = &Level> {
-        self.levels.iter()
-    }
-
-    pub fn level(&self, id: i64) -> Option<&Level> {
-        self.level_index(id).map(|i| &self.levels[i])
-    }
-
-    /// Active levels of one side beyond `price`, nearest first, at or above
-    /// `min_sig`.
-    pub fn levels_beyond(&self, side: Side, price: f64, min_sig: f64) -> Vec<&Level> {
-        let mut v: Vec<&Level> = self
-            .levels
+    /// (store, index) of a level by id. Each store is id-ascending, so a
+    /// binary search per store finds it.
+    fn level_pos(&self, id: i64) -> Option<(usize, usize)> {
+        self.lists
             .iter()
+            .enumerate()
+            .find_map(|(si, s)| s.levels.binary_search_by_key(&id, |l| l.id).ok().map(|i| (si, i)))
+    }
+
+    /// A level by id, from whichever list holds it, until it is pruned.
+    pub fn level(&self, id: i64) -> Option<&Level> {
+        self.level_pos(id).map(|(si, i)| &self.lists[si].levels[i])
+    }
+
+    /// Every level held, any status, in id order.
+    pub fn all_levels(&self) -> impl Iterator<Item = &Level> {
+        let mut v: Vec<&Level> = self.lists.iter().flat_map(|s| s.levels.iter()).collect();
+        v.sort_unstable_by_key(|l| l.id);
+        v.into_iter()
+    }
+
+    /// The base timeframe, whose view the draw map reads.
+    pub fn base_tf(&self) -> u16 {
+        self.base_tf
+    }
+
+    /// The levels `tf`'s view holds live: every list it reads, active and not
+    /// yet swept by `tf`, in id order.
+    pub fn view(&self, tf: u16) -> Vec<&Level> {
+        let span = self.span_of(tf);
+        let mut v: Vec<&Level> = (0..self.lists.len())
+            .filter(|&si| self.reads(span, si))
+            .flat_map(|si| self.lists[si].levels.iter())
+            .filter(|l| l.live_for(tf))
+            .collect();
+        v.sort_unstable_by_key(|l| l.id);
+        v
+    }
+
+    /// Whether level `id` is live in `tf`'s view.
+    pub fn is_live(&self, id: i64, tf: u16) -> bool {
+        match self.level_pos(id) {
+            Some((si, i)) => self.reads(self.span_of(tf), si) && self.lists[si].levels[i].live_for(tf),
+            None => false,
+        }
+    }
+
+    /// Live levels of `tf`'s view of one side beyond `price`, nearest first,
+    /// at or above `min_sig`.
+    pub fn levels_beyond(&self, tf: u16, side: Side, price: f64, min_sig: f64) -> Vec<&Level> {
+        let mut v: Vec<&Level> = self
+            .view(tf)
+            .into_iter()
             .filter(|l| {
-                l.status == Status::Active
-                    && l.side == side
+                l.side == side
                     && match side {
                         Side::Bsl => l.price > price,
                         Side::Ssl => l.price < price,
@@ -1085,11 +1475,12 @@ impl Scanner {
         v
     }
 
-    /// The nearest active level of one side beyond `price`, any significance.
-    pub fn nearest_beyond(&self, side: Side, price: f64) -> Option<&Level> {
+    /// The nearest live level of `tf`'s view of one side beyond `price`, any
+    /// significance.
+    pub fn nearest_beyond(&self, tf: u16, side: Side, price: f64) -> Option<&Level> {
         let mut best: Option<&Level> = None;
-        for l in &self.levels {
-            if l.status != Status::Active || l.side != side {
+        for l in self.view(tf) {
+            if l.side != side {
                 continue;
             }
             let ok = match side {
@@ -1113,10 +1504,12 @@ impl Scanner {
         best
     }
 
-    /// The nearest level in the trade direction at least `min_rr` risk
-    /// units away, at or above `min_sig` (0 = no floor).
+    /// The nearest level of `tf`'s view in the trade direction at least
+    /// `min_rr` risk units away, at or above `min_sig` (0 = no floor).
+    #[allow(clippy::too_many_arguments)]
     pub fn find_target(
         &self,
+        tf: u16,
         dir: Direction,
         entry: f64,
         stop: f64,
@@ -1131,7 +1524,7 @@ impl Scanner {
             Direction::Bull => Side::Bsl,
             Direction::Bear => Side::Ssl,
         };
-        for l in self.levels_beyond(side, entry, 0.0) {
+        for l in self.levels_beyond(tf, side, entry, 0.0) {
             if min_sig > 0.0 && l.sig < min_sig {
                 continue;
             }
@@ -1145,51 +1538,77 @@ impl Scanner {
         None
     }
 
-    fn mark_swept(&mut self, idx: usize) {
-        self.levels[idx].status = Status::Swept;
+    /// Record `tf`'s sweep of `lists[si].levels[idx]`; returns whether that
+    /// leaves the level spent (swept by every timeframe that reads it and has
+    /// delivered a bar).
+    fn mark_swept(&mut self, si: usize, idx: usize, tf: u16) -> bool {
+        let span = self.lists[si].span;
+        let l = &mut self.lists[si].levels[idx];
+        if !l.swept_on.contains(&tf) {
+            l.swept_on.push(tf);
+        }
+        let spent = self
+            .seen_tfs
+            .iter()
+            .filter(|(s, _)| *s <= span)
+            .all(|(_, t)| l.swept_on.contains(t));
+        if spent {
+            l.status = Status::Spent;
+        }
+        spent
     }
 
-    fn refresh_on_retest(&mut self, high: f64, low: f64, atr: f64, now: i64) {
+    /// A bar of `tf` closing within `atr * refresh_atr` of a level it reads,
+    /// without crossing it, resets the level's decay. Same reads and birth
+    /// guard as the sweep detector.
+    fn refresh_on_retest(&mut self, c: &Candle, atr: f64) {
         let thr = self.cfg.levels.refresh_atr;
         if atr <= 0.0 || thr <= 0.0 {
             return;
         }
+        let (tf, high, low, now) = (c.timeframe, c.high, c.low, secs(c));
+        let span = self.span_of(tf);
         let dist = atr * thr;
         let tr = self.trace.as_ref().filter(|t| t.full());
-        for l in self.levels.iter_mut() {
-            if l.status != Status::Active {
+        for store in self.lists.iter_mut() {
+            if store.span < span {
                 continue;
             }
-            let gap = match l.side {
-                Side::Bsl => {
-                    if high < l.price && (l.price - high) <= dist {
-                        l.decay = 0.0;
-                        l.last_touch = now;
-                        l.price - high
-                    } else {
-                        continue;
-                    }
+            for l in store.levels.iter_mut() {
+                if !l.live_for(tf) || l.born > now {
+                    continue;
                 }
-                Side::Ssl => {
-                    if low > l.price && (low - l.price) <= dist {
-                        l.decay = 0.0;
-                        l.last_touch = now;
-                        low - l.price
-                    } else {
-                        continue;
+                let gap = match l.side {
+                    Side::Bsl => {
+                        if high < l.price && (l.price - high) <= dist {
+                            l.decay = 0.0;
+                            l.last_touch = now;
+                            l.price - high
+                        } else {
+                            continue;
+                        }
                     }
+                    Side::Ssl => {
+                        if low > l.price && (low - l.price) <= dist {
+                            l.decay = 0.0;
+                            l.last_touch = now;
+                            low - l.price
+                        } else {
+                            continue;
+                        }
+                    }
+                };
+                if let Some(t) = tr {
+                    t.record(
+                        "lv.refresh",
+                        "decay",
+                        &t.level_run(l.id),
+                        None,
+                        Some("yes"),
+                        json!({"lid": l.id, "dist": gap, "thr": dist}),
+                        Some(json!([cmp_row("distance to level", gap, "<=", "refresh_atr * ATR", dist, true)])),
+                    );
                 }
-            };
-            if let Some(t) = tr {
-                t.record(
-                    "lv.refresh",
-                    "decay",
-                    &t.level_run(l.id),
-                    None,
-                    Some("yes"),
-                    json!({"lid": l.id, "dist": gap, "thr": dist}),
-                    Some(json!([cmp_row("distance to level", gap, "<=", "refresh_atr * ATR", dist, true)])),
-                );
             }
         }
     }
@@ -1198,28 +1617,31 @@ impl Scanner {
         let max = self.cfg.levels.decay_candles as f32;
         let mult = self.cfg.levels.sig_decay_mult;
         let min_sig = self.cfg.levels.sig_decay_min_sig;
-        for l in self.levels.iter_mut() {
-            if l.status != Status::Active {
-                continue;
-            }
-            let mut divisor = self.tf_minutes.get(&l.tf).copied().unwrap_or(1.0);
-            if mult > 1.0 && l.sig >= min_sig {
-                divisor *= mult;
-            }
-            l.decay += (1.0 / divisor) as f32;
-            if l.decay >= max {
-                l.status = Status::Expired;
-                if let Some(t) = &self.trace {
-                    if t.on() {
-                        t.record(
-                            "lv.expire",
-                            "expq",
-                            &t.level_run(l.id),
-                            None,
-                            Some("yes"),
-                            json!({"lid": l.id, "decay": l.decay as f64, "decay_candles": max as f64, "divisor": divisor}),
-                            Some(json!([cmp_row("decay", l.decay as f64, ">=", "decay_candles", max as f64, true)])),
-                        );
+        let base_min = self.tf_minutes.get(&self.base_tf).copied().unwrap_or(1.0);
+        for store in self.lists.iter_mut() {
+            for l in store.levels.iter_mut() {
+                if l.status != Status::Active {
+                    continue;
+                }
+                let mut divisor = self.tf_minutes.get(&l.tf).copied().unwrap_or(1.0) / base_min;
+                if mult > 1.0 && l.sig >= min_sig {
+                    divisor *= mult;
+                }
+                l.decay += (1.0 / divisor) as f32;
+                if l.decay >= max {
+                    l.status = Status::Expired;
+                    if let Some(t) = &self.trace {
+                        if t.on() {
+                            t.record(
+                                "lv.expire",
+                                "expq",
+                                &t.level_run(l.id),
+                                None,
+                                Some("yes"),
+                                json!({"lid": l.id, "decay": l.decay as f64, "decay_candles": max as f64, "divisor": divisor, "list": l.list.name()}),
+                                Some(json!([cmp_row("decay", l.decay as f64, ">=", "decay_candles", max as f64, true)])),
+                            );
+                        }
                     }
                 }
             }
@@ -1227,10 +1649,23 @@ impl Scanner {
     }
 
     fn prune_levels(&mut self) {
-        let before = self.levels.len();
-        self.levels.retain(|l| l.status == Status::Active);
+        let before: usize = self.lists.iter().map(|s| s.levels.len()).sum();
+        let mut gone: HashSet<i64> = HashSet::new();
+        for store in self.lists.iter_mut() {
+            store.levels.retain(|l| {
+                let keep = l.status == Status::Active;
+                if !keep && l.developing > 0 {
+                    gone.insert(l.id);
+                }
+                keep
+            });
+        }
+        // Crossings left open on a level that expired: nothing reads them.
+        if !gone.is_empty() {
+            self.developing.retain(|(lid, _), _| !gone.contains(lid));
+        }
         if let Some(t) = &self.trace {
-            let kept = self.levels.len();
+            let kept: usize = self.lists.iter().map(|s| s.levels.len()).sum();
             if kept < before && t.on() {
                 t.record(
                     "lv.prune",
@@ -1247,15 +1682,18 @@ impl Scanner {
 
     // ── Sweeps ──────────────────────────────────────────────────────────────
 
-    fn finalize_sweep(&self, dev: &Developing, idx: usize, atr: f64) -> Sweep {
-        let l = &self.levels[idx];
+    fn finalize_sweep(&self, dev: &Developing, si: usize, idx: usize, tf: u16, atr: f64) -> Sweep {
+        let l = &self.lists[si].levels[idx];
         let magnitude = if atr > 0.0 {
             (dev.extreme_price - l.price).abs() / atr
         } else {
             0.0
         };
         Sweep {
+            tf,
             level_id: l.id,
+            level_tf: l.tf,
+            level_list: l.list,
             level_price: l.price,
             level_source: self.sources.infos[l.source as usize].name.clone(),
             level_sig: l.sig,
@@ -1269,144 +1707,159 @@ impl Scanner {
         }
     }
 
+    /// Step every crossing `c` can see: the levels of the lists its
+    /// timeframe reads, active, not yet swept by this timeframe, and born at
+    /// or before the bar opened. Sweeps come back in level-id order.
     fn detect_sweeps(&mut self, c: &Candle, atr: f64) -> Vec<Sweep> {
         let mut sweeps = Vec::new();
         let min_cross = atr * self.cfg.sweep.noise_atr;
         let min_sig = self.cfg.sweep.min_level_sig;
         let max_multi = self.cfg.sweep.max_multi_candle;
         let ts = secs(c);
-        for idx in 0..self.levels.len() {
-            let (lid, side, lprice, sig, dev_count) = {
-                let l = &self.levels[idx];
-                if l.status != Status::Active {
-                    continue;
-                }
-                (l.id, l.side, l.price, l.sig, l.developing)
-            };
-            if sig < min_sig {
+        let tf = c.timeframe;
+        let span = self.span_of(tf);
+        for si in 0..self.lists.len() {
+            if !self.reads(span, si) {
                 continue;
             }
-            let (crossed, extreme) = match side {
-                Side::Bsl => (c.high > lprice + min_cross, c.high),
-                Side::Ssl => (c.low < lprice - min_cross, c.low),
-            };
-            let key = (lid, c.timeframe);
-            if !crossed {
-                if dev_count == 0 {
+            for idx in 0..self.lists[si].levels.len() {
+                let (lid, side, lprice, sig, dev_count) = {
+                    let l = &self.lists[si].levels[idx];
+                    if !l.live_for(tf) || l.born > ts {
+                        continue;
+                    }
+                    (l.id, l.side, l.price, l.sig, l.developing)
+                };
+                if sig < min_sig {
                     continue;
                 }
-                if let Some(dev) = self.developing.remove(&key) {
-                    self.levels[idx].developing -= 1;
-                    let sw = self.finalize_sweep(&dev, idx, atr);
-                    self.mark_swept(idx);
+                let (crossed, extreme) = match side {
+                    Side::Bsl => (c.high > lprice + min_cross, c.high),
+                    Side::Ssl => (c.low < lprice - min_cross, c.low),
+                };
+                let key = (lid, tf);
+                if !crossed {
+                    if dev_count == 0 {
+                        continue;
+                    }
+                    if let Some(dev) = self.developing.remove(&key) {
+                        self.lists[si].levels[idx].developing -= 1;
+                        let sw = self.finalize_sweep(&dev, si, idx, tf, atr);
+                        let spent = self.mark_swept(si, idx, tf);
+                        if let Some(t) = &self.trace {
+                            if t.on() {
+                                self.trace_sweep_end(t, &dev, &sw, c, "back_in", max_multi, atr, min_cross, spent);
+                            }
+                        }
+                        sweeps.push(sw);
+                    }
+                    continue;
+                }
+                if let std::collections::hash_map::Entry::Vacant(e) = self.developing.entry(key) {
+                    e.insert(Developing {
+                        start_ts: ts,
+                        extreme_price: extreme,
+                        extreme_ts: ts,
+                        count: 0,
+                        dir: dir_of_side(side),
+                    });
+                    self.lists[si].levels[idx].developing += 1;
                     if let Some(t) = &self.trace {
                         if t.on() {
-                            self.trace_sweep_end(t, &dev, &sw, c, "back_in", max_multi, atr, min_cross);
+                            let line = match side {
+                                Side::Bsl => lprice + min_cross,
+                                Side::Ssl => lprice - min_cross,
+                            };
+                            let (bar, op) = match side {
+                                Side::Bsl => ("bar high", ">"),
+                                Side::Ssl => ("bar low", "<"),
+                            };
+                            let tfn = t.tf_name(tf);
+                            let l = &self.lists[si].levels[idx];
+                            t.record(
+                                "sw.cross",
+                                "crossq",
+                                &t.sweep_run(lid, &tfn, ts),
+                                Some(&t.level_run(lid)),
+                                Some("yes"),
+                                json!({
+                                    "lid": lid, "side": side.as_str(), "level": lprice,
+                                    "extreme": extreme, "atr": atr,
+                                    "noise_atr": self.cfg.sweep.noise_atr, "min_cross": min_cross,
+                                    "line": line, "sig": sig, "min_sig": min_sig,
+                                    "tf": tfn, "level_list": l.list.name(), "level_born": l.born,
+                                }),
+                                Some(json!([
+                                    cmp_row(bar, extreme, op, "level +/- noise_atr * ATR", line, true),
+                                    cmp_row("level sig", sig, ">=", "min_level_sig", min_sig, true),
+                                ])),
+                            );
+                        }
+                    }
+                }
+                let (done, extended) = {
+                    let d = self.developing.get_mut(&key).unwrap();
+                    d.count += 1;
+                    let more = match side {
+                        Side::Bsl => extreme > d.extreme_price,
+                        Side::Ssl => extreme < d.extreme_price,
+                    };
+                    if more {
+                        d.extreme_price = extreme;
+                        d.extreme_ts = ts;
+                    }
+                    (d.count >= max_multi, more)
+                };
+                if let Some(t) = &self.trace {
+                    if t.on() {
+                        let d = &self.developing[&key];
+                        let tfn = t.tf_name(tf);
+                        let run = t.sweep_run(lid, &tfn, d.start_ts);
+                        t.record(
+                            "sw.dev",
+                            "dev",
+                            &run,
+                            None,
+                            None,
+                            json!({"count": d.count, "extreme": d.extreme_price, "extreme_ts": d.extreme_ts, "extended": extended}),
+                            None,
+                        );
+                        if !done {
+                            t.record(
+                                "sw.done",
+                                "doneq",
+                                &run,
+                                None,
+                                Some("next_bar"),
+                                json!({"count": d.count, "max_multi": max_multi, "how": Value::Null}),
+                                Some(json!([cmp_row("bars beyond", d.count as f64, ">=", "max_multi_candle", max_multi as f64, false)])),
+                            );
+                        }
+                    }
+                }
+                if done {
+                    let dev = self.developing.remove(&key).unwrap();
+                    self.lists[si].levels[idx].developing -= 1;
+                    let sw = self.finalize_sweep(&dev, si, idx, tf, atr);
+                    let spent = self.mark_swept(si, idx, tf);
+                    if let Some(t) = &self.trace {
+                        if t.on() {
+                            self.trace_sweep_end(t, &dev, &sw, c, "held", max_multi, atr, min_cross, spent);
                         }
                     }
                     sweeps.push(sw);
                 }
-                continue;
-            }
-            if let std::collections::hash_map::Entry::Vacant(e) = self.developing.entry(key) {
-                e.insert(Developing {
-                    start_ts: ts,
-                    extreme_price: extreme,
-                    extreme_ts: ts,
-                    count: 0,
-                    dir: dir_of_side(side),
-                });
-                self.levels[idx].developing += 1;
-                if let Some(t) = &self.trace {
-                    if t.on() {
-                        let line = match side {
-                            Side::Bsl => lprice + min_cross,
-                            Side::Ssl => lprice - min_cross,
-                        };
-                        let (bar, op) = match side {
-                            Side::Bsl => ("bar high", ">"),
-                            Side::Ssl => ("bar low", "<"),
-                        };
-                        let tfn = t.tf_name(c.timeframe);
-                        t.record(
-                            "sw.cross",
-                            "crossq",
-                            &t.sweep_run(lid, &tfn, ts),
-                            Some(&t.level_run(lid)),
-                            Some("yes"),
-                            json!({
-                                "lid": lid, "side": side.as_str(), "level": lprice,
-                                "extreme": extreme, "atr": atr,
-                                "noise_atr": self.cfg.sweep.noise_atr, "min_cross": min_cross,
-                                "line": line, "sig": sig, "min_sig": min_sig,
-                            }),
-                            Some(json!([
-                                cmp_row(bar, extreme, op, "level +/- noise_atr * ATR", line, true),
-                                cmp_row("level sig", sig, ">=", "min_level_sig", min_sig, true),
-                            ])),
-                        );
-                    }
-                }
-            }
-            let (done, extended) = {
-                let d = self.developing.get_mut(&key).unwrap();
-                d.count += 1;
-                let more = match side {
-                    Side::Bsl => extreme > d.extreme_price,
-                    Side::Ssl => extreme < d.extreme_price,
-                };
-                if more {
-                    d.extreme_price = extreme;
-                    d.extreme_ts = ts;
-                }
-                (d.count >= max_multi, more)
-            };
-            if let Some(t) = &self.trace {
-                if t.on() {
-                    let d = &self.developing[&key];
-                    let tfn = t.tf_name(c.timeframe);
-                    let run = t.sweep_run(lid, &tfn, d.start_ts);
-                    t.record(
-                        "sw.dev",
-                        "dev",
-                        &run,
-                        None,
-                        None,
-                        json!({"count": d.count, "extreme": d.extreme_price, "extreme_ts": d.extreme_ts, "extended": extended}),
-                        None,
-                    );
-                    if !done {
-                        t.record(
-                            "sw.done",
-                            "doneq",
-                            &run,
-                            None,
-                            Some("next_bar"),
-                            json!({"count": d.count, "max_multi": max_multi, "how": Value::Null}),
-                            Some(json!([cmp_row("bars beyond", d.count as f64, ">=", "max_multi_candle", max_multi as f64, false)])),
-                        );
-                    }
-                }
-            }
-            if done {
-                let dev = self.developing.remove(&key).unwrap();
-                self.levels[idx].developing -= 1;
-                let sw = self.finalize_sweep(&dev, idx, atr);
-                self.mark_swept(idx);
-                if let Some(t) = &self.trace {
-                    if t.on() {
-                        self.trace_sweep_end(t, &dev, &sw, c, "held", max_multi, atr, min_cross);
-                    }
-                }
-                sweeps.push(sw);
             }
         }
+        sweeps.sort_by_key(|s| s.level_id);
         sweeps
     }
 
     /// `sw.done` and `sw.final` for a crossing that just finalized, `how`
     /// being "held" (stayed beyond for max_multi_candle bars) or "back_in"
-    /// (a bar came back inside the noise band).
+    /// (a bar came back inside the noise band). `spent` says whether this
+    /// sweep left the level swept in every view that reads it, so the level
+    /// leaves the registry; otherwise other timeframes still read it.
     #[allow(clippy::too_many_arguments)]
     fn trace_sweep_end(
         &self,
@@ -1418,6 +1871,7 @@ impl Scanner {
         max_multi: i64,
         atr: f64,
         min_cross: f64,
+        spent: bool,
     ) {
         let tfn = t.tf_name(c.timeframe);
         let run = t.sweep_run(sw.level_id, &tfn, dev.start_ts);
@@ -1453,6 +1907,8 @@ impl Scanner {
                 "start_ts": sw.start_ts, "extreme_ts": sw.extreme_ts,
                 "extreme_price": sw.extreme_price, "magnitude_atr": sw.magnitude_atr,
                 "level_formed_at": sw.level_formed_at, "atr": atr,
+                "tf": tfn, "level_tf": t.tf_name(sw.level_tf), "level_list": sw.level_list.name(),
+                "spent": spent,
             }),
             None,
         );
@@ -1460,6 +1916,9 @@ impl Scanner {
 
     // ── Sessions ────────────────────────────────────────────────────────────
 
+    /// Session extremes, open marks and previous-period extremes. Each is
+    /// born at the boundary instant (the open of the base bar that revealed
+    /// it): its price excludes that bar, so the bar itself may sweep it.
     fn session_process(&mut self, c: &Candle) {
         use chrono::{Datelike, Timelike};
         let ts = secs(c);
@@ -1515,7 +1974,7 @@ impl Scanner {
             if hour == m.hour && minute >= m.minute && self.sess.open_mark_date[k] != Some(date)
             {
                 let src = self.open_mark_src[k];
-                self.add_level(c.open, Side::Bsl, src, c.timeframe, ts, 1, 0.0);
+                self.add_level_born(c.open, Side::Bsl, src, c.timeframe, ts, ts, 1, 0.0);
                 self.sess.open_mark_date[k] = Some(date);
             }
         }
@@ -1546,11 +2005,11 @@ impl Scanner {
                 self.sess.session_active[k] = false;
                 if let Some(sh) = self.sess.session_high[k].take() {
                     let src = self.src_session_high;
-                    self.add_level(sh, Side::Bsl, src, c.timeframe, ts, 1, 0.0);
+                    self.add_level_born(sh, Side::Bsl, src, c.timeframe, ts, ts, 1, 0.0);
                 }
                 if let Some(sl) = self.sess.session_low[k].take() {
                     let src = self.src_session_low;
-                    self.add_level(sl, Side::Ssl, src, c.timeframe, ts, 1, 0.0);
+                    self.add_level_born(sl, Side::Ssl, src, c.timeframe, ts, ts, 1, 0.0);
                 }
             }
         }
@@ -1561,31 +2020,31 @@ impl Scanner {
         if day {
             if let Some(h) = self.sess.day_high.take() {
                 let (s, tf) = (self.src_pdh, self.tf_1d);
-                self.add_level(h, Side::Bsl, s, tf, ts, 1, 0.0);
+                self.add_level_born(h, Side::Bsl, s, tf, ts, ts, 1, 0.0);
             }
             if let Some(l) = self.sess.day_low.take() {
                 let (s, tf) = (self.src_pdl, self.tf_1d);
-                self.add_level(l, Side::Ssl, s, tf, ts, 1, 0.0);
+                self.add_level_born(l, Side::Ssl, s, tf, ts, ts, 1, 0.0);
             }
         }
         if week {
             if let Some(h) = self.sess.week_high.take() {
                 let (s, tf) = (self.src_pwh, self.tf_1w);
-                self.add_level(h, Side::Bsl, s, tf, ts, 1, 0.0);
+                self.add_level_born(h, Side::Bsl, s, tf, ts, ts, 1, 0.0);
             }
             if let Some(l) = self.sess.week_low.take() {
                 let (s, tf) = (self.src_pwl, self.tf_1w);
-                self.add_level(l, Side::Ssl, s, tf, ts, 1, 0.0);
+                self.add_level_born(l, Side::Ssl, s, tf, ts, ts, 1, 0.0);
             }
         }
         if month {
             if let Some(h) = self.sess.month_high.take() {
                 let (s, tf) = (self.src_pmh, self.tf_1mo);
-                self.add_level(h, Side::Bsl, s, tf, ts, 1, 0.0);
+                self.add_level_born(h, Side::Bsl, s, tf, ts, ts, 1, 0.0);
             }
             if let Some(l) = self.sess.month_low.take() {
                 let (s, tf) = (self.src_pml, self.tf_1mo);
-                self.add_level(l, Side::Ssl, s, tf, ts, 1, 0.0);
+                self.add_level_born(l, Side::Ssl, s, tf, ts, ts, 1, 0.0);
             }
         }
     }
@@ -2213,10 +2672,8 @@ impl Scanner {
         let quantum = (atr * dcfg.quantum_atr).max(1e-6);
         let mut seen: HashSet<(u16, i64)> = HashSet::new();
         let mut cands: Vec<DrawTarget> = Vec::new();
-        for l in &self.levels {
-            if l.status != Status::Active {
-                continue;
-            }
+        // The base timeframe's view: every list, minus what base bars swept.
+        for l in self.view(self.base_tf) {
             let Some(sig) = self.sources.infos[l.source as usize].draw_sig else {
                 continue;
             };
@@ -2431,6 +2888,18 @@ impl Scanner {
     /// the caller runs [`Scanner::rebuild_draw`] and [`Scanner::after_hooks`].
     pub fn process(&mut self, c: &Candle) -> BarEvents {
         let tf = c.timeframe;
+        let span = match self.spans.get(&tf) {
+            Some(&s) => s,
+            None => {
+                let s = tf_span_secs(tf);
+                self.spans.insert(tf, s);
+                s
+            }
+        };
+        if let Err(at) = self.seen_tfs.binary_search(&(span, tf)) {
+            self.seen_tfs.insert(at, (span, tf));
+        }
+        self.bar_close = secs(c) + span;
         let cap = self.ring_cap;
         let ring = self.rings.entry(tf).or_insert_with(|| VecDeque::with_capacity(cap + 1));
         ring.push_back(c.clone());
@@ -2449,6 +2918,9 @@ impl Scanner {
             self.last_atr = atr;
         }
         let is_base = tf == self.base_tf;
+        if is_base {
+            self.base_count += 1;
+        }
 
         let day_closed = if self.cfg.day_tracker && is_base {
             self.day_process(c)
@@ -2505,7 +2977,7 @@ impl Scanner {
                 d.enabled
                     && is_base
                     && atr > 0.0
-                    && ((d.every > 0 && self.candle_count % d.every == 0) || !sweeps.is_empty())
+                    && ((d.every > 0 && self.base_count % d.every == 0) || !sweeps.is_empty())
             })
             .unwrap_or(false);
 
@@ -2571,18 +3043,21 @@ impl Scanner {
     }
 
     /// The registry maintenance that follows the strategy's hooks: retest
-    /// refresh, decay, pruning.
+    /// refresh on every bar; decay and pruning on base bars, counted in base
+    /// bars.
     pub fn after_hooks(&mut self, c: &Candle, atr: f64) {
-        let ts = secs(c);
         if self.cfg.levels.refresh_atr > 0.0 && atr > 0.0 {
-            self.refresh_on_retest(c.high, c.low, atr, ts);
+            self.refresh_on_retest(c, atr);
+        }
+        if c.timeframe != self.base_tf {
+            return;
         }
         let de = self.cfg.levels.decay_every;
-        if de > 0 && self.candle_count % de == 0 {
+        if de > 0 && self.base_count % de == 0 {
             self.tick_decay();
         }
         let pe = self.cfg.levels.prune_every;
-        if pe > 0 && self.candle_count % pe == 0 {
+        if pe > 0 && self.base_count % pe == 0 {
             self.prune_levels();
             self.fvg_rebuild_active();
             self.prune_signals();
@@ -2656,8 +3131,7 @@ impl Scanner {
         }
         let epoch = sink.epoch();
         let levels: Vec<Value> = self
-            .levels
-            .iter()
+            .all_levels()
             .filter(|l| l.status == Status::Active)
             .map(|l| {
                 json!([
@@ -2671,7 +3145,10 @@ impl Scanner {
                     l.sig,
                     l.decay as f64,
                     l.last_touch,
-                    l.developing
+                    l.developing,
+                    l.list.name(),
+                    l.born,
+                    l.swept_on.iter().map(|&t| sink.tf_name(t)).collect::<Vec<_>>()
                 ])
             })
             .collect();
@@ -2704,9 +3181,10 @@ impl Scanner {
     /// active gaps, signals kept). The per-bar cost scales with the active
     /// counts, so a registry that never expires shows up here.
     pub fn sizes(&self) -> (usize, usize, usize, usize, usize) {
+        let all = || self.lists.iter().flat_map(|s| s.levels.iter());
         (
-            self.levels.len(),
-            self.levels.iter().filter(|l| l.status == Status::Active).count(),
+            all().count(),
+            all().filter(|l| l.status == Status::Active).count(),
             self.fvgs.len(),
             self.fvg_active.len(),
             self.signals.len(),
@@ -2881,7 +3359,7 @@ mod tests {
         assert_eq!(s.extreme_price, 101.0);
         assert_eq!(s.start_ts, 60);
         assert_eq!(s.level_source, "pdh");
-        assert!(sc.levels_beyond(Side::Bsl, 0.0, 0.0).is_empty(), "swept levels leave the registry");
+        assert!(sc.levels_beyond(tf, Side::Bsl, 0.0, 0.0).is_empty(), "swept levels leave the base view");
     }
 
     #[test]
@@ -2913,7 +3391,7 @@ mod tests {
         assert_eq!(f[0].far, 101.0);
         assert_eq!(f[0].c1_stop, Some(99.0));
         // The swing low at 98 is now a sell-side level.
-        let below = sc.levels_beyond(Side::Ssl, 100.0, 0.0);
+        let below = sc.levels_beyond(tf_id("1m"), Side::Ssl, 100.0, 0.0);
         assert_eq!(below.len(), 1);
         assert_eq!(below[0].price, 98.0);
         // A body trading through the far edge inverts the gap.
@@ -2943,16 +3421,16 @@ mod tests {
     #[test]
     fn decay_expires_levels_in_single_precision() {
         let mut sc = Scanner::new(cfg());
-        sc.add_level_named(100.0, Side::Bsl, "pdh", tf_id("1m"), 0, 1, 0.0);
+        let id = sc.add_level_named(100.0, Side::Bsl, "pdh", tf_id("1m"), 0, 1, 0.0);
         sc.after_hooks(&candle(60, 1.0, 1.0, 1.0, 1.0), 1.0);
-        assert_eq!(sc.levels[0].status, Status::Active, "one tick of 1/1 per candle: 1 < 2");
-        assert_eq!(sc.levels[0].decay, 1.0f32);
-        sc.candle_count = 1; // keep the prune cadence out of it
+        assert_eq!(sc.level(id).unwrap().status, Status::Active, "one tick of 1/1 per candle: 1 < 2");
+        assert_eq!(sc.level(id).unwrap().decay, 1.0f32);
+        sc.base_count = 1; // keep the prune cadence out of it
         sc.after_hooks(&candle(120, 1.0, 1.0, 1.0, 1.0), 1.0);
-        assert_eq!(sc.levels[0].status, Status::Expired);
-        sc.candle_count = 1000;
+        assert_eq!(sc.level(id).unwrap().status, Status::Expired);
+        sc.base_count = 1000;
         sc.after_hooks(&candle(180, 1.0, 1.0, 1.0, 1.0), 1.0);
-        assert!(sc.levels.is_empty(), "pruned on the cadence");
+        assert!(sc.level(id).is_none(), "pruned on the cadence");
     }
 
     /// `cfg()` decays a level in two bars, which is right for the decay tests
@@ -2998,17 +3476,20 @@ mod tests {
     /// string: the level registry, the gap store and the draw map.
     fn fingerprint(sc: &Scanner) -> String {
         let mut s = String::new();
-        let mut levels: Vec<&Level> = sc.levels.iter().filter(|l| l.status == Status::Active).collect();
+        let mut levels: Vec<&Level> = sc.all_levels().filter(|l| l.status == Status::Active).collect();
         levels.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap().then(a.ts.cmp(&b.ts)));
         for l in levels {
             s.push_str(&format!(
-                "L {:.6} {} {} {} {} {:.6}\n",
+                "L {:.6} {} {} {} {:?} {} {:.6} {} {:?}\n",
                 l.price,
                 l.side.as_str(),
                 sc.source_name(l.source),
                 l.tf,
+                l.list,
                 l.touch,
-                l.sig
+                l.sig,
+                l.born,
+                l.swept_on
             ));
         }
         // The whole gap store, not just the active index: a script asks
@@ -3118,13 +3599,13 @@ mod tests {
         sc.add_level_named(101.0, Side::Bsl, "pdh", tf, 0, 1, 0.0);
         sc.add_level_named(105.0, Side::Bsl, "pdh", tf, 0, 1, 0.0);
         let (price, _, rr) = sc
-            .find_target(Direction::Bull, 100.0, 99.0, 2.0, 0.0)
+            .find_target(tf, Direction::Bull, 100.0, 99.0, 2.0, 0.0)
             .unwrap();
         assert_eq!(price, 105.0);
         assert_eq!(rr, 5.0);
-        assert!(sc.find_target(Direction::Bull, 100.0, 99.0, 6.0, 0.0).is_none());
-        assert_eq!(sc.nearest_beyond(Side::Bsl, 100.0).unwrap().price, 101.0);
-        assert!(sc.nearest_beyond(Side::Ssl, 100.0).is_none());
+        assert!(sc.find_target(tf, Direction::Bull, 100.0, 99.0, 6.0, 0.0).is_none());
+        assert_eq!(sc.nearest_beyond(tf, Side::Bsl, 100.0).unwrap().price, 101.0);
+        assert!(sc.nearest_beyond(tf, Side::Ssl, 100.0).is_none());
     }
 
     #[test]
@@ -3154,6 +3635,373 @@ mod tests {
         assert_eq!(d.day_ms, 86_400_000 * 10);
         assert_eq!((d.open, d.high, d.low, d.close), (1.0, 3.0, 0.5, 2.0));
         assert_eq!(sc.day().unwrap().high, 2.5);
+    }
+
+    // ── Per-timeframe lists ─────────────────────────────────────────────────
+
+    const M: i64 = 60;
+
+    /// `cfg()` with merges effectively off, so each test sees exactly the
+    /// levels it builds, and nothing decays or prunes under it.
+    fn cfg_lists() -> ScannerCfg {
+        let mut c = cfg();
+        c.levels.cluster_atr_tolerance = 0.01;
+        c.levels.decay_candles = 1e9;
+        c.draw = None;
+        c
+    }
+
+    fn flat(tf: &str, ts: i64, high: f64) -> Candle {
+        candle_tf(tf, ts, 7470.0, high, 7469.0, 7470.0)
+    }
+
+    fn sweeps_of(ev: &BarEvents, id: i64) -> Vec<Sweep> {
+        ev.sweeps.iter().filter(|s| s.level_id == id).cloned().collect()
+    }
+
+    /// The replay-debugger case: a 1m swing high (pivot 00:21, confirmed by
+    /// the 00:26 bar, so known at 00:27) sits under the high the 00:15 minute
+    /// printed. The 15m bar 00:15-00:30 carries that earlier high. Before
+    /// per-timeframe lists, its close crossed the 1m level and the next 15m
+    /// bar finalized a 15m sweep of a level that did not exist when the
+    /// crossing price printed. Now the 15m view does not read the 1m list,
+    /// and no 1m bar after the level's birth crossed it.
+    #[test]
+    fn a_1m_level_is_not_swept_by_a_15m_bar_that_printed_before_it() {
+        let mut c = cfg_lists();
+        c.primitives.swing_lookback = 5;
+        let mut sc = Scanner::new(c);
+        let day = 86_400 * 100;
+        let high_at = |m: i64| match m {
+            15 => 7480.2,
+            21 => 7479.8,
+            _ => 7471.0,
+        };
+        let mut all = Vec::new();
+        for m in 0..=50 {
+            all.extend(sc.process(&flat("1m", day + m * M, high_at(m))).sweeps);
+            // Composites arrive with the first base bar of the next period.
+            if m == 15 {
+                all.extend(sc.process(&flat("15m", day, 7471.0)).sweeps);
+            }
+            if m == 30 {
+                all.extend(sc.process(&flat("15m", day + 15 * M, 7480.2)).sweeps);
+            }
+            if m == 45 {
+                all.extend(sc.process(&flat("15m", day + 30 * M, 7471.0)).sweeps);
+            }
+        }
+        let l02 = sc
+            .all_levels()
+            .find(|l| l.price == 7479.8)
+            .expect("the 1m swing high is a level");
+        assert_eq!(l02.list, LevelList::Tf(tf_id("1m")));
+        assert_eq!(l02.ts, day + 21 * M, "formed at the pivot bar");
+        assert_eq!(l02.born, day + 27 * M, "known when the 00:26 bar closed");
+        let id = l02.id;
+        assert!(all.iter().all(|s| s.level_id != id), "no sweep of L0.2 on any timeframe: {all:?}");
+        assert!(sc.is_live(id, tf_id("1m")));
+        assert!(!sc.is_live(id, tf_id("15m")), "the 15m view never reads a 1m level");
+        // The 00:15 minute's own swing (7480.2, known at 00:21) is a 1m level
+        // too, and the 15m bar that contains its pivot does not sweep it.
+        let other = sc.all_levels().find(|l| l.price == 7480.2).unwrap().id;
+        assert!(all.iter().all(|s| s.level_id != other));
+    }
+
+    /// A level a script adds from a 1m hook into the 15m list is known at
+    /// that 1m bar's close. The 15m bar that was open at the time arrives
+    /// later and reads the 15m list, so only the birth guard stops it.
+    #[test]
+    fn a_bar_cannot_sweep_a_level_born_after_it_opened() {
+        let mut sc = Scanner::new(cfg_lists());
+        let day = 86_400 * 100;
+        for m in 0..=20 {
+            sc.process(&flat("1m", day + m * M, 7471.0));
+        }
+        // From the 00:20 bar's hook: a 15m-list level, known at 00:21.
+        let id = sc.add_level_named(7475.0, Side::Bsl, "fvg_ce", tf_id("15m"), day + 20 * M, 1, 0.0);
+        assert_eq!(sc.level(id).unwrap().born, day + 21 * M);
+        assert_eq!(sc.level(id).unwrap().list, LevelList::Tf(tf_id("15m")));
+        for m in 21..=30 {
+            sc.process(&flat("1m", day + m * M, 7471.0));
+        }
+        // 00:15-00:30 printed 7476 (at 00:16, before the level existed).
+        let ev = sc.process(&flat("15m", day + 15 * M, 7476.0));
+        assert!(sweeps_of(&ev, id).is_empty());
+        let ev = sc.process(&flat("15m", day + 30 * M, 7471.0));
+        assert!(sweeps_of(&ev, id).is_empty(), "no crossing to finalize");
+        // A 15m bar opened after the birth sweeps it.
+        sc.process(&flat("15m", day + 45 * M, 7476.0));
+        let ev = sc.process(&flat("15m", day + 60 * M, 7471.0));
+        assert_eq!(sweeps_of(&ev, id).len(), 1);
+    }
+
+    /// A 1m bar that crosses a 15m level and comes back is a 1m sweep. The
+    /// level stays live for the 15m view, and a 15m crossing later is its own
+    /// 15m sweep, after which every timeframe that reads it has swept it.
+    #[test]
+    fn a_1m_sweep_of_a_15m_level_leaves_it_live_for_15m_which_sweeps_it_separately() {
+        let mut sc = Scanner::new(cfg_lists());
+        let (m1, m15) = (tf_id("1m"), tf_id("15m"));
+        let day = 86_400 * 100;
+        sc.process(&flat("1m", day - M, 7471.0));
+        sc.process(&flat("15m", day - 15 * M, 7471.0));
+        let id = sc.add_level_named(7475.0, Side::Bsl, "swing_high", m15, day - 30 * M, 1, 0.0);
+        sc.process(&flat("1m", day, 7476.0));
+        let ev = sc.process(&flat("1m", day + M, 7471.0));
+        let sw = sweeps_of(&ev, id);
+        assert_eq!(sw.len(), 1);
+        assert_eq!(sw[0].tf, m1, "a 1m sweep");
+        assert_eq!(sw[0].level_tf, m15);
+        assert_eq!(sw[0].level_list, LevelList::Tf(m15));
+        assert!(!sc.is_live(id, m1), "spent for the 1m view");
+        assert!(sc.is_live(id, m15), "still live for the 15m view");
+        assert_eq!(sc.level(id).unwrap().status, Status::Active);
+        // Another 1m crossing is not a second 1m sweep.
+        sc.process(&flat("1m", day + 2 * M, 7477.0));
+        let ev = sc.process(&flat("1m", day + 3 * M, 7471.0));
+        assert!(sweeps_of(&ev, id).is_empty());
+        // The 15m bar 00:00-00:15 crossed it too (its 00:00 and 00:02 minutes).
+        for m in 4..15 {
+            sc.process(&flat("1m", day + m * M, 7471.0));
+        }
+        let ev = sc.process(&flat("15m", day, 7477.0));
+        assert!(sweeps_of(&ev, id).is_empty(), "developing");
+        let ev = sc.process(&flat("15m", day + 15 * M, 7471.0));
+        let sw = sweeps_of(&ev, id);
+        assert_eq!(sw.len(), 1);
+        assert_eq!(sw[0].tf, m15, "a 15m sweep");
+        assert_eq!(sc.level(id).unwrap().swept_tfs(), &[m1, m15]);
+        assert_eq!(sc.level(id).unwrap().status, Status::Spent, "1m and 15m both swept it");
+    }
+
+    #[test]
+    fn a_15m_bar_sweeps_a_15m_level() {
+        let mut sc = Scanner::new(cfg_lists());
+        let m15 = tf_id("15m");
+        let day = 86_400 * 100;
+        let id = sc.add_level_named(7475.0, Side::Bsl, "swing_high", m15, day - 30 * M, 1, 0.0);
+        assert!(sweeps_of(&sc.process(&flat("15m", day, 7476.0)), id).is_empty());
+        let ev = sc.process(&flat("15m", day + 15 * M, 7471.0));
+        let sw = sweeps_of(&ev, id);
+        assert_eq!(sw.len(), 1);
+        assert_eq!(sw[0].tf, m15);
+        assert_eq!(sw[0].extreme_price, 7476.0);
+        assert_eq!(sc.level(id).unwrap().status, Status::Spent, "only 15m has delivered bars");
+    }
+
+    #[test]
+    fn a_15m_bar_never_sees_a_1m_level() {
+        let mut sc = Scanner::new(cfg_lists());
+        let (m1, m15) = (tf_id("1m"), tf_id("15m"));
+        let day = 86_400 * 100;
+        let id = sc.add_level_named(7475.0, Side::Bsl, "swing_high", m1, day - 30 * M, 1, 0.0);
+        for k in 0..4 {
+            let ev = sc.process(&flat("15m", day + k * 15 * M, if k % 2 == 0 { 7490.0 } else { 7471.0 }));
+            assert!(sweeps_of(&ev, id).is_empty());
+        }
+        assert!(sc.developing.keys().all(|(lid, _)| *lid != id), "no crossing opened");
+        assert!(sc.is_live(id, m1));
+        assert!(!sc.is_live(id, m15));
+        assert!(sc.view(m15).iter().all(|l| l.list != LevelList::Tf(m1)));
+        assert_eq!(sc.nearest_beyond(m1, Side::Bsl, 7470.0).unwrap().id, id);
+        assert_ne!(sc.nearest_beyond(m15, Side::Bsl, 7470.0).map(|l| l.id), Some(id));
+    }
+
+    /// Dedup flows downwards: a new 1m level next to a live 15m level is the
+    /// 15m level, and a new 15m level takes over a 1m level next to it. The
+    /// 15m list is never changed by a 1m level.
+    #[test]
+    fn a_lower_level_within_tolerance_takes_the_higher_identity() {
+        let mut c = cfg_lists();
+        c.levels.cluster_atr_tolerance = 0.5;
+        let mut sc = Scanner::new(c);
+        let (m1, m15) = (tf_id("1m"), tf_id("15m"));
+        let day = 86_400 * 100;
+        for m in 0..5 {
+            sc.process(&candle_tf("1m", day + m * M, 100.0, 100.5, 99.5, 100.0));
+        }
+        let atr1 = sc.atr_cache[&m1];
+        assert!(atr1 > 0.0);
+
+        // A 15m level, then a 1m level within 0.5 * ATR(1m) of it.
+        let h = sc.add_level_named(103.0, Side::Bsl, "swing_high", m15, day, 1, 0.0);
+        let before = sc.level(h).unwrap().clone();
+        let got = sc.add_level_named(103.0 + atr1 * 0.4, Side::Bsl, "swing_high", m1, day + 4 * M, 1, atr1);
+        assert_eq!(got, h, "the 1m view already reads the 15m level");
+        let after = sc.level(h).unwrap();
+        assert_eq!((after.touch, after.sig, after.decay, after.last_touch), (before.touch, before.sig, before.decay, before.last_touch));
+        assert!(sc.all_levels().all(|l| l.price <= 101.0 || l.id == h), "no 1m level was created");
+
+        // The reverse: a live 1m level, then a 15m level born next to it.
+        let low = sc.add_level_named(97.0, Side::Ssl, "swing_low", m1, day + 4 * M, 1, atr1);
+        let hl = sc.add_level_named(97.0 - atr1 * 0.4, Side::Ssl, "swing_low", m15, day + 5 * M, 1, 0.0);
+        assert_ne!(low, hl);
+        assert_eq!(sc.level(low).unwrap().status, Status::Absorbed);
+        assert_eq!(sc.level(hl).unwrap().touch, 1, "absorbing changes nothing on the 15m level");
+        assert_eq!(sc.view(m1).iter().filter(|l| l.price < 99.0).map(|l| l.id).collect::<Vec<_>>(), vec![hl]);
+
+        // Outside tolerance, or on a level the 1m view has already swept,
+        // the 1m level is its own.
+        let far = sc.add_level_named(103.0 + atr1 * 2.0, Side::Bsl, "swing_high", m1, day + 5 * M, 1, atr1);
+        assert_ne!(far, h);
+        sc.process(&candle_tf("1m", day + 5 * M, 100.0, 103.0 + atr1 * 0.9, 99.5, 100.0));
+        sc.process(&candle_tf("1m", day + 6 * M, 100.0, 100.5, 99.5, 100.0));
+        assert!(!sc.is_live(h, m1), "1m swept the 15m level");
+        let fresh = sc.add_level_named(103.0 + atr1 * 0.1, Side::Bsl, "swing_high", m1, day + 7 * M, 1, atr1);
+        assert_ne!(fresh, h, "new 1m liquidity at a level the 1m view already took");
+        assert_eq!(sc.level(fresh).unwrap().list, LevelList::Tf(m1));
+    }
+
+    /// Session levels live in one list every timeframe reads, each
+    /// timeframe sweeps them once, and the birth guard holds for the HTF bar
+    /// that was open when the session closed.
+    #[test]
+    fn session_levels_are_swept_from_every_timeframe_after_their_birth() {
+        let mut c = cfg_lists();
+        c.sessions = SessionsCfg {
+            enabled: true,
+            tz_offset_secs: 0,
+            sessions: vec![SessionSpec { name: "s".into(), start_hour: 1, end_hour: 2 }],
+            open_marks: vec![],
+        };
+        let mut sc = Scanner::new(c);
+        let (m1, m15, h1) = (tf_id("1m"), tf_id("15m"), tf_id("1h"));
+        let base = 86_400 * 100;
+        let hr = 3600;
+        for m in 0..60 {
+            sc.process(&candle_tf("1m", base + hr + m * M, 100.0, 100.5, 99.5, 100.0));
+        }
+        // 02:00 ends the session: its high (100.5) is born at 02:00.
+        let ev = sc.process(&candle_tf("1m", base + 2 * hr, 100.0, 100.2, 99.8, 100.0));
+        assert!(ev.sweeps.is_empty());
+        let sh = sc.all_levels().find(|l| sc.source_name(l.source) == "session_high").unwrap();
+        let id = sh.id;
+        assert_eq!(sh.list, LevelList::Session);
+        assert_eq!(sh.born, base + 2 * hr);
+        // The 01:00 hourly composite opened before the session ended; it
+        // cannot sweep the high even with a print above it.
+        let ev = sc.process(&candle_tf("1h", base + hr, 100.0, 101.0, 99.0, 100.0));
+        assert!(sweeps_of(&ev, id).is_empty());
+        assert!(sc.developing.keys().all(|(lid, _)| *lid != id));
+        // A 1m sweep.
+        sc.process(&candle_tf("1m", base + 2 * hr + M, 100.0, 101.0, 99.8, 100.0));
+        let ev = sc.process(&candle_tf("1m", base + 2 * hr + 2 * M, 100.0, 100.2, 99.8, 100.0));
+        assert_eq!(sweeps_of(&ev, id).iter().map(|s| s.tf).collect::<Vec<_>>(), vec![m1]);
+        // A 15m sweep from the 02:00 bar, which opened at the birth instant.
+        sc.process(&candle_tf("15m", base + 2 * hr, 100.0, 101.0, 99.8, 100.0));
+        let ev = sc.process(&candle_tf("15m", base + 2 * hr + 15 * M, 100.0, 100.2, 99.8, 100.0));
+        assert_eq!(sweeps_of(&ev, id).iter().map(|s| s.tf).collect::<Vec<_>>(), vec![m15]);
+        assert_eq!(sc.level(id).unwrap().status, Status::Active, "1h has not swept it");
+        // And a 1h sweep from the 02:00 hour.
+        sc.process(&candle_tf("1h", base + 2 * hr, 100.0, 101.0, 99.8, 100.0));
+        let ev = sc.process(&candle_tf("1h", base + 3 * hr, 100.0, 100.2, 99.8, 100.0));
+        assert_eq!(sweeps_of(&ev, id).iter().map(|s| s.tf).collect::<Vec<_>>(), vec![h1]);
+        assert_eq!(sc.level(id).unwrap().status, Status::Spent);
+    }
+
+    #[test]
+    fn level_ids_are_unique_across_lists() {
+        let mut sc = Scanner::new(cfg_lists());
+        let tfs = ["1m", "15m", "1D", "4h", "1m", "15m"];
+        let mut ids = Vec::new();
+        for (k, tf) in tfs.iter().enumerate() {
+            ids.push(sc.add_level_named(100.0 + k as f64 * 10.0, Side::Bsl, "swing_high", tf_id(tf), 0, 1, 0.0));
+            ids.push(sc.add_level_named(50.0 - k as f64 * 10.0, Side::Ssl, "session_low", tf_id(tf), 0, 1, 0.0));
+        }
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "every id distinct");
+        assert_eq!(sorted, ids, "issued in creation order");
+        for (k, tf) in tfs.iter().enumerate() {
+            assert_eq!(sc.level(ids[2 * k]).unwrap().list, LevelList::Tf(tf_id(tf)));
+            assert_eq!(sc.level(ids[2 * k + 1]).unwrap().list, LevelList::Session);
+        }
+        let lists: Vec<LevelList> = sc.lists.iter().map(|s| s.list).collect();
+        assert_eq!(
+            lists,
+            vec![
+                LevelList::Tf(tf_id("1m")),
+                LevelList::Tf(tf_id("15m")),
+                LevelList::Tf(tf_id("4h")),
+                LevelList::Tf(tf_id("1D")),
+                LevelList::Session
+            ],
+            "stores ordered by span, session last"
+        );
+    }
+
+    #[test]
+    fn timeframe_spans_order_minutes_to_months() {
+        let s = |n: &str| tf_span_secs(tf_id(n));
+        assert_eq!(s("1m"), 60);
+        assert_eq!(s("15m"), 900);
+        assert_eq!(s("4h"), 14_400);
+        assert_eq!(s("1D"), 86_400);
+        assert!(s("1D") < s("1W") && s("1W") < s("1M"));
+        assert_eq!(s("weird"), 60);
+    }
+
+    /// `tape()` with 15m and 1h composites interleaved in arrival order: a
+    /// composite arrives with the first base bar of the next period, carrying
+    /// its period-start stamp.
+    fn tape_htf(from_min: i64, to_min: i64) -> Vec<Candle> {
+        let base = tape(from_min, to_min);
+        let mut out = Vec::new();
+        let mut open: Vec<(&str, i64, Vec<Candle>)> = vec![("15m", 15, Vec::new()), ("1h", 60, Vec::new())];
+        for c in base {
+            let m = secs(&c).div_euclid(60);
+            out.push(c.clone());
+            for (tf, n, buf) in open.iter_mut() {
+                if m.rem_euclid(*n) == 0 && !buf.is_empty() {
+                    let o = buf[0].open;
+                    let h = buf.iter().map(|x| x.high).fold(f64::MIN, f64::max);
+                    let l = buf.iter().map(|x| x.low).fold(f64::MAX, f64::min);
+                    let cl = buf.last().unwrap().close;
+                    out.push(candle_tf(tf, secs(&buf[0]), o, h, l, cl));
+                    buf.clear();
+                }
+                buf.push(c.clone());
+            }
+        }
+        out
+    }
+
+    /// The rebuild property with every list in play: 1m, 15m and 1h bars,
+    /// session and period levels, cross-list dedup and per-view sweeps.
+    #[test]
+    fn rebuild_is_warmup_invariant_with_htf_bars_and_sessions() {
+        let mut c = cfg_long();
+        c.sessions = SessionsCfg {
+            enabled: true,
+            tz_offset_secs: -18_000,
+            sessions: vec![
+                SessionSpec { name: "asia".into(), start_hour: 20, end_hour: 0 },
+                SessionSpec { name: "ny".into(), start_hour: 7, end_hour: 10 },
+            ],
+            open_marks: vec![OpenMark { hour: 9, minute: 30, source: "open_930".into() }],
+        };
+        let window = &tape_htf(0, 60 * 24 * 20);
+        let deep = &tape_htf(-60 * 24 * 20, 0);
+        let mut shallow = Scanner::new(c.clone());
+        shallow.rebuild_from(window);
+        let mut warm = Scanner::new(c);
+        for x in deep {
+            let ev = warm.process(x);
+            warm.rebuild_draw(x, &ev);
+            warm.after_hooks(x, ev.atr);
+        }
+        warm.rebuild_from(window);
+        let fp = fingerprint(&shallow);
+        assert_eq!(fingerprint(&warm), fp);
+        for list in ["Tf(", "Session"] {
+            assert!(fp.contains(list), "fixture builds {list} levels");
+        }
+        assert!(
+            shallow.all_levels().any(|l| l.list == LevelList::Tf(tf_id("15m"))),
+            "fixture builds 15m levels"
+        );
     }
 
     #[test]

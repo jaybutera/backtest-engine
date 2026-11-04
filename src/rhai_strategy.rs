@@ -74,13 +74,29 @@
 //! from `on_bar` directly.
 //!
 //! Scanner queries: `significance(src, tf, touch)`, `add_level(price, side,
-//! src, tf, ts, touch, atr)`, `level(id)`, `levels_beyond(side, price,
-//! min_sig)`, `nearest_above(price)` / `nearest_below(price)`,
-//! `find_target(dir, entry, stop, min_rr, min_sig)`, `fvg(id)`,
-//! `fvg_status(id)`, `fvgs_since(tf, dir, inverted, since_ts)`,
-//! `fvg_first(tf, dir, inverted, since_ts, min_gap, zone_lo, zone_hi,
-//! clear_from, min_clear)`, `draw_map()`, `draw_bias()`, `day()`,
-//! `day_high()` / `day_low()`, `last_atr()`, `candle_count()`, `stats()`.
+//! src, tf, ts, touch, atr)`, `level(id)`, `is_live(id, tf)`,
+//! `levels_beyond(side, price, min_sig[, tf])`, `nearest_above(price[, tf])` /
+//! `nearest_below(price[, tf])`, `find_target(dir, entry, stop, min_rr,
+//! min_sig[, tf])`, `fvg(id)`, `fvg_status(id)`, `fvgs_since(tf, dir,
+//! inverted, since_ts)`, `fvg_first(tf, dir, inverted, since_ts, min_gap,
+//! zone_lo, zone_hi, clear_from, min_clear)`, `draw_map()`, `draw_bias()`,
+//! `day()`, `day_high()` / `day_low()`, `last_atr()`, `candle_count()`,
+//! `stats()`.
+//!
+//! Levels live in one list per candle timeframe plus a session list (see
+//! [`Scanner`] for the rules). A level query reads one timeframe's view: that
+//! timeframe's list, every longer timeframe's, and the session list, minus
+//! the levels that timeframe has already swept. The optional trailing `tf`
+//! names the view; without it the query reads the base timeframe's view,
+//! which holds every list. `add_level` puts the level in `tf`'s list (the
+//! session list for a session source), born at the close of the bar being
+//! processed, and returns the id to hold, which is a longer-timeframe level's
+//! when that level already covers the price. Level ids are unique across
+//! lists. `level(id)` carries `list`, `born`, `status` (`active`, `spent`,
+//! `expired`, `absorbed`) and `swept_on` (the timeframes that have swept it)
+//! beside the level's own fields. A sweep map carries `tf`, the timeframe of
+//! the bars that swept, and `level_tf` / `level_list`: a level is swept at
+//! most once per timeframe that reads it, and each of those is its own sweep.
 //! Setting `BACKTEST_RHAI_STATS=1` prints per-hook call counts and time per
 //! asset at the end of a run.
 //!
@@ -2085,7 +2101,10 @@ fn dir_name(d: Direction) -> ImmutableString {
 
 fn sweep_map(s: &liquidity::Sweep) -> Map {
     let mut m = Map::new();
+    m.insert("tf".into(), tf_str(s.tf).into());
     m.insert("level_id".into(), s.level_id.into());
+    m.insert("level_tf".into(), tf_str(s.level_tf).into());
+    m.insert("level_list".into(), s.level_list.name().into());
     m.insert("level_price".into(), s.level_price.into());
     m.insert("level_source".into(), s.level_source.clone().into());
     m.insert("level_sig".into(), s.level_sig.into());
@@ -2140,11 +2159,24 @@ fn level_map(scan: &Scanner, l: &liquidity::Level) -> Map {
     m.insert("dir".into(), l.side.as_str().into());
     m.insert("source".into(), scan.source_name_owned(l).into());
     m.insert("tf".into(), tf_str(l.tf).into());
+    m.insert("list".into(), l.list.name().into());
     m.insert("ts".into(), l.ts.into());
+    m.insert("born".into(), l.born.into());
     m.insert("touch".into(), l.touch.into());
     m.insert("sig".into(), l.sig.into());
     m.insert("last_touch".into(), l.last_touch.into());
+    m.insert("status".into(), l.status.as_str().into());
+    let swept: Array = l.swept_tfs().iter().map(|&t| Dynamic::from(tf_str(t))).collect();
+    m.insert("swept_on".into(), swept.into());
     m
+}
+
+fn target_map((price, id, rr): (f64, i64, f64)) -> Dynamic {
+    let mut m = Map::new();
+    m.insert("price".into(), price.into());
+    m.insert("level_id".into(), id.into());
+    m.insert("rr".into(), rr.into());
+    Dynamic::from_map(m)
 }
 
 fn draw_map_map(dm: &liquidity::DrawMap) -> Map {
@@ -2246,39 +2278,69 @@ fn register_scanner_api(engine: &mut Engine) {
                 None => Dynamic::UNIT,
             }
         })
+        .register_fn("is_live", |s: &mut ScanHandle, id: i64, tf: &str| -> bool {
+            s.0.borrow().is_live(id, tf_of(tf))
+        })
+        // Level queries read one timeframe's view; without a timeframe, the
+        // base timeframe's (every list).
         .register_fn(
             "levels_beyond",
             |s: &mut ScanHandle, side: &str, price: f64, min_sig: f64| -> Result<Array, Box<EvalAltResult>> {
                 let side = side_from_str(side)?;
                 let sc = s.0.borrow();
                 Ok(sc
-                    .levels_beyond(side, price, min_sig)
+                    .levels_beyond(sc.base_tf(), side, price, min_sig)
+                    .into_iter()
+                    .map(|l| Dynamic::from_map(level_map(&sc, l)))
+                    .collect())
+            },
+        )
+        .register_fn(
+            "levels_beyond",
+            |s: &mut ScanHandle, side: &str, price: f64, min_sig: f64, tf: &str| -> Result<Array, Box<EvalAltResult>> {
+                let side = side_from_str(side)?;
+                let sc = s.0.borrow();
+                Ok(sc
+                    .levels_beyond(tf_of(tf), side, price, min_sig)
                     .into_iter()
                     .map(|l| Dynamic::from_map(level_map(&sc, l)))
                     .collect())
             },
         )
         .register_fn("nearest_above", |s: &mut ScanHandle, price: f64| -> Dynamic {
-            opt_f64(s.0.borrow().nearest_beyond(Side::Bsl, price).map(|l| l.price))
+            let sc = s.0.borrow();
+            opt_f64(sc.nearest_beyond(sc.base_tf(), Side::Bsl, price).map(|l| l.price))
+        })
+        .register_fn("nearest_above", |s: &mut ScanHandle, price: f64, tf: &str| -> Dynamic {
+            opt_f64(s.0.borrow().nearest_beyond(tf_of(tf), Side::Bsl, price).map(|l| l.price))
         })
         .register_fn("nearest_below", |s: &mut ScanHandle, price: f64| -> Dynamic {
-            opt_f64(s.0.borrow().nearest_beyond(Side::Ssl, price).map(|l| l.price))
+            let sc = s.0.borrow();
+            opt_f64(sc.nearest_beyond(sc.base_tf(), Side::Ssl, price).map(|l| l.price))
+        })
+        .register_fn("nearest_below", |s: &mut ScanHandle, price: f64, tf: &str| -> Dynamic {
+            opt_f64(s.0.borrow().nearest_beyond(tf_of(tf), Side::Ssl, price).map(|l| l.price))
         })
         .register_fn(
             "find_target",
             |s: &mut ScanHandle, dir: &str, entry: f64, stop: f64, min_rr: f64, min_sig: f64|
              -> Result<Dynamic, Box<EvalAltResult>> {
                 let d = dir_from_str(dir)?;
-                Ok(match s.0.borrow().find_target(d, entry, stop, min_rr, min_sig) {
-                    Some((price, id, rr)) => {
-                        let mut m = Map::new();
-                        m.insert("price".into(), price.into());
-                        m.insert("level_id".into(), id.into());
-                        m.insert("rr".into(), rr.into());
-                        Dynamic::from_map(m)
-                    }
-                    None => Dynamic::UNIT,
-                })
+                let sc = s.0.borrow();
+                Ok(sc
+                    .find_target(sc.base_tf(), d, entry, stop, min_rr, min_sig)
+                    .map_or(Dynamic::UNIT, target_map))
+            },
+        )
+        .register_fn(
+            "find_target",
+            |s: &mut ScanHandle, dir: &str, entry: f64, stop: f64, min_rr: f64, min_sig: f64, tf: &str|
+             -> Result<Dynamic, Box<EvalAltResult>> {
+                let d = dir_from_str(dir)?;
+                Ok(s.0
+                    .borrow()
+                    .find_target(tf_of(tf), d, entry, stop, min_rr, min_sig)
+                    .map_or(Dynamic::UNIT, target_map))
             },
         )
         // Gaps.
@@ -3084,5 +3146,86 @@ mod trace_tests {
                 assert!(next["run"].as_str().unwrap().starts_with(&format!("L{to}.")));
             }
         }
+    }
+}
+
+/// The scanner's level queries read one timeframe's view; without a
+/// timeframe they read the base timeframe's, which holds every list.
+#[cfg(test)]
+mod scanner_api_tests {
+    use super::*;
+
+    const CFG: &str = r#"#{
+        primitives: #{ atr_period: 3, swing_lookback: 1, fvg_min_gap_pct: 0, structure_min_displacement_atr: 0 },
+        significance: #{ base: #{ swing_high: 1 } },
+        levels: #{ cluster_atr_tolerance: 0.5, decay_candles: 500 },
+        sweep: #{ noise_atr: 0, max_multi_candle: 3 },
+        fvg: #{ cap: 500 },
+    }"#;
+
+    #[test]
+    fn level_queries_take_a_timeframe_view_and_default_to_the_base() {
+        let mut engine = Engine::new();
+        register_scanner_api(&mut engine);
+        let script = format!(
+            r#"
+            let s = scanner({CFG});
+            let a = s.add_level(105.0, "BSL", "swing_high", "15m", 0, 1, 0.0);
+            let b = s.add_level(103.0, "BSL", "swing_high", "1m", 0, 1, 0.0);
+            #{{ base: s.nearest_above(100.0), m15: s.nearest_above(100.0, "15m"),
+                below15: s.nearest_below(110.0, "15m"),
+                lv: s.level(a), lb: s.level(b),
+                live15: s.is_live(b, "15m"), live1: s.is_live(b, "1m"), a1: s.is_live(a, "1m"),
+                t15: s.find_target("bull", 100.0, 99.0, 2.0, 0.0, "15m"),
+                tb: s.find_target("bull", 100.0, 99.0, 2.0, 0.0),
+                n15: s.levels_beyond("BSL", 100.0, 0.0, "15m").len(),
+                nb: s.levels_beyond("BSL", 100.0, 0.0).len() }}
+            "#
+        );
+        let r: Map = engine.eval(&script).unwrap();
+        let f = |k: &str| r[k].as_float().unwrap();
+        assert_eq!(f("base"), 103.0, "the base view reads the 1m list");
+        assert_eq!(f("m15"), 105.0, "the 15m view does not");
+        assert!(r["below15"].is_unit(), "both levels are buy-side");
+        let lv = r["lv"].clone().cast::<Map>();
+        assert_eq!(lv["list"].clone().into_string().unwrap(), "15m");
+        assert_eq!(lv["status"].clone().into_string().unwrap(), "active");
+        assert!(lv["swept_on"].clone().cast::<Array>().is_empty());
+        assert_eq!(r["lb"].clone().cast::<Map>()["list"].clone().into_string().unwrap(), "1m");
+        assert!(!r["live15"].as_bool().unwrap());
+        assert!(r["live1"].as_bool().unwrap());
+        assert!(r["a1"].as_bool().unwrap(), "a 1m bar reads the 15m list");
+        assert_eq!(r["t15"].clone().cast::<Map>()["price"].as_float().unwrap(), 105.0);
+        assert_eq!(r["tb"].clone().cast::<Map>()["price"].as_float().unwrap(), 103.0);
+        assert_eq!(r["n15"].as_int().unwrap(), 1);
+        assert_eq!(r["nb"].as_int().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_sweep_names_its_timeframe_and_the_level_list() {
+        let engine = Engine::new();
+        let m: Map = engine.eval(CFG).unwrap();
+        let cfg: ScannerCfg = rhai::serde::from_dynamic(&Dynamic::from_map(m)).unwrap();
+        let mut sc = Scanner::new(cfg);
+        let (m1, m15) = (tf_id("1m"), tf_id("15m"));
+        let id = sc.add_level_named(105.0, Side::Bsl, "swing_high", m15, 0, 1, 0.0);
+        let bar = |min: i64, high: f64| Candle {
+            asset: 0,
+            timeframe: m1,
+            timestamp: chrono::DateTime::from_timestamp(min * 60, 0).unwrap().naive_utc(),
+            open: 100.0,
+            high,
+            low: 99.0,
+            close: 100.0,
+            volume: 0.0,
+            complete: true,
+        };
+        sc.process(&bar(1, 106.0));
+        let ev = sc.process(&bar(2, 101.0));
+        let sw = ev.sweeps.iter().find(|s| s.level_id == id).expect("a 1m sweep");
+        let m = sweep_map(sw);
+        assert_eq!(m["tf"].clone().into_string().unwrap(), "1m");
+        assert_eq!(m["level_tf"].clone().into_string().unwrap(), "15m");
+        assert_eq!(m["level_list"].clone().into_string().unwrap(), "15m");
     }
 }

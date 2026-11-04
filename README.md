@@ -399,6 +399,15 @@ clustering, a ranked draw-on-liquidity map and a UTC day tracker. Every
 table it uses (source significance, timeframe multipliers, session hours,
 caps, cadences) comes from the script.
 
+Levels are kept in one list per candle timeframe plus a session list. A bar
+on timeframe T sweeps levels from its own list, every longer timeframe's,
+and the session list, and only levels that existed when the bar opened; a
+15m bar never sweeps a 1m level. Each timeframe sweeps a level at most once,
+so a 1m wick through a 15m level is a 1m sweep and the level stays live for
+15m. A new level that falls within tolerance of a longer-timeframe level
+takes that level's identity, never the other way round. The `Scanner` docs
+in `src/liquidity.rs` give the full rules.
+
 A script opts in by putting a scanner in its state and replacing
 `on_candle` with event hooks; the engine steps the scanner on every candle
 and calls the script only on bars that carry a sweep or a structure break,
@@ -433,8 +442,10 @@ fn emit(c, atr, cand) {                   // scoring, after the rebuild; () drop
 `scripts/rhai/sweep_fvg.rhai` with `config/strategy/example_sweep.toml` is
 the bundled demonstration: a swept session or period level, the first gap
 after it, entered on the retrace, targeting the nearest opposing level. The
-queries a script has: `significance`, `add_level`, `level`,
-`levels_beyond`, `nearest_above` / `nearest_below`, `find_target`, `fvg`,
+queries a script has: `significance`, `add_level`, `level`, `is_live`,
+`levels_beyond`, `nearest_above` / `nearest_below`, `find_target` (the level
+queries take an optional trailing timeframe naming the view, default the
+base timeframe's), `fvg`,
 `fvg_status`, `fvgs_since`, `fvg_first`, `draw_map`, `draw_bias`, `day`,
 `day_high` / `day_low`, `last_atr`, `candle_count`, `stats`; an `on_day(c,
 prev)` hook reports each completed UTC day; `wake_book(true)` asks for
@@ -557,16 +568,16 @@ and gaps from zero again. Scripts add their own runs (`D{id}`, `W{id}` ...).
 
 | Kind | Node | `v` |
 |---|---|---|
-| `lv.birth` | `period`, `sess`, `swing`, `x_script_level` | `lid, price, side, source, ltf, lts, touch, sig, atr, merge_checked, tol` |
-| `lv.merge` | `merge` | `lid, price, in_price, in_source, in_tf, dist, tol, touch_before, touch, sig_before, sig` |
-| `lv.expire` | `expq` | `lid, decay, decay_candles, divisor` |
+| `lv.birth` | `period`, `sess`, `swing`, `x_script_level` | `lid, price, side, source, ltf, lts, touch, sig, atr, merge_checked, tol, list, born` (`list`: the level's timeframe list, or `session`; `born`: when it became known) |
+| `lv.merge` | `merge` | `lid, price, in_price, in_source, in_tf, dist, tol, touch_before, touch, sig_before, sig, list, in_list, cross_list`, and `in_lid` when an existing shorter-timeframe level was absorbed. A `cross_list` merge changes nothing on the kept level. |
+| `lv.expire` | `expq` | `lid, decay, decay_candles, divisor, list` |
 | `lv.prune` | `expired` | `removed, kept` |
 | `lv.refresh` (full) | `decay` | `lid, dist, thr` |
 | `lv.rebuild` | `""` | `epoch_from, epoch_to, tape_bars, levels_before, levels_after` |
-| `sw.cross` | `crossq` | `lid, side, level, extreme, atr, noise_atr, min_cross, line, sig, min_sig` |
+| `sw.cross` | `crossq` | `lid, side, level, extreme, atr, noise_atr, min_cross, line, sig, min_sig, tf, level_list, level_born` |
 | `sw.dev` | `dev` | `count, extreme, extreme_ts, extended` |
 | `sw.done` | `doneq` | `count, max_multi, how` (`o`: `next_bar`, or `yes` with `how` `held` / `back_in`) |
-| `sw.final` | `sweep` | the sweep's fields (`level_id, level_price, level_source, level_sig, level_side, dir, start_ts, extreme_ts, extreme_price, magnitude_atr, level_formed_at`) plus `atr` |
+| `sw.final` | `sweep` | the sweep's fields (`level_id, level_price, level_source, level_sig, level_side, dir, start_ts, extreme_ts, extreme_price, magnitude_atr, level_formed_at`) plus `atr, tf, level_tf, level_list, spent`. A level is swept at most once per timeframe that reads it; `spent` is true when this sweep leaves it swept in every such view, which is when it leaves the registry. |
 | `fvg.new`, `fvg.status` (full) | `x_fvg` | `id, dir, tf, ts, near, far, ce, status, is_ifvg, c1_stop` (`o`: `new`, `mitigated`, `filled`, `inverted`, `cap`) |
 | `st.break` | `x_break` | `tf, ts, level, dir` |
 | `hook` | `bar` | `o, h, l, c, atr, sweeps` (swept level ids), `breaks` (count), `wake` (true on a wake-only call) |
