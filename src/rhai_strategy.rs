@@ -2720,3 +2720,374 @@ mod target_tests {
         );
     }
 }
+
+/// Decision traces: tracing reads, never writes back.
+///
+/// The property that makes a trace usable is that it describes the run that
+/// would have happened anyway. These tests run one script with and without a
+/// trace sink, batch and streaming, and compare the JSON reports byte for
+/// byte; then they check what the trace itself contains.
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use crate::models::asset_id;
+    use crate::paper::PaperTrader;
+    use crate::session::{self, Session};
+    use crate::strategy::MarketData;
+    use crate::trace::{AssetStats, Detail, TraceConfig, TraceSink};
+    use serde_json::Value as J;
+    use tempfile::TempDir;
+
+    /// A scanner script that turns every sweep into a limit entry at the
+    /// sweep's midpoint, and calls `trace()` from `on_bar`, `emit`, `admit`
+    /// and `on_trace_snapshot`.
+    const SCRIPT: &str = r#"
+        fn init(cfg) {
+            #{ scan: scanner(#{
+                   primitives: #{ atr_period: 14, swing_lookback: 3, fvg_min_gap_pct: 0.0,
+                                  structure_min_displacement_atr: 0.5 },
+                   significance: #{ base: #{ pdh: 4.0, pdl: 4.0, session_high: 3.0, session_low: 3.0,
+                                             swing_high: 1.0, swing_low: 1.0 },
+                                    default_score: 1.0, touch_bonus: [[2, 1.0]] },
+                   levels: #{ cluster_atr_tolerance: 0.3, decay_candles: 300.0, refresh_atr: 0.5,
+                              decay_every: 10, prune_every: 50 },
+                   sweep: #{ noise_atr: 0.5, max_multi_candle: 3, min_level_sig: 1.0 },
+                   sessions: #{ enabled: true, tz_offset_secs: -18000,
+                                sessions: [#{ name: "ny", start_hour: 9, end_hour: 16 }] },
+                   fvg: #{ cap: 500 },
+                   draw: #{ enabled: true, every: 15, dist_cap_atr: 20.0, sweep_window_secs: 3600,
+                            boost_min_magnitude: 1.0, boost: 1.5, quantum_atr: 0.1,
+                            sources: #{ pdh: 6.0, pdl: 6.0 }, top_min_sig: 3.0, tie_atr: 0.3,
+                            hysteresis: 1.1, hysteresis_tol_atr: 0.1, keep: 10, one_sided_n: 5 },
+               }),
+               n: 0, tr: tracing(), cfg_trace: cfg.trace, snaps: 0, rebuilds: 0 }
+        }
+        fn on_bar(c, atr, sweeps, breaks) {
+            let out = [];
+            for sw in sweeps {
+                if this.tr {
+                    trace("t.sweep", "x_t", sw, #{ sig: sw.level_sig, o: "pass", p: "L",
+                          cmp: [#{ l: "sig", lv: sw.level_sig, op: ">=", r: "min", rv: 1.0, ok: true }] });
+                }
+                let entry = (sw.level_price + sw.extreme_price) / 2.0;
+                out.push(#{ dir: sw.dir, tf: c.tf, entry: entry, stop: sw.extreme_price, sig: sw.level_sig });
+            }
+            out
+        }
+        fn emit(c, atr, cand) {
+            this.n += 1;
+            let o = opp("t_" + cand.dir, cand.tf, cand.dir, c.ts);
+            o.id = "t" + this.n;
+            o.entry = cand.entry;
+            o.stop = cand.stop;
+            o.score = cand.sig;
+            if this.tr { trace("t.emit", "minq", "O" + o.id, #{ score: o.score, nothing: nan() }); }
+            o
+        }
+        fn admit(o, ctx) {
+            let risk = (o.entry - o.stop).abs();
+            if this.tr { trace("t.admit", "g_x", "O" + o.id, #{ risk: risk, o: if risk > 0.0 { "pass" } else { "skip" } }); }
+            if risk <= 0.0 { return skip("non_positive_risk"); }
+            if o.score < 1.5 { return skip("low_sig"); }
+            let tp = if o.direction == "bull" { o.entry + 2.0 * risk } else { o.entry - 2.0 * risk };
+            take(o.entry, o.stop, tp)
+        }
+        fn on_trace_snapshot(ts) {
+            if this.tr { trace("snap.script", "", "", #{ n: this.n }); }
+        }
+        fn on_rebuild(ts) { this.rebuilds += 1; }
+    "#;
+
+    const DAY: i64 = 1440;
+
+    /// Deterministic 1m bars: a random walk with an occasional spike, so
+    /// swings form and get swept.
+    fn bars(aid: u16, from_min: i64, to_min: i64) -> Vec<Candle> {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (x >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut close = 100.0;
+        let mut out = Vec::new();
+        for m in 0..to_min {
+            let (u1, u2, u3, u4) = (next(), next(), next(), next());
+            let o = close;
+            let c = o + (u1 - 0.5) * 0.6 + ((m as f64) / 900.0).sin() * 0.02;
+            let mut h = o.max(c) + u2 * 0.3;
+            let mut l = o.min(c) - u3 * 0.3;
+            if u4 < 0.004 {
+                h += 1.5;
+            } else if u4 > 0.996 {
+                l -= 1.5;
+            }
+            close = c;
+            if m < from_min {
+                continue;
+            }
+            out.push(Candle {
+                asset: aid,
+                timeframe: crate::models::base_tf_id(),
+                timestamp: chrono::DateTime::from_timestamp(m * 60, 0).unwrap().naive_utc(),
+                open: o,
+                high: h,
+                low: l,
+                close: c,
+                volume: 1.0,
+                complete: true,
+            });
+        }
+        out
+    }
+
+    fn tcfg(dir: &Path, from_day: i64, to_day: i64, detail: Detail) -> TraceConfig {
+        TraceConfig {
+            dir: dir.to_path_buf(),
+            from: from_day * DAY * 60,
+            to: to_day * DAY * 60,
+            detail,
+            max_bytes: 1 << 30,
+        }
+    }
+
+    struct Run {
+        json: String,
+        trades: usize,
+        stats: Option<AssetStats>,
+    }
+
+    /// One asset through a Session, batch or streaming, traced or not.
+    fn run(name: &str, days: i64, params: &crate::params::Params, trace: Option<&TraceConfig>, streaming: bool) -> Run {
+        let _ = crate::params::register_knobs(RHAI_KNOBS);
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("s.rhai");
+        std::fs::write(&path, SCRIPT).unwrap();
+        let aid = asset_id(name);
+        let candles = bars(aid, 0, days * DAY);
+        let tfs = vec!["5m".to_string(), "15m".to_string()];
+
+        let mut market = MarketData::new();
+        market.insert(name, if streaming { SharedSeries::default() } else { SharedSeries::new(candles.clone()) });
+        let th = trace.map(|c| TraceSink::open(c, name));
+        let strategy = RhaiStrategy::new_traced(
+            &path,
+            name,
+            params,
+            None,
+            &tfs,
+            200,
+            market.series.clone(),
+            &toml::value::Table::new(),
+            th.clone(),
+        )
+        .unwrap();
+        let mut session = Session::new(market, streaming, false);
+        session.add_asset(name, Box::new(strategy), &tfs, PaperTrader::new(0.0, 2.0, 300));
+        if let Some(h) = &th {
+            session.attach_trace(name, h.clone());
+        }
+        if streaming {
+            session::push_sorted(&mut session, &candles);
+        } else {
+            for c in &candles {
+                assert!(session.push(c).is_empty(), "events come back only with record_events");
+            }
+        }
+        let (_, pt) = session.finish().pop().unwrap();
+        Run {
+            json: pt.render_json("trace test"),
+            trades: pt.trades.len(),
+            stats: th.map(|h| h.finish()),
+        }
+    }
+
+    fn records(dir: &Path, name: &str) -> Vec<J> {
+        let text = std::fs::read_to_string(dir.join(TraceConfig::file_name(name))).unwrap();
+        text.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    #[test]
+    fn trace_on_and_off_book_identical_trades() {
+        let p = crate::params::Params::new();
+        let off = run("TR_ID", 6, &p, None, false);
+        assert!(off.trades > 5, "the fixture must trade to prove anything, got {}", off.trades);
+        for detail in [Detail::Basic, Detail::Full] {
+            let d = TempDir::new().unwrap();
+            let c = tcfg(d.path(), 1, 5, detail);
+            let on = run("TR_ID", 6, &p, Some(&c), false);
+            assert!(on.stats.as_ref().unwrap().records > 100);
+            assert!(on.json == off.json, "batch, {detail:?}: traced report differs");
+
+            let d2 = TempDir::new().unwrap();
+            let c2 = tcfg(d2.path(), 1, 5, detail);
+            let st = run("TR_ID", 6, &p, Some(&c2), true);
+            assert!(st.json == off.json, "streaming, {detail:?}: traced report differs");
+            assert_eq!(
+                std::fs::read(d.path().join(TraceConfig::file_name("TR_ID"))).unwrap().len(),
+                std::fs::read(d2.path().join(TraceConfig::file_name("TR_ID"))).unwrap().len(),
+                "batch and streaming traces carry the same records"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_records_levels_and_sweeps() {
+        let p = crate::params::Params::new();
+        let d = TempDir::new().unwrap();
+        let c = tcfg(d.path(), 1, 4, Detail::Full);
+        run("TR_REC", 4, &p, Some(&c), false);
+        let recs = records(d.path(), "TR_REC");
+        let mut last_b = i64::MIN;
+        for (i, r) in recs.iter().enumerate() {
+            let b = r["b"].as_i64().unwrap();
+            assert!(b >= last_b, "b went backwards at record {i}");
+            last_b = b;
+            assert_eq!(r["q"].as_i64().unwrap(), i as i64, "q is the line number");
+            for key in ["k", "n", "t", "tf", "ph", "run", "v"] {
+                assert!(r.get(key).is_some(), "record {i} lacks {key}");
+            }
+        }
+        let kinds: std::collections::BTreeSet<&str> = recs.iter().map(|r| r["k"].as_str().unwrap()).collect();
+        for k in [
+            "snap.levels", "snap.dev", "snap.script", "lv.birth", "lv.merge", "lv.expire", "lv.prune",
+            "lv.refresh", "sw.cross", "sw.dev", "sw.done", "sw.final", "hook", "st.break",
+            "fvg.new", "fvg.status", "cx.draw", "cx.day", "adm.result", "book.entry_placed",
+            "t.sweep", "t.emit", "t.admit",
+        ] {
+            assert!(kinds.contains(k), "no {k} record; kinds: {kinds:?}");
+        }
+        // Lifted keys and run formats.
+        let sw = recs.iter().find(|r| r["k"] == "t.sweep").unwrap();
+        assert_eq!(sw["o"], "pass");
+        assert_eq!(sw["p"], "L");
+        assert_eq!(sw["cmp"][0]["op"], ">=");
+        assert!(sw["v"].get("o").is_none() && sw["v"].get("cmp").is_none());
+        assert!(sw["run"].as_str().unwrap().starts_with("S0."));
+        let em = recs.iter().find(|r| r["k"] == "t.emit").unwrap();
+        assert!(em["v"]["nothing"].is_null(), "NaN serializes as null");
+        assert_eq!(em["ph"], "emit");
+        let adm = recs.iter().find(|r| r["k"] == "adm.result").unwrap();
+        assert_eq!(adm["ph"], "admit");
+        assert!(adm["run"].as_str().unwrap().starts_with("Ot"));
+        let fin = recs.iter().find(|r| r["k"] == "sw.final").unwrap();
+        let run_id = fin["run"].as_str().unwrap();
+        assert!(recs.iter().any(|r| r["k"] == "sw.cross" && r["run"] == run_id), "a final's crossing is traced under the same run");
+        let birth = recs.iter().find(|r| r["k"] == "lv.birth" && r["v"]["source"] == "pdh");
+        if let Some(b) = birth {
+            assert_eq!(b["n"], "period");
+            assert_eq!(b["v"]["merge_checked"], false);
+        }
+        assert!(recs.iter().any(|r| r["k"].as_str().unwrap().starts_with("book.") && r["ph"] == "book"));
+    }
+
+    #[test]
+    fn trace_window_excludes_warmup() {
+        let p = crate::params::Params::new();
+        let d = TempDir::new().unwrap();
+        let c = tcfg(d.path(), 2, 3, Detail::Basic);
+        run("TR_WIN", 4, &p, Some(&c), false);
+        let recs = records(d.path(), "TR_WIN");
+        assert_eq!(recs[0]["k"], "snap.levels", "the trace opens with a snapshot");
+        assert_eq!(recs[0]["b"].as_i64().unwrap(), c.from);
+        assert!(recs.iter().all(|r| {
+            let b = r["b"].as_i64().unwrap();
+            b >= c.from && b < c.to
+        }));
+        assert!(!recs[0]["v"]["levels"].as_array().unwrap().is_empty(), "warmup state shows in the first snapshot");
+    }
+
+    #[test]
+    fn trace_io_failure_does_not_abort() {
+        let p = crate::params::Params::new();
+        let off = run("TR_IO", 3, &p, None, false);
+        let d = TempDir::new().unwrap();
+        let blocker = d.path().join("a-file");
+        std::fs::write(&blocker, "x").unwrap();
+        let c = tcfg(&blocker.join("trace"), 0, 3, Detail::Full);
+        let on = run("TR_IO", 3, &p, Some(&c), false);
+        let st = on.stats.unwrap();
+        assert!(st.failed);
+        assert_eq!(st.records, 0);
+        assert!(on.json == off.json);
+    }
+
+    #[test]
+    fn tracing_is_false_without_flag() {
+        let _ = crate::params::register_knobs(RHAI_KNOBS);
+        let script = r#"
+            fn init(cfg) { #{ at_init: tracing(), cfg_trace: cfg.trace, per_bar: false, snaps: 0 } }
+            fn on_candle(c) { if tracing() { this.per_bar = true; } [] }
+            fn on_trace_snapshot(ts) { this.snaps += 1; }
+        "#;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("s.rhai");
+        std::fs::write(&path, script).unwrap();
+        let state = |trace: Option<TraceHandle>, name: &str| {
+            let aid = asset_id(name);
+            let mut s = RhaiStrategy::new_traced(
+                &path, name, &crate::params::Params::new(), None, &[], 10, HashMap::new(),
+                &toml::value::Table::new(), trace.clone(),
+            )
+            .unwrap();
+            for c in bars(aid, 0, 3 * DAY) {
+                if let Some(t) = &trace {
+                    t.set_bar(&c);
+                }
+                s.on_candle(&c);
+            }
+            let st = s.state.borrow();
+            let m = st.read_lock::<Map>().unwrap();
+            (
+                m["at_init"].as_bool().unwrap(),
+                m["cfg_trace"].as_bool().unwrap(),
+                m["per_bar"].as_bool().unwrap(),
+                m["snaps"].as_int().unwrap(),
+            )
+        };
+        assert_eq!(state(None, "TR_FLAG_OFF"), (false, false, false, 0));
+        let d = TempDir::new().unwrap();
+        let c = tcfg(d.path(), 1, 2, Detail::Basic);
+        let (at_init, cfg_trace, per_bar, snaps) = state(Some(TraceSink::open(&c, "TR_FLAG_ON")), "TR_FLAG_ON");
+        assert!(at_init && cfg_trace && per_bar);
+        assert_eq!(snaps, 1, "one snapshot: the first in-window bar, nothing at the window-end midnight");
+    }
+
+    #[test]
+    fn trace_epoch_advances_on_rebuild_and_a_snapshot_follows() {
+        let _ = crate::params::register_knobs(RHAI_KNOBS);
+        let mut p = crate::params::Params::new();
+        p.set("rebuild_from_scratch_days", crate::params::Value::F64(32.0));
+        p.set("rebuild_interval_hours", crate::params::Value::F64(168.0));
+        let off = run("TR_RB", 56, &p, None, false);
+        let d = TempDir::new().unwrap();
+        let c = tcfg(d.path(), 33, 50, Detail::Basic);
+        let on = run("TR_RB", 56, &p, Some(&c), false);
+        assert!(on.json == off.json, "a traced rebuilding run books the same trades");
+
+        let recs = records(d.path(), "TR_RB");
+        let rb: Vec<usize> = recs.iter().enumerate().filter(|(_, r)| r["k"] == "lv.rebuild").map(|(i, _)| i).collect();
+        assert!(rb.len() >= 2, "17 traced days at a weekly cadence rebuild at least twice, got {}", rb.len());
+        let mut last_epoch = None;
+        for &i in &rb {
+            let r = &recs[i];
+            let (from, to) = (r["v"]["epoch_from"].as_i64().unwrap(), r["v"]["epoch_to"].as_i64().unwrap());
+            assert_eq!(to, from + 1);
+            if let Some(prev) = last_epoch {
+                assert_eq!(from, prev, "epochs are consecutive");
+            }
+            last_epoch = Some(to);
+            assert_eq!(r["ph"], "rebuild");
+            assert_eq!(recs[i + 1]["k"], "snap.levels");
+            assert_eq!(recs[i + 1]["v"]["epoch"].as_i64().unwrap(), to);
+            assert_eq!(recs[i + 2]["k"], "snap.dev");
+            // Level and sweep runs after the rebuild carry the new epoch.
+            if let Some(next) = recs[i + 1..]
+                .iter()
+                .take_while(|x| x["k"] != "lv.rebuild")
+                .find(|x| x["k"] == "lv.birth")
+            {
+                assert!(next["run"].as_str().unwrap().starts_with(&format!("L{to}.")));
+            }
+        }
+    }
+}
