@@ -821,8 +821,12 @@ pub fn load_strategy(path: &Path, context: Context) -> Result<ResolvedStrategy, 
 pub fn parse_asset_map(items: &[String], malformed_default: f64) -> HashMap<String, f64> {
     items
         .iter()
+        // Split on the LAST ':' — asset names carry their own colon
+        // (`xyz:CL:5.27` is asset `xyz:CL`, value 5.27). Splitting on the
+        // first one turned every xyz entry into key `xyz` with an
+        // unparseable value, i.e. 0 for every xyz asset.
         .filter_map(|s| {
-            s.split_once(':')
+            s.rsplit_once(':')
                 .map(|(a, v)| (a.to_string(), v.parse().unwrap_or(malformed_default)))
         })
         .collect()
@@ -833,7 +837,7 @@ pub fn parse_asset_signals(items: &[String]) -> Vec<(String, String)> {
     items
         .iter()
         .filter_map(|s| {
-            s.split_once(':')
+            s.rsplit_once(':')
                 .map(|(a, b)| (a.to_string(), b.to_string()))
         })
         .collect()
@@ -1386,6 +1390,22 @@ rr = 2.0
             Some(&9.0),
             "malformed takes the caller's fallback"
         );
+    }
+
+    #[test]
+    fn asset_map_keys_keep_the_assets_own_colon() {
+        let items = vec!["xyz:CL:5.27".to_string(), "xyz:SP500:1.48".to_string(), "CL:2".to_string()];
+        let m = parse_asset_map(&items, 0.0);
+        assert_eq!(m.get("xyz:CL"), Some(&5.27));
+        assert_eq!(m.get("xyz:SP500"), Some(&1.48));
+        assert_eq!(m.get("CL"), Some(&2.0));
+        assert!(m.get("xyz").is_none(), "no collapsed `xyz` key");
+    }
+
+    #[test]
+    fn asset_signal_pairs_keep_the_assets_own_colon() {
+        let items = vec!["xyz:CL:ifvg_bull".to_string()];
+        assert_eq!(parse_asset_signals(&items), vec![("xyz:CL".to_string(), "ifvg_bull".to_string())]);
     }
 
     #[test]
