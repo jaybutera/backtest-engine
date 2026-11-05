@@ -1630,6 +1630,10 @@ fn register_api(engine: &mut Engine) {
         .register_set("stop", |o: &mut ScriptOpp, v: f64| o.inner.stop = Some(v))
         .register_get("target", |o: &mut ScriptOpp| opt_f64(o.inner.target))
         .register_set("target", |o: &mut ScriptOpp, v: f64| o.inner.target = Some(v))
+        .register_get("ready_at", |o: &mut ScriptOpp| -> Dynamic {
+            o.inner.ready_at.map(|t| Dynamic::from(ndt_secs(t))).unwrap_or(Dynamic::UNIT)
+        })
+        .register_set("ready_at", |o: &mut ScriptOpp, v: i64| o.inner.ready_at = Some(secs_to_ndt(v)))
         .register_get("developing", |o: &mut ScriptOpp| o.inner.developing)
         .register_set("developing", |o: &mut ScriptOpp, v: bool| o.inner.developing = v)
         .register_get("meta", |o: &mut ScriptOpp| o.meta.clone())

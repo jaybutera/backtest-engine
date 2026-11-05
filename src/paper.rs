@@ -302,6 +302,12 @@ pub struct PaperTrader {
     /// slightly optimistic if the touch printed in those first seconds; 120 =
     /// strictly honest (a full spare bar).
     pub rest_min_lead_secs: i64,
+    /// rest-on-Ready lens only: when a rested-maker signal-bar fill's bar also
+    /// reached the stop, close it on that same bar as a stop-loss (at the stop,
+    /// stop gap applied) instead of racing it from the next bar. Intrabar
+    /// order is unknowable from OHLC; this is the stop-first reading
+    /// (`intrabar_stop_first`). Default false = the old behaviour.
+    pub rest_fill_bar_stop_exit: bool,
     // ─── De-risk exit (trade management, default OFF) ─────────────────────────
     /// After a trade has been open for more than this many 1m bars (≈ minutes),
     /// if its unrealized R at the bar close is below `derisk_below_r`, close it
@@ -919,6 +925,7 @@ impl PaperTrader {
             pending: Vec::new(),
             rest_on_ready_fill: false,
             rest_min_lead_secs: 60,
+            rest_fill_bar_stop_exit: false,
             // De-risk exit OFF by default.
             derisk_after_min: 0,
             derisk_below_r: 0.0,
@@ -997,7 +1004,13 @@ impl PaperTrader {
             }
         };
 
-        self.place_order(opp, take)
+        let placed = self.place_order(opp, take);
+        // Carry the strategy's Ready stamp onto the resting limit so the
+        // rest-on-ready lens can see it. A no-op for any other lens.
+        if placed.is_some() && opp.ready_at.is_some() {
+            self.annotate_last_pending(opp.ready_at, None);
+        }
+        placed
     }
 
     /// Convenience wrapper: admit `opp` with `strategy` and place the order if
@@ -2028,7 +2041,21 @@ impl PaperTrader {
                         }
                         self.end_resting(&pf.trade.opportunity_id, candle.timestamp);
                         let entry_px = pf.trade.entry;
+                        let opp_id = pf.trade.opportunity_id.clone();
+                        let risk = (pf.trade.entry - pf.trade.stop).abs();
+                        let stop_px = pf.trade.stop;
+                        let dir = pf.trade.direction;
                         self.book_fill(pf.trade, entry_px, EntryFeeSide::Maker, candle.timestamp);
+                        if fill_bar_hit_stop && self.rest_fill_bar_stop_exit {
+                            self.close_fill_bar_stop(
+                                &opp_id,
+                                dir,
+                                entry_px,
+                                stop_px,
+                                risk,
+                                candle.timestamp,
+                            );
+                        }
                         continue;
                     }
                 }
@@ -2530,6 +2557,36 @@ impl PaperTrader {
         if let Some(idx) = closed_idx {
             self.closed_this_bar.push((idx, is_stop_exit));
         }
+    }
+
+    /// Close a trade that filled on THIS bar at its stop, on the same bar: the
+    /// `rest_fill_bar_stop_exit` path. Mirrors the race's stop close (loss
+    /// measured from the fill, ÷ R_planned; `close_trade` applies the stop
+    /// gap and the exit fee) and drops the fresh fill from `open_trades` so
+    /// the next bar does not race it again.
+    fn close_fill_bar_stop(
+        &mut self,
+        opp_id: &str,
+        direction: Direction,
+        fill: f64,
+        stop: f64,
+        risk: f64,
+        at: NaiveDateTime,
+    ) {
+        let r = if risk <= 0.0 {
+            -1.0
+        } else if direction == Direction::Bull {
+            (stop - fill) / risk
+        } else {
+            (fill - stop) / risk
+        };
+        self.close_trade(opp_id, TradeResult::Loss, r, at, ExitReason::Stop);
+        self.open_trades.retain(|t| t.opportunity_id != opp_id);
+        self.watermarks.remove(opp_id);
+        self.partial_taken.remove(opp_id);
+        self.entry_fee_side.remove(opp_id);
+        self.stop_overrides.remove(opp_id);
+        self.hold_counts.remove(opp_id);
     }
 
     /// Book a market entry at this bar's close, on behalf of a strategy's
@@ -4814,6 +4871,53 @@ mod fill_model_tests {
             "got {}",
             pt.trades[0].r_pnl
         );
+    }
+
+    #[test]
+    fn rest_fill_bar_stop_exit_closes_a_touch_and_stop_bar_as_a_loss() {
+        // T touches the entry AND the stop. Knob off: the fill is raced from
+        // the next bar, so a recovery bar lets it survive. Knob on: it closes
+        // on T at the stop, -1R before fees.
+        for knob in [false, true] {
+            let mut pt = hybrid_pt();
+            pt.rest_on_ready_fill = true;
+            pt.rest_fill_bar_stop_exit = knob;
+            place_with_ready(&mut pt, base_trade(Direction::Bull, 100.0, 90.0, 130.0), 60);
+            pt.update_prices(&candle(0, 100.5, 101.0, 89.0, 95.0)); // E then S in one bar
+            assert_eq!(pt.opportunities_taken, 1);
+            if knob {
+                assert_eq!(pt.losses(), 1, "closed on the fill bar");
+                assert!(pt.open_trades.is_empty());
+                assert!(
+                    (pt.trades[0].r_pnl + 1.0).abs() < 1e-9,
+                    "got {}",
+                    pt.trades[0].r_pnl
+                );
+                pt.update_prices(&candle(1, 95.0, 131.0, 94.0, 130.0));
+                assert_eq!(pt.wins(), 0, "a closed trade is not raced again");
+            } else {
+                assert_eq!(pt.losses(), 0, "old behaviour: not raced on T");
+                pt.update_prices(&candle(1, 95.0, 131.0, 94.0, 130.0));
+                assert_eq!(pt.wins(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn evaluate_carries_opportunity_ready_at_onto_the_pending_limit() {
+        let mut pt = hybrid_pt();
+        pt.rest_on_ready_fill = true;
+        let t0 = candle(0, 100.5, 101.0, 99.5, 100.2).timestamp;
+        let mut opp =
+            Opportunity::new("x", "BTC", "1m", Direction::Bull, t0).with_entry_stop(100.0, 90.0);
+        opp.ready_at = Some(t0 - chrono::Duration::seconds(60));
+        let take = TakeParams {
+            entry: 100.0,
+            stop: 90.0,
+            tp: 130.0,
+        };
+        assert!(pt.evaluate(&opp, &Decision::Take(take)).is_some());
+        assert_eq!(pt.pending.last().unwrap().ready_at, opp.ready_at);
     }
 
     #[test]

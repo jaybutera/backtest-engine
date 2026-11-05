@@ -300,6 +300,11 @@ pub struct Opportunity {
     /// Optional explicit take-profit. When `Some`, `default_admit` uses it
     /// verbatim instead of projecting one from the reward:risk target.
     pub target: Option<f64>,
+    /// When the setup's entry and stop became final (the strategy's "Ready"),
+    /// which can precede `created_at`. Only the rest-on-ready fill lens reads
+    /// it: a resting limit placed at Ready may fill maker on the signal bar.
+    /// `None` = unknown, and that lens falls back to plain hybrid.
+    pub ready_at: Option<NaiveDateTime>,
 }
 
 impl Opportunity {
@@ -331,6 +336,7 @@ impl Opportunity {
             entry: None,
             stop: None,
             target: None,
+            ready_at: None,
         }
     }
 

@@ -357,6 +357,14 @@ pub static REGISTRY: &[Knob] = &[
          bar. Larger is stricter."
     ),
     knob!(
+        "rest_fill_bar_stop_exit",
+        Bool,
+        Value::Bool(false),
+        "rest-on-ready lens only: a maker fill booked on the signal bar whose \
+         bar also reached the stop closes on that bar as a stop-loss \
+         (stop-first), instead of being raced from the next bar."
+    ),
+    knob!(
         "tick_chase",
         Bool,
         Value::Bool(true),

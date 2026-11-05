@@ -111,6 +111,7 @@ const FILL_KEYS: &[&str] = &[
     "intrabar_stop_first",
     "exit_gap_at_open",
     "rest_min_lead_secs",
+    "rest_fill_bar_stop_exit",
     "tick_chase",
 ];
 
@@ -219,6 +220,7 @@ struct FillParams {
     deferred_chase_at_open: Option<bool>,
     past_entry_fee: Option<String>,
     rest_min_lead_secs: Option<i64>,
+    rest_fill_bar_stop_exit: Option<bool>,
     tick_chase: Option<bool>,
     /// Stop-exit gap penalty, bps of the stop price. See
     /// `ResolvedFill::stop_gap_bps_default`.
@@ -259,6 +261,10 @@ pub struct ResolvedFill {
     /// rest-on-Ready lens only: minimum Ready→touch lead (seconds) for the
     /// rested-maker signal-bar fill. See `PaperTrader::rest_min_lead_secs`.
     pub rest_min_lead_secs: i64,
+    /// rest-on-Ready lens only: a rested signal-bar fill whose bar also hit
+    /// the stop closes there as a stop-loss. See
+    /// `PaperTrader::rest_fill_bar_stop_exit`.
+    pub rest_fill_bar_stop_exit: bool,
     /// Tick lens only: model the live entry-chase on real tick order (a resting
     /// limit whose chase boundary is reached before the entry fills taker at the
     /// boundary). `true` = live-faithful default; `false` = pure resting maker
@@ -295,6 +301,7 @@ impl ResolvedFill {
             deferred_chase_at_open: false,
             past_entry_fee: "taker".to_string(),
             rest_min_lead_secs: 60,
+            rest_fill_bar_stop_exit: false,
             tick_chase: true,
             stop_gap_bps_default: 0.0,
             stop_gap_bps_asset: Vec::new(),
@@ -338,6 +345,9 @@ pub fn load_fill(path: &Path) -> Result<ResolvedFill, String> {
         deferred_chase_at_open: p.deferred_chase_at_open.unwrap_or(d.deferred_chase_at_open),
         past_entry_fee: p.past_entry_fee.unwrap_or(d.past_entry_fee),
         rest_min_lead_secs: p.rest_min_lead_secs.unwrap_or(d.rest_min_lead_secs),
+        rest_fill_bar_stop_exit: p
+            .rest_fill_bar_stop_exit
+            .unwrap_or(d.rest_fill_bar_stop_exit),
         tick_chase: p.tick_chase.unwrap_or(d.tick_chase),
         stop_gap_bps_default: p.stop_gap_bps_default.unwrap_or(d.stop_gap_bps_default),
         stop_gap_bps_asset: p.stop_gap_bps_asset.unwrap_or(d.stop_gap_bps_asset),

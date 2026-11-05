@@ -942,6 +942,7 @@ fn apply_config(pt: &mut PaperTrader, p: &params::Params, fill: &strategy_config
     pt.race_maker_first = fill.race_maker_first;
     pt.deferred_chase_at_open = fill.deferred_chase_at_open;
     pt.rest_min_lead_secs = fill.rest_min_lead_secs;
+    pt.rest_fill_bar_stop_exit = fill.rest_fill_bar_stop_exit;
     pt.tick_chase = fill.tick_chase;
     pt.past_entry_fee = if fill.past_entry_fee == "maker" {
         fees::EntryFeeSide::Maker
