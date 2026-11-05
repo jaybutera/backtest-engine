@@ -1401,14 +1401,28 @@ impl Scanner {
         }
         let at = |i: usize| &h[len - 1 - i];
         let cts = secs(at(lb));
-        let mut max_high = f64::NEG_INFINITY;
-        let mut min_low = f64::INFINITY;
-        for j in 0..(2 * lb + 1) {
-            max_high = max_high.max(at(j).high);
-            min_low = min_low.min(at(j).low);
-        }
+        // Tie-break: the centre must be STRICTLY beyond the lb bars to its
+        // left (older, j > lb) and at least level with the lb bars to its
+        // right (newer, j < lb). A run of equal extremes yields one swing, at
+        // its first bar, instead of one swing per tied bar.
         let ch = at(lb).high;
-        if ch == max_high && !self.swing_seen.contains(&(0, tf, cts)) {
+        let cl = at(lb).low;
+        let mut is_high = true;
+        let mut is_low = true;
+        for j in 0..(2 * lb + 1) {
+            if j == lb {
+                continue;
+            }
+            let (hj, lj) = (at(j).high, at(j).low);
+            if j > lb {
+                is_high &= hj < ch;
+                is_low &= lj > cl;
+            } else {
+                is_high &= hj <= ch;
+                is_low &= lj >= cl;
+            }
+        }
+        if is_high && !self.swing_seen.contains(&(0, tf, cts)) {
             out.push(Signal {
                 kind: SignalKind::SwingHigh,
                 tf,
@@ -1420,8 +1434,7 @@ impl Scanner {
                 c1_stop: 0.0,
             });
         }
-        let cl = at(lb).low;
-        if cl == min_low && !self.swing_seen.contains(&(1, tf, cts)) {
+        if is_low && !self.swing_seen.contains(&(1, tf, cts)) {
             out.push(Signal {
                 kind: SignalKind::SwingLow,
                 tf,
@@ -2421,6 +2434,27 @@ mod tests {
             timestamp: DateTime::from_timestamp(ts, 0).unwrap().naive_utc(),
             complete: true,
         }
+    }
+
+    #[test]
+    fn equal_swing_extremes_yield_one_swing_at_the_first_bar() {
+        // lookback 1. Bars 1 and 2 share low 9.0 and high 12.0: the old rule
+        // (centre == window extreme) marked both; only bar 1 is a swing now.
+        let sc = Scanner::new(cfg());
+        let bars = [
+            candle(0, 10.5, 11.0, 10.0, 10.5),
+            candle(60, 10.5, 12.0, 9.0, 10.0),
+            candle(120, 10.0, 12.0, 9.0, 10.0),
+            candle(180, 10.5, 11.0, 10.0, 10.5),
+        ];
+        let kinds = |w: &[Candle]| -> Vec<(SignalKind, i64)> {
+            let ring: VecDeque<Candle> = w.iter().cloned().collect();
+            sc.detect_swings(&ring, tf_id("1m")).iter().map(|s| (s.kind, s.ts)).collect()
+        };
+        let first = kinds(&bars[0..3]);
+        assert!(first.contains(&(SignalKind::SwingLow, 60)), "{first:?}");
+        assert!(first.contains(&(SignalKind::SwingHigh, 60)), "{first:?}");
+        assert!(kinds(&bars[1..4]).is_empty(), "tied second bar is not a swing");
     }
 
     #[test]
