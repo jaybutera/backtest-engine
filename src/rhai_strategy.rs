@@ -2842,6 +2842,7 @@ mod trace_tests {
             to: to_day * DAY * 60,
             detail,
             max_bytes: 1 << 30,
+            assets: Vec::new(),
         }
     }
 

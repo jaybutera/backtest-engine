@@ -163,6 +163,12 @@ pub struct ReplayArgs {
     /// the manifest records where (`truncated_at`).
     #[arg(long = "trace-max-mb", default_value = "512")]
     pub trace_max_mb: u64,
+
+    /// Trace only this asset (repeatable). Every asset still runs, from the
+    /// same first bar, so cross-asset state and the report are unchanged;
+    /// only the other assets' trace files are not written. Default: all.
+    #[arg(long = "trace-asset")]
+    pub trace_asset: Vec<String>,
 }
 
 /// Parse the process command line and run it against these factories.
@@ -305,7 +311,10 @@ impl ResolvedReplay<'_> {
 
     /// Open this asset's trace sink, when the run is traced.
     pub fn open_trace(&self, asset: &str) -> Option<TraceHandle> {
-        self.trace.as_ref().map(|c| TraceSink::open(c, asset))
+        self.trace
+            .as_ref()
+            .filter(|c| c.traces_asset(asset))
+            .map(|c| TraceSink::open(c, asset))
     }
 }
 
@@ -321,6 +330,9 @@ fn resolve_trace(
     let Some(dir) = args.trace.as_ref() else {
         if args.trace_to.is_some() {
             return Err("--trace-to needs --trace <dir>".to_string());
+        }
+        if !args.trace_asset.is_empty() {
+            return Err("--trace-asset needs --trace <dir>".to_string());
         }
         return Ok(None);
     };
@@ -345,6 +357,7 @@ fn resolve_trace(
         to,
         detail,
         max_bytes: args.trace_max_mb.saturating_mul(1 << 20),
+        assets: args.trace_asset.clone(),
     }))
 }
 
@@ -469,6 +482,12 @@ pub fn resolve<'f>(
     // Warmup extends the LOAD bound backwards without moving the REPORT bound.
     let load_start = window_start.map(|s| s - chrono::Duration::days(args.warmup_days as i64));
     let trace = resolve_trace(&args, load_start, window_end)?;
+    if let Some(unknown) = args.trace_asset.iter().find(|a| !assets.contains(a)) {
+        return Err(format!(
+            "--trace-asset {unknown} is not one of this run's assets ({})",
+            assets.join(", ")
+        ));
+    }
     let trace_run = trace::ManifestRun {
         strategy_file: args.config_strategy.as_ref().map(PathBuf::from),
         fill_file: args.config_fill.as_ref().map(PathBuf::from),

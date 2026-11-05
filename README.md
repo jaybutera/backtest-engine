@@ -498,6 +498,7 @@ for a replay viewer or a decision debugger:
 | `--trace-to <YYYY-MM-DD>` | `--to` | Last traced day, inclusive. |
 | `--trace-detail basic\|full` | `basic` | `full` adds `lv.refresh`, `fvg.*` and a `hook` record for every wake-only call. |
 | `--trace-max-mb <N>` | `512` | Byte budget per asset file. Past it the file stops and the manifest records `truncated_at`. |
+| `--trace-asset <ASSET>` | all | Trace only this asset (repeatable). Every asset still runs from the same first bar, so cross-asset reads and the report are unchanged; the other assets get no file and no manifest entry. The manifest lists the filter as `trace_assets`. |
 
 Tracing only reads. A traced run books the same trades as an untraced one,
 and the JSON report is byte-identical (`cmp` the two sidecars); the engine's

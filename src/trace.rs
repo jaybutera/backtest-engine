@@ -108,12 +108,20 @@ pub struct TraceConfig {
     pub detail: Detail,
     /// Byte budget per asset file.
     pub max_bytes: u64,
+    /// Assets to trace; empty = every asset. A filtered-out asset still
+    /// runs, it just gets no sink (and so no file and no manifest entry).
+    pub assets: Vec<String>,
 }
 
 impl TraceConfig {
     /// The file name an asset's trace is written to.
     pub fn file_name(asset: &str) -> String {
         format!("{}.trace.jsonl", asset.replace(':', "_"))
+    }
+
+    /// Whether this asset gets a trace sink.
+    pub fn traces_asset(&self, asset: &str) -> bool {
+        self.assets.is_empty() || self.assets.iter().any(|a| a == asset)
     }
 }
 
@@ -513,6 +521,7 @@ pub fn write_manifest(
         "trace_from": iso(cfg.from),
         "trace_to": if cfg.to == i64::MAX { Value::Null } else { iso(cfg.to - 1) },
         "detail": cfg.detail.as_str(),
+        "trace_assets": if cfg.assets.is_empty() { Value::Null } else { json!(cfg.assets) },
         "sidecar": sidecar.map(|(p, _)| p),
         "sidecar_sha256": sidecar.map(|(_, body)| sha256_hex(body.as_bytes())),
         "assets": Value::Object(assets),
@@ -553,6 +562,7 @@ mod tests {
             to,
             detail: Detail::Basic,
             max_bytes,
+            assets: Vec::new(),
         }
     }
 
@@ -620,6 +630,21 @@ mod tests {
         let st = s.finish();
         assert!(st.failed);
         assert_eq!(st.records, 0);
+    }
+
+    #[test]
+    fn the_asset_filter_names_which_assets_get_a_sink() {
+        let d = TempDir::new().unwrap();
+        let mut c = cfg(d.path(), i64::MIN, i64::MAX, 1 << 20);
+        assert!(c.traces_asset("xyz:CL") && c.traces_asset("xyz:SILVER"));
+        c.assets = vec!["xyz:CL".to_string()];
+        assert!(c.traces_asset("xyz:CL"));
+        assert!(!c.traces_asset("xyz:SILVER"));
+        let st = vec![("xyz:CL".to_string(), AssetStats::default())];
+        let m = write_manifest(&c, &ManifestRun::default(), &st, None).unwrap();
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(m).unwrap()).unwrap();
+        assert_eq!(doc["trace_assets"], json!(["xyz:CL"]));
+        assert!(doc["assets"].get("xyz:SILVER").is_none());
     }
 
     #[test]
