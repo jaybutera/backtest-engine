@@ -59,6 +59,15 @@ fn d_max_open() -> i64 {
 fn d_keep() -> i64 {
     400
 }
+fn d_min_gap() -> f64 {
+    0.1
+}
+fn d_htf_map() -> std::collections::HashMap<String, String> {
+    [("1m", "15m"), ("5m", "1h"), ("15m", "4h"), ("1h", "1D"), ("4h", "1W"), ("1D", "1M")]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
+}
 fn d_htf_sources() -> Vec<String> {
     ["pdh", "pdl", "pwh", "pwl", "pmh", "pml", "session_high", "session_low"]
         .iter()
@@ -98,6 +107,13 @@ pub struct StructureCfg {
     /// timeframe stamp.
     #[serde(default = "d_htf_sources")]
     pub htf_sources: Vec<String>,
+    /// The higher timeframe each timeframe reacts off (ICT pairs: 1m -> 15m,
+    /// 5m -> 1h, ...). Gaps and levels on that timeframe or above count.
+    #[serde(default = "d_htf_map")]
+    pub htf_map: std::collections::HashMap<String, String>,
+    /// Gaps narrower than this many ATRs of the bar's timeframe are ignored.
+    #[serde(default = "d_min_gap")]
+    pub min_gap_atr: f64,
 }
 
 impl Default for StructureCfg {
@@ -113,6 +129,8 @@ impl Default for StructureCfg {
             keep: d_keep(),
             rebalance: true,
             htf_sources: d_htf_sources(),
+            htf_map: d_htf_map(),
+            min_gap_atr: d_min_gap(),
         }
     }
 }
@@ -423,7 +441,12 @@ fn new_st(lad: &mut Ladder, p: MsPoint, cfg: &StructureCfg, tol: f64, ts: i64, o
                 let x = &lad.pts[&b];
                 (x.price, x.htf.is_some())
             };
-            if bh && beyond(high, bp, lad.pts[&s].price, tol) {
+            // An intact LT already beyond it: this is a lower reaction inside
+            // the same move, not a new LT.
+            let inside = lad.open.iter().any(|o| {
+                lad.pts.get(o).is_some_and(|q| q.tier >= 2 && q.taken_ts.is_none() && !beyond(high, bp, q.price, tol))
+            });
+            if bh && !inside && beyond(high, bp, lad.pts[&s].price, tol) {
                 promote(lad, b, 2, PointKind::HtfReaction, cfg, tol, ts, out);
             }
         }
