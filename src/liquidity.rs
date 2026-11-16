@@ -27,6 +27,7 @@ use rustc_hash::FxHashMap;
 use serde::Deserialize;
 
 use crate::models::{tf_id, tf_name, Candle, Direction};
+use crate::structure::{BarZones, MsEvent, MsPoint, Structure, StructureCfg};
 use crate::trace::{cmp_row, TraceHandle, TraceSink};
 use serde_json::{json, Value};
 
@@ -392,6 +393,10 @@ pub struct ScannerCfg {
     /// Track UTC days and report each completed one.
     #[serde(default = "d_true")]
     pub day_tracker: bool,
+    /// Market-structure tiers (STH/ITH/LTH and lows). On by default; labels
+    /// only, nothing reads them unless the strategy asks.
+    #[serde(default)]
+    pub structure: StructureCfg,
 }
 
 // ─── Sources ────────────────────────────────────────────────────────────────
@@ -708,6 +713,8 @@ pub struct BarEvents {
     pub day_closed: Option<Day>,
     /// Whether the draw map is due a rebuild after the strategy's first hook.
     pub draw_due: bool,
+    /// Market-structure promotions and takings on this bar's timeframe.
+    pub structure: Vec<MsEvent>,
 }
 
 // ─── Session state ──────────────────────────────────────────────────────────
@@ -829,6 +836,9 @@ pub struct Scanner {
     latest_sh: FxHashMap<u16, LatestSwing>,
     latest_sl: FxHashMap<u16, LatestSwing>,
 
+    structure: Structure,
+    last_structure: Vec<MsEvent>,
+
     sess: SessionState,
     eq: Option<EqState>,
 
@@ -900,6 +910,34 @@ pub fn tf_span_secs(tf: u16) -> i64 {
         _ => return 60,
     };
     n * unit
+}
+
+/// STs per timeframe and side a structure snapshot carries.
+const SNAP_MS_ST: usize = 60;
+
+/// Timeframe length in minutes, weeks and months included, for "higher
+/// timeframe" comparisons.
+fn tf_rank(tf: u16) -> i64 {
+    static RANK: crate::models::TfMemo = crate::models::TfMemo::new(|tf| match tf_name(tf).as_ref() {
+        "1W" => 10_080.0,
+        "1M" => 43_200.0,
+        other => crate::timeframe::tf_minutes_str(other) as f64,
+    });
+    RANK.get(tf) as i64
+}
+
+/// A structure point's stable trace id: timeframe, side, extreme bar.
+fn ms_run(p: &MsPoint, t: &TraceSink) -> String {
+    format!("M:{}:{}:{}", t.tf_name(p.tf), if p.high { "H" } else { "L" }, p.ts)
+}
+
+fn ms_point_json(p: &MsPoint, t: &TraceSink) -> Value {
+    json!({
+        "id": ms_run(p, t), "tf": t.tf_name(p.tf), "side": if p.high { "high" } else { "low" },
+        "price": p.price, "ts": p.ts, "st_ts": p.st_confirmed_ts, "tier": p.tier,
+        "label": p.tier_name(), "kind": p.kind.as_str(), "tier_ts": p.tier_ts,
+        "htf": p.htf, "rebal": p.rebal, "taken_ts": p.taken_ts,
+    })
 }
 
 impl Scanner {
@@ -1005,6 +1043,8 @@ impl Scanner {
             break_seen: HashSet::new(),
             latest_sh: FxHashMap::default(),
             latest_sl: FxHashMap::default(),
+            structure: Structure::new(cfg.structure.clone()),
+            last_structure: Vec::new(),
             sess: SessionState {
                 session_high: vec![None; n_sess],
                 session_low: vec![None; n_sess],
@@ -2941,6 +2981,10 @@ impl Scanner {
             None
         };
 
+        // What this bar's extremes traded into, read before this bar updates
+        // the level and gap books.
+        let zones = if self.cfg.structure.enabled { self.bar_zones(c) } else { BarZones::default() };
+
         // Session and period extremes are tracked on base bars only. An HTF
         // composite carries its period-start stamp and arrives after the base
         // bar that closed it, so feeding it here would read a stamp from
@@ -2980,7 +3024,16 @@ impl Scanner {
         }
         self.fvg_process(c);
         let sweeps = self.detect_sweeps(c, atr);
-        let _ = ts;
+        let structure = if self.cfg.structure.enabled {
+            let ev = self.structure.process(tf, ts, c.high, c.low, c.close, atr, zones);
+            if !ev.is_empty() {
+                self.trace_structure(&ev);
+            }
+            ev
+        } else {
+            Vec::new()
+        };
+        self.last_structure = structure.clone();
 
         let draw_due = self
             .cfg
@@ -3008,7 +3061,112 @@ impl Scanner {
                 .collect(),
             day_closed,
             draw_due,
+            structure,
         }
+    }
+
+    // ── Market structure ────────────────────────────────────────────────────
+
+    /// Higher-timeframe levels and gaps, and same-or-higher opposing gaps,
+    /// that this bar's high / low traded into. Only a bar that could be a
+    /// swing (beyond the previous bar on that side) is checked.
+    fn bar_zones(&self, c: &Candle) -> BarZones {
+        let tf = c.timeframe;
+        let ts = secs(c);
+        let mut z = BarZones::default();
+        let Some(ring) = self.rings.get(&tf) else { return z };
+        let n = ring.len();
+        if n < 2 {
+            return z;
+        }
+        let prev = &ring[n - 2];
+        let (cand_h, cand_l) = (c.high > prev.high, c.low < prev.low);
+        if !cand_h && !cand_l {
+            return z;
+        }
+        let rank = tf_rank(tf);
+        let sc = &self.cfg.structure;
+        let spans = |p: f64| c.low <= p && p <= c.high;
+        let meets = |lo: f64, hi: f64| c.high >= lo && c.low <= hi;
+        for &i in &self.fvg_active {
+            let f = &self.fvgs[i];
+            if !matches!(f.status, FvgStatus::Unmitigated | FvgStatus::Mitigated) || f.ts >= ts {
+                continue;
+            }
+            let (lo, hi) = (f.near.min(f.far), f.near.max(f.far));
+            if !meets(lo, hi) {
+                continue;
+            }
+            let fr = tf_rank(f.tf);
+            let want_h = f.dir == Direction::Bear && cand_h;
+            let want_l = f.dir == Direction::Bull && cand_l;
+            let what = || format!("{} {}fvg {}-{}", tf_name(f.tf), if f.is_inverted_kind { "i" } else { "" }, lo, hi);
+            if want_h {
+                if fr > rank && z.htf_high.is_none() {
+                    z.htf_high = Some(what());
+                }
+                if fr >= rank && z.rebal_high.is_none() {
+                    z.rebal_high = Some(what());
+                }
+            }
+            if want_l {
+                if fr > rank && z.htf_low.is_none() {
+                    z.htf_low = Some(what());
+                }
+                if fr >= rank && z.rebal_low.is_none() {
+                    z.rebal_low = Some(what());
+                }
+            }
+        }
+        for l in self.lists.iter().flat_map(|s| s.levels.iter()) {
+            if l.status != Status::Active || l.ts >= ts || !spans(l.price) {
+                continue;
+            }
+            let (need_h, need_l) = (l.side == Side::Bsl && cand_h && z.htf_high.is_none(), l.side == Side::Ssl && cand_l && z.htf_low.is_none());
+            if !need_h && !need_l {
+                continue;
+            }
+            let name = self.source_name(l.source);
+            if tf_rank(l.tf) > rank || sc.htf_sources.iter().any(|s| s == name) {
+                let what = Some(format!("{} {} {}", tf_name(l.tf), name, l.price));
+                if need_h {
+                    z.htf_high = what;
+                } else {
+                    z.htf_low = what;
+                }
+            }
+        }
+        z
+    }
+
+    fn trace_structure(&self, ev: &[MsEvent]) {
+        let Some(t) = &self.trace else { return };
+        if !t.on() {
+            return;
+        }
+        for e in ev {
+            let (k, o) = match e {
+                MsEvent::Tier { from: None, .. } => ("ms.tier", "st"),
+                MsEvent::Tier { .. } => ("ms.tier", "promote"),
+                MsEvent::Taken { .. } => ("ms.taken", "taken"),
+            };
+            let p = e.point();
+            let mut v = ms_point_json(p, t);
+            if let MsEvent::Tier { from: Some(f), .. } = e {
+                v["from"] = json!(f);
+            }
+            t.record(k, "ms", &ms_run(p, t), None, Some(o), v, None);
+        }
+    }
+
+    /// This bar's structure events (empty on bars of other timeframes).
+    pub fn structure_events(&self) -> &[MsEvent] {
+        &self.last_structure
+    }
+
+    /// Kept structure points of `tf`, one side, `min_tier` and up, newest first.
+    pub fn structure_points(&self, tf: u16, high: bool, min_tier: u8) -> Vec<&MsPoint> {
+        self.structure.points_of(tf, high, min_tier)
     }
 
     /// Record this bar's sweeps for the recency boost and rebuild the draw
@@ -3179,6 +3337,24 @@ impl Scanner {
             })
             .collect();
         sink.record("snap.dev", "", "", None, None, json!({"epoch": epoch, "dev": dev}), None);
+        if self.cfg.structure.enabled {
+            // Every kept IT+ point, and the newest STs of each ladder.
+            let all = self.structure.points();
+            let mut st_count: FxHashMap<(u16, bool), usize> = FxHashMap::default();
+            let mut rows: Vec<Value> = Vec::new();
+            for p in all.iter().rev() {
+                if p.tier == 0 {
+                    let n = st_count.entry((p.tf, p.high)).or_default();
+                    *n += 1;
+                    if *n > SNAP_MS_ST {
+                        continue;
+                    }
+                }
+                rows.push(ms_point_json(p, sink));
+            }
+            rows.reverse();
+            sink.record("snap.ms", "", "", None, None, json!({"points": rows}), None);
+        }
     }
 
     pub fn candle_count(&self) -> i64 {
@@ -3280,6 +3456,7 @@ mod tests {
                 one_sided_n: 5,
             }),
             day_tracker: true,
+            structure: Default::default(),
         }
     }
 
