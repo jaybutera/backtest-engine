@@ -240,11 +240,27 @@ struct Ladder {
     tiers: Vec<VecDeque<u64>>,
     /// Points whose taking is still watched.
     open: VecDeque<u64>,
+    /// HTF-reaction STs on their way to LT.
+    watch: Vec<Watch>,
 }
+
+/// An HTF-reaction ST being followed toward LT. `run` is the opposite
+/// extreme of the bars after it (the highest high after a low). Once a
+/// beyond-ST prints to its right, `trigger` freezes at `run`: the move away
+/// is the swing it made before that ST. It becomes an LT when a bar closes
+/// beyond `trigger` (price traded away), unless it is taken first.
+#[derive(Clone, Debug)]
+struct Watch {
+    seq: u64,
+    run: f64,
+    trigger: Option<f64>,
+}
+
+const MAX_WATCH: usize = 16;
 
 impl Ladder {
     fn referenced(&self, s: u64) -> bool {
-        self.tiers.iter().any(|t| t.contains(&s)) || self.open.contains(&s)
+        self.tiers.iter().any(|t| t.contains(&s)) || self.open.contains(&s) || self.watch.iter().any(|w| w.seq == s)
     }
 }
 
@@ -303,6 +319,13 @@ impl Structure {
         while st.bars.len() > 2 * lb + 1 {
             st.bars.pop_front();
         }
+        // The LT watches: trade-away on this close; the run takes the bar at
+        // the swing-candidate position (lb bars back), so when an ST is
+        // confirmed the run spans exactly the bars from the watched point to
+        // that ST, not the confirmation bars after it.
+        let mid = if st.bars.len() == 2 * lb + 1 { Some((st.bars[lb].0, st.bars[lb].1, st.bars[lb].2)) } else { None };
+        trade_away(&mut st.hi, true, mid, close, &cfg, tol, ts, &mut out);
+        trade_away(&mut st.lo, false, mid, close, &cfg, tol, ts, &mut out);
         if st.bars.len() < 2 * lb + 1 {
             return out;
         }
@@ -422,6 +445,50 @@ fn take(lad: &mut Ladder, high: bool, x: f64, ts: i64, out: &mut Vec<MsEvent>) {
     }
 }
 
+/// Follow the LT watches through one bar: a close beyond a frozen trigger
+/// promotes (unless an intact LT already sits beyond it: a weaker reaction
+/// inside the same move); a taken point drops out; the bar's opposite
+/// extreme extends each unfrozen run.
+#[allow(clippy::too_many_arguments)]
+fn trade_away(lad: &mut Ladder, high: bool, mid: Option<(i64, f64, f64)>, close: f64, cfg: &StructureCfg, tol: f64, ts: i64, out: &mut Vec<MsEvent>) {
+    if lad.watch.is_empty() {
+        return;
+    }
+    let mut fire = Vec::new();
+    let pts = &lad.pts;
+    lad.watch.retain_mut(|w| {
+        let Some(p) = pts.get(&w.seq) else { return false };
+        if p.taken_ts.is_some() || p.ts >= ts {
+            return p.taken_ts.is_none();
+        }
+        if let Some(t) = w.trigger {
+            // A high trades away when a close goes below the lowest low of
+            // its swing down; a low, above the highest high of its swing up.
+            let away = if high { close < t } else { close > t };
+            if away {
+                fire.push(w.seq);
+                return false;
+            }
+            return true;
+        }
+        if let Some((mts, bh, bl)) = mid {
+            if mts > p.ts {
+                w.run = if high { w.run.min(bl) } else { w.run.max(bh) };
+            }
+        }
+        true
+    });
+    for b in fire {
+        let bp = lad.pts[&b].price;
+        let inside = lad.open.iter().any(|o| {
+            *o != b && lad.pts.get(o).is_some_and(|q| q.tier >= 2 && q.taken_ts.is_none() && !beyond(high, bp, q.price, tol))
+        });
+        if !inside {
+            promote(lad, b, 2, PointKind::HtfReaction, cfg, tol, ts, out);
+        }
+    }
+}
+
 fn new_st(lad: &mut Ladder, p: MsPoint, cfg: &StructureCfg, tol: f64, ts: i64, out: &mut Vec<MsEvent>) {
     let high = p.high;
     let s = lad.next;
@@ -436,18 +503,25 @@ fn new_st(lad: &mut Ladder, p: MsPoint, cfg: &StructureCfg, tol: f64, ts: i64, o
     // LT now that a lower ST printed to its right. Done before the ladder
     // pushes `s`, so the previous ST is still the newest of tier 0.
     if !cfg.fractal() && cfg.max_tier >= 2 {
-        if let Some(&b) = lad.tiers.first().and_then(|t| t.back()) {
-            let (bp, bh) = {
-                let x = &lad.pts[&b];
-                (x.price, x.htf.is_some())
-            };
-            // An intact LT already beyond it: this is a lower reaction inside
-            // the same move, not a new LT.
-            let inside = lad.open.iter().any(|o| {
-                lad.pts.get(o).is_some_and(|q| q.tier >= 2 && q.taken_ts.is_none() && !beyond(high, bp, q.price, tol))
-            });
-            if bh && !inside && beyond(high, bp, lad.pts[&s].price, tol) {
-                promote(lad, b, 2, PointKind::HtfReaction, cfg, tol, ts, out);
+        let b = lad.tiers.first().and_then(|t| t.back()).copied();
+        let sp = lad.pts[&s].price;
+        // The previous ST gets its trigger if this ST is beyond it; every
+        // other untriggered watch is done (its right-hand ST was not beyond).
+        let pts = &lad.pts;
+        lad.watch.retain_mut(|w| {
+            if w.trigger.is_some() {
+                return true;
+            }
+            if Some(w.seq) == b && beyond(high, pts[&w.seq].price, sp, tol) {
+                w.trigger = Some(w.run);
+                return true;
+            }
+            false
+        });
+        if lad.pts[&s].htf.is_some() {
+            lad.watch.push(Watch { seq: s, run: if high { f64::INFINITY } else { f64::NEG_INFINITY }, trigger: None });
+            if lad.watch.len() > MAX_WATCH {
+                lad.watch.remove(0);
             }
         }
     }
@@ -632,11 +706,28 @@ mod tests {
 
     #[test]
     fn htf_mode_lt_needs_the_reaction_and_a_lower_st_to_its_right() {
-        let bars = zig(&[10.0, 12.0, 11.0]);
+        let mut bars = zig(&[10.0, 12.0, 11.0]);
         let z = BarZones { htf_high: Some("1h fvg".into()), ..Default::default() };
+        // Not yet: the lowest low between the 12 and the 11 (bar 4, low 5)
+        // has not been closed below.
         let ev = run(StructureCfg::default(), &bars, &[(3, z.clone())]);
-        let t = tiers(&ev, true);
-        assert!(t.contains(&(3, 2, "htf")), "{t:?}");
+        assert!(!tiers(&ev, true).iter().any(|x| x.1 >= 2), "{:?}", tiers(&ev, true));
+        // A close at 5.5 is not below 5; a close at 4.5 is: LT on that bar.
+        bars.push((7.0, 4.0)); // close 5.5
+        bars.push((6.0, 3.0)); // close 4.5
+        let ev = run(StructureCfg::default(), &bars, &[(3, z.clone())]);
+        let lt: Vec<_> = ev.iter().filter_map(|e| match e {
+            MsEvent::Tier { point, .. } if point.tier == 2 => Some((point.ts / 60, point.tier_ts / 60)),
+            _ => None,
+        }).collect();
+        assert_eq!(lt, vec![(3, 8)], "LT at the 12 (bar 3), promoted on bar 8");
+        // Taken before it trades away: never an LT.
+        let mut b2 = zig(&[10.0, 12.0, 11.0]);
+        b2.push((13.0, 11.0)); // close 12 = not beyond 12
+        b2.push((14.0, 12.5)); // close 13.25 > 12: taken
+        b2.push((6.0, 3.0));
+        let ev = run(StructureCfg::default(), &b2, &[(3, z.clone())]);
+        assert!(!tiers(&ev, true).iter().any(|x| x.1 >= 2), "{:?}", tiers(&ev, true));
         // A higher ST to its right: not an LT.
         let ev = run(StructureCfg::default(), &zig(&[10.0, 12.0, 13.0]), &[(3, z)]);
         assert!(!tiers(&ev, true).iter().any(|x| x.1 >= 2));
