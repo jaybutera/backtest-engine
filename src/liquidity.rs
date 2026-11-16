@@ -2983,7 +2983,7 @@ impl Scanner {
 
         // What this bar's extremes traded into, read before this bar updates
         // the level and gap books.
-        let zones = if self.cfg.structure.enabled { self.bar_zones(c) } else { BarZones::default() };
+        let zones = if self.cfg.structure.enabled { self.bar_zones(c, atr) } else { BarZones::default() };
 
         // Session and period extremes are tracked on base bars only. An HTF
         // composite carries its period-start stamp and arrives after the base
@@ -3070,7 +3070,7 @@ impl Scanner {
     /// Higher-timeframe levels and gaps, and same-or-higher opposing gaps,
     /// that this bar's high / low traded into. Only a bar that could be a
     /// swing (beyond the previous bar on that side) is checked.
-    fn bar_zones(&self, c: &Candle) -> BarZones {
+    fn bar_zones(&self, c: &Candle, atr: f64) -> BarZones {
         let tf = c.timeframe;
         let ts = secs(c);
         let mut z = BarZones::default();
@@ -3086,48 +3086,58 @@ impl Scanner {
         }
         let rank = tf_rank(tf);
         let sc = &self.cfg.structure;
-        let spans = |p: f64| c.low <= p && p <= c.high;
-        let meets = |lo: f64, hi: f64| c.high >= lo && c.low <= hi;
+        let htf_rank = sc
+            .htf_map
+            .get(tf_name(tf).as_ref())
+            .map(|h| tf_rank(tf_id(h)))
+            .unwrap_or(i64::MAX);
         for &i in &self.fvg_active {
             let f = &self.fvgs[i];
-            if !matches!(f.status, FvgStatus::Unmitigated | FvgStatus::Mitigated) || f.ts >= ts {
+            if f.is_inverted_kind
+                || !matches!(f.status, FvgStatus::Unmitigated | FvgStatus::Mitigated)
+                || f.ts >= ts
+            {
                 continue;
             }
             let (lo, hi) = (f.near.min(f.far), f.near.max(f.far));
-            if !meets(lo, hi) {
+            if hi - lo < sc.min_gap_atr * atr {
                 continue;
             }
             let fr = tf_rank(f.tf);
-            let want_h = f.dir == Direction::Bear && cand_h;
-            let want_l = f.dir == Direction::Bull && cand_l;
-            let what = || format!("{} {}fvg {}-{}", tf_name(f.tf), if f.is_inverted_kind { "i" } else { "" }, lo, hi);
-            if want_h {
-                if fr > rank && z.htf_high.is_none() {
+            let what = || format!("{} fvg {}-{}", tf_name(f.tf), lo, hi);
+            // A high reacts off a bearish gap: this bar is the one that
+            // reached it (the previous bar stayed below) and it did not close
+            // through. Rebalanced = the extreme stayed inside a gap still
+            // unmitigated before this bar.
+            if f.dir == Direction::Bear && cand_h && prev.high < lo && c.high >= lo && c.close <= hi {
+                if fr >= htf_rank && z.htf_high.is_none() {
                     z.htf_high = Some(what());
                 }
-                if fr >= rank && z.rebal_high.is_none() {
+                if fr >= rank && f.status == FvgStatus::Unmitigated && c.high <= hi && z.rebal_high.is_none() {
                     z.rebal_high = Some(what());
                 }
             }
-            if want_l {
-                if fr > rank && z.htf_low.is_none() {
+            if f.dir == Direction::Bull && cand_l && prev.low > hi && c.low <= hi && c.close >= lo {
+                if fr >= htf_rank && z.htf_low.is_none() {
                     z.htf_low = Some(what());
                 }
-                if fr >= rank && z.rebal_low.is_none() {
+                if fr >= rank && f.status == FvgStatus::Unmitigated && c.low >= lo && z.rebal_low.is_none() {
                     z.rebal_low = Some(what());
                 }
             }
         }
         for l in self.lists.iter().flat_map(|s| s.levels.iter()) {
-            if l.status != Status::Active || l.ts >= ts || !spans(l.price) {
+            if l.status != Status::Active || l.ts >= ts || !(c.low <= l.price && l.price <= c.high) {
                 continue;
             }
-            let (need_h, need_l) = (l.side == Side::Bsl && cand_h && z.htf_high.is_none(), l.side == Side::Ssl && cand_l && z.htf_low.is_none());
+            // This bar is the one that reached the level.
+            let need_h = l.side == Side::Bsl && cand_h && z.htf_high.is_none() && prev.high < l.price;
+            let need_l = l.side == Side::Ssl && cand_l && z.htf_low.is_none() && prev.low > l.price;
             if !need_h && !need_l {
                 continue;
             }
             let name = self.source_name(l.source);
-            if tf_rank(l.tf) > rank || sc.htf_sources.iter().any(|s| s == name) {
+            if tf_rank(l.tf) >= htf_rank || sc.htf_sources.iter().any(|s| s == name) {
                 let what = Some(format!("{} {} {}", tf_name(l.tf), name, l.price));
                 if need_h {
                     z.htf_high = what;
