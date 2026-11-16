@@ -838,6 +838,11 @@ pub struct Scanner {
 
     structure: Structure,
     last_structure: Vec<MsEvent>,
+    /// When a bar (of any timeframe) first reached each gap's CE: gap id ->
+    /// that bar's open time. The gap's own status only updates on bars of its
+    /// timeframe; a candidate bar mitigates a gap if the first hit falls
+    /// inside its own span (a 5m bar's 1m bars land first).
+    ce_hit: FxHashMap<i64, i64>,
 
     sess: SessionState,
     eq: Option<EqState>,
@@ -1045,6 +1050,7 @@ impl Scanner {
             latest_sl: FxHashMap::default(),
             structure: Structure::new(cfg.structure.clone()),
             last_structure: Vec::new(),
+            ce_hit: Default::default(),
             sess: SessionState {
                 session_high: vec![None; n_sess],
                 session_low: vec![None; n_sess],
@@ -2983,7 +2989,13 @@ impl Scanner {
 
         // What this bar's extremes traded into, read before this bar updates
         // the level and gap books.
-        let zones = if self.cfg.structure.enabled { self.bar_zones(c, atr) } else { BarZones::default() };
+        let zones = if self.cfg.structure.enabled {
+            let z = self.bar_zones(c, atr);
+            self.mark_ce_hits(c);
+            z
+        } else {
+            BarZones::default()
+        };
 
         // Session and period extremes are tracked on base bars only. An HTF
         // composite carries its period-start stamp and arrives after the base
@@ -3104,24 +3116,27 @@ impl Scanner {
                 continue;
             }
             let fr = tf_rank(f.tf);
-            let what = || format!("{} fvg {}-{}", tf_name(f.tf), lo, hi);
-            // A high reacts off a bearish gap: this bar is the one that
-            // reached it (the previous bar stayed below) and it did not close
-            // through. Rebalanced = the extreme stayed inside a gap still
-            // unmitigated before this bar.
-            if f.dir == Direction::Bear && cand_h && prev.high < lo && c.high >= lo && c.close <= hi {
+            let what = || format!("{} fvg {}-{} ce {}", tf_name(f.tf), lo, hi, f.ce);
+            // Touching a gap is not a reaction; mitigating it is. The bar must
+            // be the first to reach the gap's CE (the gap was unmitigated
+            // before it) and must not close through the far edge. Rebalanced
+            // also needs the extreme itself to stay inside the gap.
+            if f.status != FvgStatus::Unmitigated || self.ce_hit.get(&f.id).is_some_and(|&t| t < ts) {
+                continue;
+            }
+            if f.dir == Direction::Bear && cand_h && c.high >= f.ce && c.close <= hi {
                 if fr >= htf_rank && z.htf_high.is_none() {
                     z.htf_high = Some(what());
                 }
-                if fr >= rank && f.status == FvgStatus::Unmitigated && c.high <= hi && z.rebal_high.is_none() {
+                if fr >= rank && c.high <= hi && z.rebal_high.is_none() {
                     z.rebal_high = Some(what());
                 }
             }
-            if f.dir == Direction::Bull && cand_l && prev.low > hi && c.low <= hi && c.close >= lo {
+            if f.dir == Direction::Bull && cand_l && c.low <= f.ce && c.close >= lo {
                 if fr >= htf_rank && z.htf_low.is_none() {
                     z.htf_low = Some(what());
                 }
-                if fr >= rank && f.status == FvgStatus::Unmitigated && c.low >= lo && z.rebal_low.is_none() {
+                if fr >= rank && c.low >= lo && z.rebal_low.is_none() {
                     z.rebal_low = Some(what());
                 }
             }
@@ -3147,6 +3162,27 @@ impl Scanner {
             }
         }
         z
+    }
+
+    fn mark_ce_hits(&mut self, c: &Candle) {
+        let ts = secs(c);
+        for &i in &self.fvg_active {
+            let f = &self.fvgs[i];
+            if f.ts >= ts || f.is_inverted_kind {
+                continue;
+            }
+            let hit = match f.dir {
+                Direction::Bear => c.high >= f.ce,
+                Direction::Bull => c.low <= f.ce,
+            };
+            if hit {
+                self.ce_hit.entry(f.id).or_insert(ts);
+            }
+        }
+        if self.ce_hit.len() > 4 * self.fvg_active.len() + 256 {
+            let live: rustc_hash::FxHashSet<i64> = self.fvg_active.iter().map(|&i| self.fvgs[i].id).collect();
+            self.ce_hit.retain(|id, _| live.contains(id));
+        }
     }
 
     fn trace_structure(&self, ev: &[MsEvent]) {
