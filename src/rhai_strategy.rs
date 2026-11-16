@@ -2108,6 +2108,21 @@ fn break_map(b: &liquidity::Break) -> Map {
     m
 }
 
+fn ms_point_map(p: &crate::structure::MsPoint) -> Map {
+    let mut m = Map::new();
+    m.insert("tf".into(), tf_str(p.tf).into());
+    m.insert("side".into(), (if p.high { "high" } else { "low" }).into());
+    m.insert("price".into(), p.price.into());
+    m.insert("ts".into(), p.ts.into());
+    m.insert("tier".into(), (p.tier as i64).into());
+    m.insert("label".into(), p.tier_name().into());
+    m.insert("kind".into(), p.kind.as_str().into());
+    m.insert("tier_ts".into(), p.tier_ts.into());
+    m.insert("taken".into(), p.taken_ts.is_some().into());
+    m.insert("taken_ts".into(), p.taken_ts.map(Dynamic::from).unwrap_or(Dynamic::UNIT));
+    m
+}
+
 fn day_map(d: &liquidity::Day) -> Map {
     let mut m = Map::new();
     m.insert("day_ms".into(), d.day_ms.into());
@@ -2288,6 +2303,39 @@ fn register_scanner_api(engine: &mut Engine) {
                 None => Dynamic::UNIT,
             }
         })
+        // Market-structure tiers (STH/ITH/LTH and lows; see structure.rs).
+        .register_fn("structure_events", |s: &mut ScanHandle| -> Array {
+            s.0.borrow()
+                .structure_events()
+                .iter()
+                .map(|e| {
+                    let mut m = ms_point_map(e.point());
+                    let what = match e {
+                        crate::structure::MsEvent::Tier { from: None, .. } => "st",
+                        crate::structure::MsEvent::Tier { .. } => "promote",
+                        crate::structure::MsEvent::Taken { .. } => "taken",
+                    };
+                    m.insert("event".into(), what.into());
+                    Dynamic::from_map(m)
+                })
+                .collect()
+        })
+        .register_fn(
+            "structure",
+            |s: &mut ScanHandle, tf: &str, side: &str, min_tier: i64| -> Result<Array, Box<EvalAltResult>> {
+                let high = match side {
+                    "high" | "bsl" => true,
+                    "low" | "ssl" => false,
+                    o => return Err(format!("structure side must be high or low, got {o:?}").into()),
+                };
+                Ok(s.0
+                    .borrow()
+                    .structure_points(tf_of(tf), high, min_tier.clamp(0, 255) as u8)
+                    .into_iter()
+                    .map(|p| Dynamic::from_map(ms_point_map(p)))
+                    .collect())
+            },
+        )
         .register_fn("fvg_status", |s: &mut ScanHandle, id: i64| -> Dynamic {
             match s.0.borrow().fvg(id) {
                 Some(f) => f.status.as_str().into(),

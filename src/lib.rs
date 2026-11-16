@@ -97,6 +97,7 @@ pub mod rhai_strategy;
 pub mod session;
 pub mod strategy;
 pub mod strategy_config;
+pub mod structure;
 pub mod timeframe;
 pub mod trace;
 
