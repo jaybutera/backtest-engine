@@ -327,6 +327,16 @@ pub struct FvgCfg {
     /// How many extra to fill past the cap so capping is not per-bar work.
     #[serde(default = "d_50", deserialize_with = "lenient::i64")]
     pub cap_overshoot: i64,
+    /// A new gap that touches an unmitigated gap of the same timeframe and
+    /// direction (edges within `merge_tol_atr` ATRs of that timeframe)
+    /// extends it instead of standing alone: stacked gaps are one zone.
+    #[serde(default = "d_true")]
+    pub merge: bool,
+    #[serde(default = "d_merge_tol", deserialize_with = "lenient::f64")]
+    pub merge_tol_atr: f64,
+}
+fn d_merge_tol() -> f64 {
+    0.05
 }
 
 /// The ranked draw-on-liquidity map.
@@ -2427,7 +2437,48 @@ impl Scanner {
         idx
     }
 
-    fn fvg_add(&mut self, sig: &Signal) {
+    /// The active, unmitigated regular gap of the same timeframe and
+    /// direction that `sig`'s gap touches (newest first), if merging is on.
+    fn fvg_touching(&self, sig: &Signal, atr: f64) -> Option<usize> {
+        if !self.cfg.fvg.merge {
+            return None;
+        }
+        let tol = self.cfg.fvg.merge_tol_atr.max(0.0) * atr;
+        let (lo, hi) = (sig.level.min(sig.level_end), sig.level.max(sig.level_end));
+        let act = self.fvg_by_tf.get(&sig.tf)?;
+        act.iter().rev().copied().find(|&i| {
+            let f = &self.fvgs[i];
+            !f.is_inverted_kind
+                && f.dir == sig.dir
+                && f.status == FvgStatus::Unmitigated
+                && f.near.min(f.far) <= hi + tol
+                && f.near.max(f.far) >= lo - tol
+        })
+    }
+
+    fn fvg_add(&mut self, sig: &Signal, atr: f64) {
+        if let Some(idx) = self.fvg_touching(sig, atr) {
+            let f = &mut self.fvgs[idx];
+            let lo = f.near.min(f.far).min(sig.level.min(sig.level_end));
+            let hi = f.near.max(f.far).max(sig.level.max(sig.level_end));
+            match f.dir {
+                Direction::Bull => {
+                    f.near = hi;
+                    f.far = lo;
+                    f.c1_stop = Some(f.c1_stop.unwrap_or(sig.c1_stop).min(sig.c1_stop));
+                }
+                Direction::Bear => {
+                    f.near = lo;
+                    f.far = hi;
+                    f.c1_stop = Some(f.c1_stop.unwrap_or(sig.c1_stop).max(sig.c1_stop));
+                }
+            }
+            f.ce = (lo + hi) / 2.0;
+            let id = f.id;
+            self.ce_hit.remove(&id);
+            self.trace_fvg("fvg.status", idx, "merged");
+            return;
+        }
         let id = self.fvgs.len() as i64;
         let f = Fvg {
             id,
@@ -3032,7 +3083,7 @@ impl Scanner {
         }
         self.eq_process(c, atr);
         for s in &fvgs {
-            self.fvg_add(s);
+            self.fvg_add(s, atr);
         }
         self.fvg_process(c);
         let sweeps = self.detect_sweeps(c, atr);
@@ -3112,7 +3163,10 @@ impl Scanner {
                 continue;
             }
             let (lo, hi) = (f.near.min(f.far), f.near.max(f.far));
-            if hi - lo < sc.min_gap_atr * atr {
+            // Size is judged on the gap's own timeframe: a 2-point 15m gap
+            // is a sliver even when the 1m ATR is 2 points.
+            let gap_atr = self.atr_cache.get(&f.tf).copied().filter(|a| *a > 0.0).unwrap_or(atr);
+            if hi - lo < sc.min_gap_atr * gap_atr {
                 continue;
             }
             let fr = tf_rank(f.tf);
@@ -3483,6 +3537,8 @@ mod tests {
             fvg: FvgCfg {
                 cap: 500,
                 cap_overshoot: 50,
+                merge: true,
+                merge_tol_atr: 0.05,
             },
             draw: Some(DrawCfg {
                 enabled: true,
@@ -3657,6 +3713,28 @@ mod tests {
         let inv = sc.fvgs_since(tf_id("1m"), Direction::Bear, true, 0);
         assert_eq!(inv.len(), 1);
         assert_eq!(inv[0].near, 103.0);
+    }
+
+    #[test]
+    fn stacked_gaps_merge_into_one_zone() {
+        let mut sc = Scanner::new(cfg());
+        sc.process(&candle(60, 100.0, 101.0, 99.0, 100.5));
+        sc.process(&candle(120, 100.5, 101.5, 98.0, 101.0));
+        sc.process(&candle(180, 103.0, 104.0, 103.0, 103.5)); // gap 101-103
+        sc.process(&candle(240, 104.0, 107.0, 104.0, 106.5)); // gap 101.5-104 overlaps
+        let f = sc.fvgs_since(tf_id("1m"), Direction::Bull, false, 0);
+        assert_eq!(f.len(), 1, "one zone");
+        assert_eq!((f[0].near, f[0].far, f[0].ce), (104.0, 101.0, 102.5));
+        assert_eq!(f[0].c1_stop, Some(98.0));
+
+        let mut c = cfg();
+        c.fvg.merge = false;
+        let mut sc = Scanner::new(c);
+        sc.process(&candle(60, 100.0, 101.0, 99.0, 100.5));
+        sc.process(&candle(120, 100.5, 101.5, 98.0, 101.0));
+        sc.process(&candle(180, 103.0, 104.0, 103.0, 103.5));
+        sc.process(&candle(240, 104.0, 107.0, 104.0, 106.5));
+        assert_eq!(sc.fvgs_since(tf_id("1m"), Direction::Bull, false, 0).len(), 2);
     }
 
     #[test]
