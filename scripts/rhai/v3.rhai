@@ -23,7 +23,12 @@
 
 fn init(cfg) {
     let s = cfg.script;
+    // Decision trace for the replay debugger; off unless the run is traced.
+    let tr = false;
+    try { tr = tracing(); } catch { }
     #{
+        asset: cfg.asset,
+        tr: tr,
         scan: scanner(#{
             primitives: #{
                 atr_period: 14, swing_lookback: 5,
@@ -57,6 +62,7 @@ fn init(cfg) {
         next_key: 0,
         setups: [],        // one per sweep being worked
         placed: #{},       // setup key -> resting opportunity id
+        used: #{},         // gaps that already carry a plan: one plan per gap
         dead: [],          // opportunity ids to cancel at the bar close
     }
 }
@@ -73,6 +79,12 @@ fn on_bar(c, atr, sweeps, breaks) {
             this.next_key += 1;
             this.setups.push(#{ key: `${this.next_key}`, sweep: sw, tf: tf, bars: 0,
                                 brk: (), fvg: (), entry: (), stop: (), placed: false });
+            if this.tr {
+                trace("v3.sweep", "sweep", `D${this.next_key}`, #{ dir: sw.dir, tf: tf,
+                    level_id: sw.level_id, level_price: sw.level_price, level_source: sw.level_source,
+                    level_sig: sw.level_sig, extreme_price: sw.extreme_price, start_ts: sw.start_ts,
+                    o: "watching" });
+            }
         }
     }
     let out = [];
@@ -87,26 +99,55 @@ fn on_bar(c, atr, sweeps, breaks) {
             || (dir == "bull" && c.close < ext) || (dir == "bear" && c.close > ext)
             || (w.fvg != () && this.scan.fvg_status(w.fvg) == "inverted");
         if over {
+            if this.tr {
+                let why = if w.bars > this.max_bars { "timed_out" }
+                    else if w.fvg != () && this.scan.fvg_status(w.fvg) == "inverted" { "gap_inverted" }
+                    else { "closed_through_sweep_extreme" };
+                trace("v3.dead", "dead", `D${w.key}`, #{ o: why, bars: w.bars, close: c.close, extreme_price: ext,
+                    cancels_resting_order: w.placed });
+            }
             if w.placed && w.key in this.placed { this.dead.push(this.placed.remove(w.key)); }
             continue;
         }
         if w.brk == () {
             for b in breaks {
-                if b.dir == dir && b.tf == tf && b.ts >= w.sweep.start_ts
-                    && break_beyond_sweep(dir, b.level, w.sweep.level_price) {
-                    w.brk = b.level;
-                    break;
+                if b.dir == dir && b.tf == tf && b.ts >= w.sweep.start_ts {
+                    let beyond = break_beyond_sweep(dir, b.level, w.sweep.level_price);
+                    if this.tr {
+                        trace("v3.break", "break", `D${w.key}`, #{ o: if beyond { "accepted" } else { "inside_sweep" },
+                            break_level: b.level, swept_level: w.sweep.level_price,
+                            cmp: [#{ l: "broken swing", lv: b.level, op: if dir == "bull" { ">" } else { "<" },
+                                     r: "swept level", rv: w.sweep.level_price, ok: beyond }] });
+                    }
+                    if beyond { w.brk = b.level; break; }
                 }
             }
         }
         if w.brk != () && !w.placed {
             let f = this.scan.fvg_first(tf, dir, false, w.sweep.start_ts, 0.0, -inf(), inf(), ext, atr * this.min_clear);
+            let gap_key = if f != () { `${tf}:${f.id}` } else { "" };
+            if f != () && gap_key in this.used {
+                if this.tr {
+                    trace("v3.gap", "gap", `D${w.key}`, #{ o: "same_gap_as_earlier_plan", gap_id: f.id,
+                        near: f.near, far: f.far });
+                }
+                // Another sweep on this bar or an earlier one already placed
+                // this gap's plan; this setup is the same trade.
+                continue;
+            }
             if f != () {
                 let t = this.scan.find_target(dir, f.near, ext, this.min_rr, 0.0);
                 if t != () {
                     w.fvg = f.id; w.entry = f.near; w.stop = ext; w.placed = true;
+                    this.used[gap_key] = true;
                     out.push(#{ key: w.key, dir: dir, tf: tf, entry: w.entry, stop: w.stop, target: t.price,
                                 sig: w.sweep.level_sig });
+                }
+                if this.tr {
+                    trace("v3.gap", "gap", `D${w.key}`, #{ o: if t != () { "plan_placed" } else { "no_target" },
+                        gap_id: f.id, near: f.near, far: f.far, entry: f.near, stop: ext,
+                        target: if t != () { t.price } else { () }, min_rr: this.min_rr,
+                        opp_id: `v3_${this.asset}_${w.key}` });
                 }
             }
         }
@@ -125,6 +166,9 @@ fn emit(c, atr, cand) {
     o.stop = cand.stop;
     o.target = cand.target;
     o.score = cand.sig;
+    // The engine's own ids count across assets in thread order; an id built
+    // from this asset's setup number is the same in every run.
+    o.id = `v3_${this.asset}_${cand.key}`;
     this.placed[cand.key] = o.id;
     o
 }
