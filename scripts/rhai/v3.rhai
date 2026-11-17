@@ -24,8 +24,9 @@
 //      has closed, a setup with no such gap is dead: the leg is over.
 //
 // The plan dies, and its resting order is cancelled, when a bar closes back
-// through the sweep's extreme, when the gap inverts, or after
-// `max_bars_after_sweep` bars of the sweep's timeframe.
+// through the sweep's extreme, when the gap inverts, when price trades to the
+// target before the entry has filled (the move happened without us), or
+// after `max_bars_after_sweep` bars of the sweep's timeframe.
 
 fn init(cfg) {
     let s = cfg.script;
@@ -110,7 +111,7 @@ fn on_bar(c, atr, sweeps, breaks) {
         if sw.tf == tf && sw.level_sig >= this.min_sig {
             this.next_key += 1;
             let w = #{ key: `${this.next_key}`, sweep: sw, tf: tf, bars: 0,
-                       brk: (), fvg: (), entry: (), stop: (), placed: false,
+                       brk: (), fvg: (), entry: (), stop: (), target: (), placed: false,
                        mss: (), mss_swing_ts: (), brk_ts: () };
             let p = launch_swing(this.scan, tf, sw.dir, sw.extreme_ts, sw.level_price);
             if p != () { w.mss = p.price; w.mss_swing_ts = p.ts; }
@@ -133,12 +134,18 @@ fn on_bar(c, atr, sweeps, breaks) {
         w.bars += 1;
         let dir = w.sweep.dir;
         let ext = w.sweep.extreme_price;
-        let over = w.bars > this.max_bars
+        // The target was reached while the order was still resting. A setup
+        // is forgotten once its order fills, so a placed setup seen here has
+        // not filled.
+        let ran = w.placed && w.target != ()
+            && ((dir == "bull" && c.high >= w.target) || (dir == "bear" && c.low <= w.target));
+        let over = w.bars > this.max_bars || ran
             || (dir == "bull" && c.close < ext) || (dir == "bear" && c.close > ext)
             || (w.fvg != () && this.scan.fvg_status(w.fvg) == "inverted");
         if over {
             if this.tr {
                 let why = if w.bars > this.max_bars { "timed_out" }
+                    else if ran { "target_reached_before_entry" }
                     else if w.fvg != () && this.scan.fvg_status(w.fvg) == "inverted" { "gap_inverted" }
                     else { "closed_through_sweep_extreme" };
                 trace("v3.dead", "dead", `D${w.key}`, #{ o: why, bars: w.bars, close: c.close, extreme_price: ext,
@@ -229,7 +236,7 @@ fn on_bar(c, atr, sweeps, breaks) {
             if f != () {
                 let t = this.scan.find_target(dir, f.near, ext, this.min_rr, 0.0);
                 if t != () {
-                    w.fvg = f.id; w.entry = f.near; w.stop = ext; w.placed = true;
+                    w.fvg = f.id; w.entry = f.near; w.stop = ext; w.target = t.price; w.placed = true;
                     this.used[gap_key] = true;
                     out.push(#{ key: w.key, dir: dir, tf: tf, entry: w.entry, stop: w.stop, target: t.price,
                                 sig: w.sweep.level_sig });
