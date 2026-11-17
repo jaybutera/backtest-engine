@@ -60,7 +60,7 @@ fn d_keep() -> i64 {
     400
 }
 fn d_min_gap() -> f64 {
-    0.1
+    0.5
 }
 fn d_htf_map() -> std::collections::HashMap<String, String> {
     [("1m", "15m"), ("5m", "1h"), ("15m", "4h"), ("1h", "1D"), ("4h", "1W"), ("1D", "1M")]
@@ -111,7 +111,7 @@ pub struct StructureCfg {
     /// 5m -> 1h, ...). Gaps and levels on that timeframe or above count.
     #[serde(default = "d_htf_map")]
     pub htf_map: std::collections::HashMap<String, String>,
-    /// Gaps narrower than this many ATRs of the bar's timeframe are ignored.
+    /// Gaps narrower than this many ATRs of the gap's own timeframe are ignored.
     #[serde(default = "d_min_gap")]
     pub min_gap_atr: f64,
 }
