@@ -20,6 +20,26 @@
 // The plan dies, and its resting order is cancelled, when a bar closes back
 // through the sweep's extreme, when the gap inverts, or after
 // `max_bars_after_sweep` bars of the sweep's timeframe.
+//
+// Three [script] knobs change steps 2 and 3. Left out, the script behaves as
+// above, trade for trade.
+//
+//   mss = "launch_swing"   (default "engine_break")
+//     The break that counts is of the swing that launched the run into the
+//     sweep: the most recent short-term swing on the sweep's timeframe, on
+//     the reversal side (a low for a bear setup), whose pivot bar is before
+//     the sweep's extreme and which had not been closed through before that
+//     extreme. The break is a bar of that timeframe closing beyond it. A
+//     swing that forms after the extreme can never be the level. The engine's
+//     break events (a close past the LATEST swing) are not used.
+//   gap_in_leg = true      (default false)
+//     Only gaps made by the move that broke structure are entries: a gap
+//     whose third candle is after the sweep's extreme and no later than the
+//     candle after the break candle (so the gap whose middle candle is the
+//     break candle counts). Once that candle has closed, a setup with no
+//     eligible gap is dead: the leg is over and cannot grow another.
+//   gap_min_risk_frac = x  (default 0 = off)
+//     The gap's height must be at least x of the entry-to-stop distance.
 
 fn init(cfg) {
     let s = cfg.script;
@@ -59,6 +79,9 @@ fn init(cfg) {
         max_bars: s.max_bars_after_sweep,
         min_rr: s.min_target_rr,
         min_clear: s.gap_min_clear_atr,
+        mss_mode: if "mss" in s { s.mss } else { "engine_break" },
+        gap_in_leg: if "gap_in_leg" in s { s.gap_in_leg } else { false },
+        gap_min_frac: if "gap_min_risk_frac" in s { s.gap_min_risk_frac + 0.0 } else { 0.0 },
         next_key: 0,
         setups: [],        // one per sweep being worked
         placed: #{},       // setup key -> resting opportunity id
@@ -72,18 +95,54 @@ fn break_beyond_sweep(dir, break_level, swept_level) {
     if dir == "bull" { break_level > swept_level } else { break_level < swept_level }
 }
 
+// A timeframe name's length in seconds ("15m" -> 900).
+fn tf_secs(tf) {
+    let n = tf.len();
+    let unit = tf.sub_string(n - 1, 1);
+    let k = parse_int(tf.sub_string(0, n - 1));
+    if unit == "m" { k * 60 } else if unit == "h" { k * 3600 } else if unit == "d" || unit == "D" { k * 86400 } else { k * 60 }
+}
+
+// The swing that launched the run into a sweep: the most recent short-term
+// swing on the reversal side with its pivot before the sweep's extreme, not
+// closed through before that extreme, and lying beyond the swept level (a
+// swing between the swept level and the extreme is a pause inside the sweep).
+// () when the structure layer holds none. The point's `taken` says whether a
+// bar has closed through it since.
+fn launch_swing(scan, tf, dir, extreme_ts, swept_level) {
+    let side = if dir == "bear" { "low" } else { "high" };
+    for p in scan.structure(tf, side, 0) {      // newest first
+        if p.ts >= extreme_ts { continue; }
+        if p.taken && p.taken_ts < extreme_ts { continue; }
+        if !break_beyond_sweep(dir, p.price, swept_level) { continue; }
+        return p;
+    }
+    ()
+}
+
 fn on_bar(c, atr, sweeps, breaks) {
     let tf = c.tf;
     for sw in sweeps {
         if sw.tf == tf && sw.level_sig >= this.min_sig {
             this.next_key += 1;
-            this.setups.push(#{ key: `${this.next_key}`, sweep: sw, tf: tf, bars: 0,
-                                brk: (), fvg: (), entry: (), stop: (), placed: false });
+            let w = #{ key: `${this.next_key}`, sweep: sw, tf: tf, bars: 0,
+                       brk: (), fvg: (), entry: (), stop: (), placed: false,
+                       mss: (), mss_swing_ts: (), brk_ts: () };
+            if this.mss_mode == "launch_swing" {
+                let p = launch_swing(this.scan, tf, sw.dir, sw.extreme_ts, sw.level_price);
+                if p != () { w.mss = p.price; w.mss_swing_ts = p.ts; }
+            }
+            this.setups.push(w);
             if this.tr {
-                trace("v3.sweep", "sweep", `D${this.next_key}`, #{ dir: sw.dir, tf: tf,
+                let rec = #{ dir: sw.dir, tf: tf,
                     level_id: sw.level_id, level_price: sw.level_price, level_source: sw.level_source,
                     level_sig: sw.level_sig, extreme_price: sw.extreme_price, start_ts: sw.start_ts,
-                    o: "watching" });
+                    extreme_ts: sw.extreme_ts, o: "watching" };
+                if this.mss_mode == "launch_swing" {
+                    rec.mss_mode = "launch_swing";
+                    if w.mss != () { rec.mss_level = w.mss; rec.mss_ts = w.mss_swing_ts; }
+                }
+                trace("v3.sweep", "sweep", `D${this.next_key}`, rec);
             }
         }
     }
@@ -109,7 +168,36 @@ fn on_bar(c, atr, sweeps, breaks) {
             if w.placed && w.key in this.placed { this.dead.push(this.placed.remove(w.key)); }
             continue;
         }
-        if w.brk == () {
+        if w.brk == () && this.mss_mode == "launch_swing" {
+            // The level is fixed by the sweep: the swing that launched the run.
+            // (Looked up again while there is none: a pivot is only labelled
+            // once the bar after it has closed.)
+            if w.mss == () {
+                let p = launch_swing(this.scan, tf, dir, w.sweep.extreme_ts, w.sweep.level_price);
+                if p != () { w.mss = p.price; w.mss_swing_ts = p.ts; }
+            }
+            if w.mss != () {
+                // Broken by this bar's close, or already closed through
+                // between the sweep's extreme and the bar the sweep finished on.
+                let fired = (dir == "bear" && c.close < w.mss) || (dir == "bull" && c.close > w.mss);
+                let at = c.ts;
+                if !fired {
+                    let p = launch_swing(this.scan, tf, dir, w.sweep.extreme_ts, w.sweep.level_price);
+                    if p != () && p.ts == w.mss_swing_ts && p.taken { fired = true; at = p.taken_ts; }
+                }
+                if fired {
+                    w.brk = w.mss; w.brk_ts = at;
+                    if this.tr {
+                        trace("v3.break", "break", `D${w.key}`, #{ o: "accepted", mss_mode: "launch_swing",
+                            break_level: w.mss, swing_ts: w.mss_swing_ts, break_ts: at,
+                            swept_level: w.sweep.level_price, close: c.close,
+                            cmp: [#{ l: "bar close", lv: c.close, op: if dir == "bull" { ">" } else { "<" },
+                                     r: "launch swing", rv: w.mss, ok: true }] });
+                    }
+                }
+            }
+        }
+        if w.brk == () && this.mss_mode != "launch_swing" {
             for b in breaks {
                 if b.dir == dir && b.tf == tf && b.ts >= w.sweep.start_ts {
                     let beyond = break_beyond_sweep(dir, b.level, w.sweep.level_price);
@@ -119,12 +207,55 @@ fn on_bar(c, atr, sweeps, breaks) {
                             cmp: [#{ l: "broken swing", lv: b.level, op: if dir == "bull" { ">" } else { "<" },
                                      r: "swept level", rv: w.sweep.level_price, ok: beyond }] });
                     }
-                    if beyond { w.brk = b.level; break; }
+                    if beyond { w.brk = b.level; w.brk_ts = b.ts; break; }
                 }
             }
         }
         if w.brk != () && !w.placed {
-            let f = this.scan.fvg_first(tf, dir, false, w.sweep.start_ts, 0.0, -inf(), inf(), ext, atr * this.min_clear);
+            let f = ();
+            if !this.gap_in_leg && this.gap_min_frac <= 0.0 {
+                f = this.scan.fvg_first(tf, dir, false, w.sweep.start_ts, 0.0, -inf(), inf(), ext, atr * this.min_clear);
+            } else {
+                // The first gap (oldest) that passes every filter. With
+                // gap_in_leg: third candle after the sweep's extreme and no
+                // later than the candle after the break candle.
+                let last_ts = w.brk_ts + tf_secs(tf);
+                let since = if this.gap_in_leg { w.sweep.extreme_ts + 1 } else { w.sweep.start_ts };
+                let small = (); let leg_done = this.gap_in_leg && c.ts >= last_ts;
+                for g in this.scan.fvgs_since(tf, dir, false, since) {
+                    if this.gap_in_leg && g.ts > last_ts { continue; }
+                    let clearance = if dir == "bull" { g.near - ext } else { ext - g.near };
+                    if clearance < atr * this.min_clear { continue; }
+                    let risk = (g.near - ext).abs();
+                    let height = (g.near - g.far).abs();
+                    if this.gap_min_frac > 0.0 && (risk <= 0.0 || height / risk < this.gap_min_frac) {
+                        if small == () { small = #{ id: g.id, near: g.near, far: g.far, height: height, risk: risk }; }
+                        continue;
+                    }
+                    f = g; break;
+                }
+                if f == () && small != () && this.tr && !("small_traced" in w) {
+                    w.small_traced = true;
+                    trace("v3.gap", "gap", `D${w.key}`, #{ o: "gap_too_small", gap_id: small.id,
+                        gap_near: small.near, gap_far: small.far, height: small.height, risk: small.risk,
+                        frac: small.height / small.risk, min_frac: this.gap_min_frac,
+                        cmp: [#{ l: "gap height / risk", lv: small.height / small.risk, op: ">=",
+                                 r: "gap_min_risk_frac", rv: this.gap_min_frac, ok: false }] });
+                }
+                if f == () && leg_done {
+                    // The leg is over: no later gap can belong to it.
+                    let why = if small != () { "gap_too_small" } else { "no_gap_in_leg" };
+                    if this.tr {
+                        if small == () {
+                            trace("v3.gap", "gap", `D${w.key}`, #{ o: "no_gap_in_leg", extreme_ts: w.sweep.extreme_ts,
+                                break_ts: w.brk_ts, last_gap_ts: last_ts });
+                        }
+                        trace("v3.dead", "dead", `D${w.key}`, #{ o: why, bars: w.bars, close: c.close,
+                            extreme_price: ext, cancels_resting_order: false });
+                    }
+                    continue;
+                }
+            }
             let gap_key = if f != () { `${tf}:${f.id}` } else { "" };
             if f != () && gap_key in this.used {
                 if this.tr {
