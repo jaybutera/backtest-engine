@@ -120,7 +120,7 @@ fn on_bar(c, atr, sweeps, breaks) {
 }
 
 fn emit(c, atr, cand) {
-    let o = opp("v3_sweep_break_gap_" + cand.dir, cand.tf, cand.dir, c.ts);
+    let o = opp("v3_" + cand.dir, cand.tf, cand.dir, c.ts);
     o.entry = cand.entry;
     o.stop = cand.stop;
     o.target = cand.target;
