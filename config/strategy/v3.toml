@@ -1,0 +1,22 @@
+# v3: setups stated ahead of price, placed as resting limits.
+# Runs scripts/rhai/v3.rhai; pass --timeframe 5m --timeframe 15m --timeframe 1h
+# --timeframe 4h. Grade it with a plain resting-limit lens
+# (config/fill/limit_only.toml): the script places and cancels its own orders,
+# so a chase lens would grade a different strategy.
+factory = "rhai"
+assets = ["ES"]
+
+[strategy]
+script = "../../scripts/rhai/v3.rhai"
+min_score = 3.0
+rr = 2.0
+max_hold = 300
+fees = true
+
+[script]
+noise_atr = 1.0              # a bar must clear a level by this many ATR to count as a sweep
+min_level_sig = 3.0          # only session and period levels start a setup
+break_displacement_atr = 1.0 # a close must clear the swing by this many ATR to break structure
+gap_min_clear_atr = 0.5      # the entry gap must sit this many ATR clear of the sweep's extreme
+max_bars_after_sweep = 60    # bars of the sweep's timeframe a setup may live
+min_target_rr = 2.0          # nearest opposing level must be this far, in R
