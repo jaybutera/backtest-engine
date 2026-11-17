@@ -446,10 +446,15 @@ queries a script has: `significance`, `add_level`, `level`, `is_live`,
 `levels_beyond`, `nearest_above` / `nearest_below`, `find_target` (the level
 queries take an optional trailing timeframe naming the view, default the
 base timeframe's), `fvg`,
-`fvg_status`, `fvgs_since`, `fvg_first`, `draw_map`, `draw_bias`, `day`,
+`fvg_status`, `fvg_pieces`, `fvgs_since`, `fvg_first`, `structure`,
+`structure_events`, `draw_map`, `draw_bias`, `day`,
 `day_high` / `day_low`, `last_atr`, `candle_count`, `stats`; an `on_day(c,
 prev)` hook reports each completed UTC day; `wake_book(true)` asks for
 `on_bar_close` on every bar rather than only on bars that closed a trade.
+Stacked gaps (same timeframe and direction, edges within
+`fvg.merge_tol_atr` of that timeframe's ATR) are one zone by default
+(`fvg.merge = true`); `fvg_pieces(id)` returns the 3-bar gaps a zone is made
+of, for a strategy that wants to trade one of them.
 The module docs of `src/rhai_strategy.rs` give the exact per-candle order.
 `BACKTEST_RHAI_STATS=1` prints per-hook call counts and time at the end of a
 run, which is how to find out what a script is still paying for.

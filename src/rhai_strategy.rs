@@ -2164,6 +2164,7 @@ fn fvg_map(f: &liquidity::Fvg) -> Map {
     m.insert("status".into(), f.status.as_str().into());
     m.insert("is_ifvg".into(), f.is_inverted_kind.into());
     m.insert("c1_stop".into(), opt_f64(f.c1_stop));
+    m.insert("pieces".into(), (f.pieces.len() as i64).into());
     m
 }
 
@@ -2363,6 +2364,27 @@ fn register_scanner_api(engine: &mut Engine) {
             match s.0.borrow().fvg(id) {
                 Some(f) => Dynamic::from_map(fvg_map(f)),
                 None => Dynamic::UNIT,
+            }
+        })
+        // The 3-bar gaps a (merged) zone is made of, oldest first, each as an
+        // fvg map (zone id, dir, tf, status) with the piece's own edges, CE,
+        // first-candle stop and formation ts.
+        .register_fn("fvg_pieces", |s: &mut ScanHandle, id: i64| -> Array {
+            match s.0.borrow().fvg(id) {
+                Some(f) => f
+                    .pieces
+                    .iter()
+                    .map(|p| {
+                        let mut m = fvg_map(f);
+                        m.insert("ts".into(), p.ts.into());
+                        m.insert("near".into(), p.near.into());
+                        m.insert("far".into(), p.far.into());
+                        m.insert("ce".into(), p.ce.into());
+                        m.insert("c1_stop".into(), opt_f64(p.c1_stop));
+                        Dynamic::from_map(m)
+                    })
+                    .collect(),
+                None => Array::new(),
             }
         })
         // Market-structure tiers (STH/ITH/LTH and lows; see structure.rs).

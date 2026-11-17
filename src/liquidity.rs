@@ -680,6 +680,20 @@ pub struct Fvg {
     pub status: FvgStatus,
     pub is_inverted_kind: bool,
     /// The first candle's opposite extreme, for stops; none for inverted gaps.
+    pub c1_stop: Option<f64>,    /// The 3-bar gaps this zone is made of, oldest first: one for a gap that
+    /// never merged, more once stacked gaps merged into it. A strategy that
+    /// wants to trade one specific gap reads these.
+    pub pieces: Vec<FvgPiece>,
+}
+
+/// One 3-bar gap inside a (possibly merged) zone, with the same edge
+/// orientation as its zone.
+#[derive(Clone, Copy, Debug)]
+pub struct FvgPiece {
+    pub ts: i64,
+    pub near: f64,
+    pub far: f64,
+    pub ce: f64,
     pub c1_stop: Option<f64>,
 }
 
@@ -2473,6 +2487,9 @@ impl Scanner {
                 Direction::Bear => f.c1_stop.unwrap_or(sig.c1_stop).max(sig.c1_stop),
             });
             f.ce = (lo + hi) / 2.0;
+            let (plo, phi) = (sig.level.min(sig.level_end), sig.level.max(sig.level_end));
+            let (pn, pf) = if f.near >= f.far { (phi, plo) } else { (plo, phi) };
+            f.pieces.push(FvgPiece { ts: sig.ts, near: pn, far: pf, ce: (plo + phi) / 2.0, c1_stop: Some(sig.c1_stop) });
             let id = f.id;
             self.ce_hit.remove(&id);
             self.trace_fvg("fvg.status", idx, "merged");
@@ -2490,6 +2507,13 @@ impl Scanner {
             status: FvgStatus::Unmitigated,
             is_inverted_kind: false,
             c1_stop: Some(sig.c1_stop),
+            pieces: vec![FvgPiece {
+                ts: sig.ts,
+                near: sig.level_end,
+                far: sig.level,
+                ce: (sig.level + sig.level_end) / 2.0,
+                c1_stop: Some(sig.c1_stop),
+            }],
         };
         let idx = self.fvg_push(f);
         self.fvg_active.push(idx);
@@ -2591,6 +2615,7 @@ impl Scanner {
                             status: FvgStatus::Unmitigated,
                             is_inverted_kind: true,
                             c1_stop: None,
+                            pieces: Vec::new(),
                         });
                         self.trace_fvg("fvg.new", fi, "new");
                         new_inverted.push(fi);
@@ -2624,6 +2649,7 @@ impl Scanner {
                             status: FvgStatus::Unmitigated,
                             is_inverted_kind: true,
                             c1_stop: None,
+                            pieces: Vec::new(),
                         });
                         self.trace_fvg("fvg.new", fi, "new");
                         new_inverted.push(fi);
@@ -3725,6 +3751,9 @@ mod tests {
         assert_eq!(f.len(), 1, "one zone");
         assert_eq!((f[0].near, f[0].far, f[0].ce), (104.0, 101.0, 102.5));
         assert_eq!(f[0].c1_stop, Some(98.0));
+        assert_eq!(f[0].pieces.len(), 2);
+        assert_eq!((f[0].pieces[0].near, f[0].pieces[0].far), (103.0, 101.0));
+        assert_eq!((f[0].pieces[1].near, f[0].pieces[1].far, f[0].pieces[1].c1_stop), (104.0, 101.5, Some(98.0)));
 
         // Bear gaps keep the engine's orientation after a merge.
         let mut sc = Scanner::new(cfg());
