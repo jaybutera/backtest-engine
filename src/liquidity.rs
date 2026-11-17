@@ -1997,18 +1997,17 @@ impl Scanner {
             let f = &mut self.fvgs[idx];
             let lo = f.near.min(f.far).min(sig.level.min(sig.level_end));
             let hi = f.near.max(f.far).max(sig.level.max(sig.level_end));
-            match f.dir {
-                Direction::Bull => {
-                    f.near = hi;
-                    f.far = lo;
-                    f.c1_stop = Some(f.c1_stop.unwrap_or(sig.c1_stop).min(sig.c1_stop));
-                }
-                Direction::Bear => {
-                    f.near = lo;
-                    f.far = hi;
-                    f.c1_stop = Some(f.c1_stop.unwrap_or(sig.c1_stop).max(sig.c1_stop));
-                }
+            // Keep the gap's own edge orientation (fvg_add stores the top as
+            // `near` for both directions); only the extent grows.
+            if f.near >= f.far {
+                (f.near, f.far) = (hi, lo);
+            } else {
+                (f.near, f.far) = (lo, hi);
             }
+            f.c1_stop = Some(match f.dir {
+                Direction::Bull => f.c1_stop.unwrap_or(sig.c1_stop).min(sig.c1_stop),
+                Direction::Bear => f.c1_stop.unwrap_or(sig.c1_stop).max(sig.c1_stop),
+            });
             f.ce = (lo + hi) / 2.0;
             let id = f.id;
             self.ce_hit.remove(&id);
@@ -3199,6 +3198,17 @@ mod tests {
         assert_eq!(f.len(), 1, "one zone");
         assert_eq!((f[0].near, f[0].far, f[0].ce), (104.0, 101.0, 102.5));
         assert_eq!(f[0].c1_stop, Some(98.0));
+
+        // Bear gaps keep the engine's orientation after a merge.
+        let mut sc = Scanner::new(cfg());
+        sc.process(&candle(60, 110.0, 111.0, 109.0, 109.5));
+        sc.process(&candle(120, 109.5, 112.0, 108.5, 109.0));
+        sc.process(&candle(180, 107.0, 107.0, 106.0, 106.5)); // gap 107-109
+        sc.process(&candle(240, 106.0, 106.0, 104.0, 104.5)); // gap 106-108.5
+        let b = sc.fvgs_since(tf_id("1m"), Direction::Bear, false, 0);
+        assert_eq!(b.len(), 1);
+        let n = sc.fvg(b[0].id).unwrap();
+        assert_eq!((n.near, n.far), (109.0, 106.0));
 
         let mut c = cfg();
         c.fvg.merge = false;
